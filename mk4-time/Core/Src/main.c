@@ -192,7 +192,7 @@ volatile struct {
   uint32_t epoch;      // currentTime at the edge (Unix seconds, UTC)
   int32_t  calerr;     // debug_rtc_val: signed LSE cycle error over CAL_PERIOD s (=> ppm on host)
   uint32_t sincecal;   // seconds since last successful RTC calibration (holdover age)
-  int16_t  temp;       // die temperature (°C) — enables ppm-vs-temperature & holdover compensation
+  int16_t  temp;       // die temperature (°C) — for host-side ppm-vs-temperature characterisation
   uint8_t  flags;      // bit0 data_valid, bit1 had_pps, bit2 rtc_good
 } pps_cap;
 
