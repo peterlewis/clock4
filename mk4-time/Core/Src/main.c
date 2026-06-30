@@ -165,6 +165,10 @@ char textDisplay[32];
 _Bool delayedLoadRules = 0;
 _Bool delayedReadConfigFile = 0;
 _Bool delayedCheckOnEject = 0;
+_Bool delayedPostConfigCleanup = 0;
+// Set while the main loop is inside a (non-reentrant) FATFS operation, so the USB-ISR
+// firmware-eject check defers instead of corrupting FATFS state. volatile: ISR-visible.
+volatile uint8_t fatfs_busy = 0;
 uint32_t delayedDisplayFreq = 0;
 
 _Bool waitingForLatch = 0;
@@ -389,6 +393,10 @@ void sendDate( _Bool now ){
   case MODE_TEXT:
     if (textDisplay[0]) {
       i = snprintf((char*)&uart2_tx_buffer[1], 30,"%s", textDisplay);
+      // snprintf returns the length it WOULD have written (newlib-nano follows C99),
+      // not the truncated count; a >29-char TEXT= would otherwise push the ++i below
+      // past uart2_tx_buffer[31]. Clamp to the bytes actually written.
+      if (i > 29) i = 29;
     } else {
       uart2_tx_buffer[1]='-';
       i=1;
@@ -1099,7 +1107,10 @@ void rxConfigString(char c){
     }
     if (k && (v || state>=2)) {
       parseConfigString(key, value);
-      postConfigCleanup();
+      // rxConfigString runs in the USB OTG ISR; postConfigCleanup() calls nextMode()
+      // and sendDate(), which are non-reentrant against the SysTick repaint. Defer it
+      // to the main loop so it runs in thread context, like the file-config path does.
+      delayedPostConfigCleanup=1;
     }
     k=0;
     v=0;
@@ -1136,7 +1147,11 @@ void readConfigFile(void){
   if (f_stat(CONFIG_FILENAME, &fno) == FR_OK) {
     // if unchanged, exit early before touching any config
     // if the file doesn't exist, fall through and fail on the f_open
-    if (fno.fdate==config.fdate && fno.ftime==config.ftime) return;
+    // A zero FAT timestamp (the volume's RTC was unset when config.txt was written)
+    // must not be used as a cache key: config={0} matches it on the very first boot,
+    // so config is never loaded, no mode is enabled, and the first MODE button press
+    // then spins nextMode() forever. Only short-circuit on a real, non-zero stamp.
+    if ((fno.fdate || fno.ftime) && fno.fdate==config.fdate && fno.ftime==config.ftime) return;
     config.fdate=fno.fdate;
     config.ftime=fno.ftime;
   }
@@ -1614,6 +1629,14 @@ uint8_t loadRules( char* cat, char* zo ) {
 
   f_lseek(&file, zoAddr);
 
+  // TZRULES.BIN is host-writable over the USB mass-storage volume, so its length
+  // fields are untrusted: a rowLength larger than one rule slot, or numEntries larger
+  // than the array, would overrun rules[] (global RAM corruption / HardFault). Reject.
+  if (rowLength > sizeof rules[0] || numEntries > MAX_RULES) {
+    f_close(&file);
+    return RULES_HEADER_ERR;
+  }
+
   int i;
   for (i=0;i<numEntries;i++) {
     f_read(&file, &rules[i], rowLength, &rc);
@@ -2079,6 +2102,7 @@ int main(void)
         && latitude>=-90.0 && latitude<=90.0 && longitude>=-180.0 && longitude<=180.0) {
 
       new_position=0;
+      fatfs_busy=1;   // map lookup + loadRulesSingle touch FATFS; block the eject-time check
       FIL mapfile;
       if (f_open(&mapfile, MAP_FILENAME, FA_READ) == FR_OK) {
 #ifdef MEASURE_LOOKUP_TIME
@@ -2108,10 +2132,17 @@ int main(void)
         }
       }
       // else no_map = 1
+      fatfs_busy=0;
     }
 
     if (delayedCheckOnEject) firmwareCheckOnEject();
 
+    if (delayedPostConfigCleanup) {
+      delayedPostConfigCleanup=0;
+      postConfigCleanup();
+    }
+
+    fatfs_busy=1;   // FATFS_remount + readConfigFile + checkDelayedLoadRules touch FATFS
     if (delayedReadConfigFile) {
       FATFS_remount();
       readConfigFile();
@@ -2119,6 +2150,7 @@ int main(void)
     }
 
     checkDelayedLoadRules();
+    fatfs_busy=0;
 
     if (delayedDisplayFreq) setDisplayFreq(delayedDisplayFreq);
 
