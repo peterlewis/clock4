@@ -162,6 +162,15 @@ enum {
   MODE_DDMMYYYY,
 #endif
 
+  // Astro pack — GPS-derived astronomy read-outs. SATVIEW-style: the payload
+  // shows on the 10-char date row while the live clock keeps running on the
+  // time row. Enabled individually via the MODE_* config keys, like any mode.
+  MODE_SUN,        // sunrise / sunset / solar noon (local), auto-paged
+  MODE_SUN_AZEL,   // sun azimuth & elevation, now
+  MODE_MOON,       // moon phase index + illuminated %
+  MODE_GRID,       // Maidenhead grid locator
+  MODE_LATLON,     // latitude / longitude, auto-paged
+
   NUM_DISPLAY_MODES
 };
 

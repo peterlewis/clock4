@@ -32,6 +32,7 @@
 #include "qspi_drv.h"
 #include "zonedetect.h"
 #include "chainloader.h"
+#include "astro.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -148,6 +149,20 @@ uint8_t decisec=0, centisec=0, millisec=0;
 
 float longitude=-9999, latitude=-9999;
 _Bool data_valid=0, had_pps=0, rtc_good=0, new_position=1;
+
+// Astro pack — sun/moon/grid read-outs, computed once a second in the main loop
+// (astro_update) and formatted by the sendDate cases, the same compute-in-loop /
+// format-in-ISR split MODE_VBAT uses for vbat.
+struct astro_cache_s {
+  uint32_t epoch;          // currentTime this was computed for; 0 = never computed
+  _Bool    have_pos;       // a usable lat/lon was available
+  _Bool    sun_up_today;   // false = polar day/night (no rise/set this date)
+  int16_t  rise_min, set_min, noon_min;  // local minutes-of-day [0,1440)
+  int16_t  az, el;         // sun azimuth 0..359 / elevation, whole degrees
+  uint8_t  moon_idx, moon_pct;           // phase index 0..7 / illuminated %
+  char     grid[8];        // Maidenhead locator, or "----"
+  float    lat_show, lon_show;           // the snapshot lat/lon, for MODE_LATLON
+} astro = {0};
 #define rtc_last_write RTC->BKP30R
 #define rtc_last_calibration RTC->BKP31R
 uint32_t last_pps_time = 0;
@@ -216,6 +231,57 @@ void memcpyword(volatile uint32_t *dest, volatile uint32_t *src, size_t n){
 }
 
 // 12 bytes at 115200 8E1 is 1.14ms, 32 bytes would be 3.06ms
+// --- Astro pack helpers ----------------------------------------------------
+// A usable position is held in latitude/longitude from either a GPS fix or the
+// configured fake_latitude/fake_longitude; both sit at the -9999 sentinel until
+// a position is known, so a simple range check is the "have we got a fix" test.
+static _Bool astro_pos_ok(float lat, float lon){
+  return lat >= -90.0f && lat <= 90.0f && lon >= -180.0f && lon <= 180.0f;
+}
+// Decimal UTC hour (sun_times may return <0 or >24) -> local minutes-of-day [0,1440).
+static int astro_local_minutes(double utc_h){
+  double h = fmod(utc_h + currentOffset / 3600.0, 24.0);
+  if (h < 0) h += 24.0;
+  int m = (int)(h * 60.0 + 0.5);
+  if (m >= 1440) m -= 1440;
+  return m;
+}
+// Recompute the astro cache (called from the main loop, never the ISR). The
+// double soft-float maths runs here, then the small result struct is swapped in
+// under a brief IRQ mask so sendDate() always reads a consistent snapshot.
+static void astro_update(void){
+  if (astro.epoch == (uint32_t)currentTime) return;     // at most once a second
+  struct astro_cache_s c = {0};
+  c.epoch = (uint32_t)currentTime;
+  double ph = moon_phase((double)currentTime);          // moon needs no fix
+  c.moon_idx = moon_phase_index(ph);
+  c.moon_pct = (uint8_t)(moon_illuminated_fraction(ph) * 100.0 + 0.5);
+  float lat = latitude, lon = longitude;                // one consistent snapshot of the fix
+  c.have_pos = astro_pos_ok(lat, lon);
+  if (c.have_pos) {
+    c.lat_show = lat;
+    c.lon_show = lon;
+    double az, el, rise = 0, set = 0, noon = 0;
+    sun_az_el(lat, lon, (double)currentTime, &az, &el);
+    int ia = (int)(az + 0.5); if (ia >= 360) ia -= 360;
+    c.az = (int16_t)ia;
+    c.el = (int16_t)(el < 0 ? el - 0.5 : el + 0.5);
+    c.sun_up_today = (sun_times(lat, lon, (double)currentTime,
+                                &rise, &set, &noon, 0, 0, 0) == 0);
+    c.noon_min = (int16_t)astro_local_minutes(noon);     // noon is valid even at the poles
+    if (c.sun_up_today) {
+      c.rise_min = (int16_t)astro_local_minutes(rise);
+      c.set_min  = (int16_t)astro_local_minutes(set);
+    }
+    maidenhead(lat, lon, c.grid);
+  } else {
+    strcpy(c.grid, "----");
+  }
+  __disable_irq();
+  astro = c;
+  __enable_irq();
+}
+
 void sendDate( _Bool now ){
   if (waitingForLatch) {
     if (countMode==COUNT_HIDDEN) {
@@ -471,6 +537,47 @@ void sendDate( _Bool now ){
     break;
   case MODE_FIRMWARE_CRC_D:
     uart2_tx_buffer[0]=CMD_SHOW_CRC;
+    break;
+
+  // --- Astro pack: format the main-loop-computed cache onto the date row only,
+  //     leaving the time row as the running clock (SATVIEW-style). --------------
+  case MODE_SUN: {
+    if (!astro.have_pos || !astro.epoch) { i = sprintf((char*)&uart2_tx_buffer[1], "RISE  ----"); break; }
+    int page = (currentTime / 2) % 3;                  // rise -> set -> solar noon, 2 s each
+    // labels padded to 4 chars in the literal ("SET "/"SOL ") so the time digits
+    // line up under RISE without relying on the nano printf honouring "%-4s"
+    const char *lbl = page == 0 ? "RISE" : page == 1 ? "SET " : "SOL ";
+    int m           = page == 0 ? astro.rise_min : page == 1 ? astro.set_min : astro.noon_min;
+    if (!astro.sun_up_today && page != 2) {            // sun never rises/sets today
+      i = sprintf((char*)&uart2_tx_buffer[1], "%s ----", lbl);
+    } else {
+      i = sprintf((char*)&uart2_tx_buffer[1], "%s %02d.%02d", lbl, m / 60, m % 60);
+    }
+    break;
+  }
+  case MODE_SUN_AZEL:
+    if (!astro.have_pos || !astro.epoch) { i = sprintf((char*)&uart2_tx_buffer[1], "AZ -- EL--"); }
+    else if (astro.el < 0) i = sprintf((char*)&uart2_tx_buffer[1], "AZ%03dEL-%02d", astro.az, -astro.el);
+    else                   i = sprintf((char*)&uart2_tx_buffer[1], "AZ%03dEL%02d",  astro.az,  astro.el);
+    break;
+  case MODE_MOON:                                      // UTC only; no fix needed
+    if (!astro.epoch) i = sprintf((char*)&uart2_tx_buffer[1], "MOON -");
+    else              i = sprintf((char*)&uart2_tx_buffer[1], "MOON %d %3d", astro.moon_idx, astro.moon_pct);
+    break;
+  case MODE_GRID:
+    i = sprintf((char*)&uart2_tx_buffer[1], "%s", astro.epoch ? astro.grid : "----");
+    break;
+  case MODE_LATLON:
+    if (!astro.have_pos || !astro.epoch) { i = sprintf((char*)&uart2_tx_buffer[1], "LAT  ----"); }
+    else if ((currentTime / 2) % 2 == 0) {             // page latitude / longitude, 2 s each
+      long h = (long)(astro.lat_show * 100.0 + (astro.lat_show < 0 ? -0.5 : 0.5)); // hundredths, rounded
+      if (h < 0) i = sprintf((char*)&uart2_tx_buffer[1], "LAT-%ld.%02ld", -h / 100, -h % 100);
+      else       i = sprintf((char*)&uart2_tx_buffer[1], "LAT %ld.%02ld",  h / 100,  h % 100);
+    } else {
+      long h = (long)(astro.lon_show * 100.0 + (astro.lon_show < 0 ? -0.5 : 0.5));
+      if (h < 0) i = sprintf((char*)&uart2_tx_buffer[1], "LON-%ld.%02ld", -h / 100, -h % 100);
+      else       i = sprintf((char*)&uart2_tx_buffer[1], "LON %ld.%02ld",  h / 100,  h % 100);
+    }
     break;
   }
   if (now) {
@@ -999,6 +1106,16 @@ void parseConfigString(char *key, char *value) {
   } else if (strcasecmp(key, "MODE_FIRMWARE_CRC") == 0) {
     set_mode_enabled(MODE_FIRMWARE_CRC_D, value);
     set_mode_enabled(MODE_FIRMWARE_CRC_T, value);
+  } else if (strcasecmp(key, "MODE_SUN") == 0) {
+    set_mode_enabled(MODE_SUN, value);
+  } else if (strcasecmp(key, "MODE_SUN_AZEL") == 0) {
+    set_mode_enabled(MODE_SUN_AZEL, value);
+  } else if (strcasecmp(key, "MODE_MOON") == 0) {
+    set_mode_enabled(MODE_MOON, value);
+  } else if (strcasecmp(key, "MODE_GRID") == 0) {
+    set_mode_enabled(MODE_GRID, value);
+  } else if (strcasecmp(key, "MODE_LATLON") == 0) {
+    set_mode_enabled(MODE_LATLON, value);
   } else if (strcasecmp(key, "Tolerance_time_1ms") == 0) {
     config.tolerance_1ms = atoi(value);
   } else if (strcasecmp(key, "Tolerance_time_10ms") == 0) {
@@ -2126,6 +2243,10 @@ int main(void)
 
     if (displayMode == MODE_VBAT)
       measure_vbat();
+
+    if (displayMode == MODE_SUN  || displayMode == MODE_SUN_AZEL || displayMode == MODE_MOON
+        || displayMode == MODE_GRID || displayMode == MODE_LATLON)
+      astro_update();
 
 
     /* USER CODE END WHILE */
