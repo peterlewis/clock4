@@ -563,12 +563,14 @@ void sendDate( _Bool now ){
   case MODE_SUN: {
     if (!astro.have_pos || !astro.epoch) { i = sprintf((char*)&uart2_tx_buffer[1], "RISE  ----"); break; }
     int page = (currentTime / 2) % 3;                  // rise -> set -> solar noon, 2 s each
-    const char *lbl = page == 0 ? "RISE" : page == 1 ? "SET" : "SOL";
+    // labels padded to 4 chars in the literal ("SET "/"SOL ") so the time digits
+    // line up under RISE without relying on the nano printf honouring "%-4s"
+    const char *lbl = page == 0 ? "RISE" : page == 1 ? "SET " : "SOL ";
     int m           = page == 0 ? astro.rise_min : page == 1 ? astro.set_min : astro.noon_min;
     if (!astro.sun_up_today && page != 2) {            // sun never rises/sets today
-      i = sprintf((char*)&uart2_tx_buffer[1], "%-4s ----", lbl);   // %-4s aligns the columns
-    } else {                                                       // across the RISE/SET/SOL pages
-      i = sprintf((char*)&uart2_tx_buffer[1], "%-4s %02d.%02d", lbl, m / 60, m % 60);
+      i = sprintf((char*)&uart2_tx_buffer[1], "%s ----", lbl);
+    } else {
+      i = sprintf((char*)&uart2_tx_buffer[1], "%s %02d.%02d", lbl, m / 60, m % 60);
     }
     break;
   }
