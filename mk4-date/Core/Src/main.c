@@ -488,7 +488,13 @@ static inline void latchDisplay(void){
   buffer_a[3] = pre_buffer_a[3];
   buffer_a[4] = pre_buffer_a[4];
 
+  // dp_pos is the 1-based digit the decimal point attaches to (0 = none). It comes from
+  // text_idx, which the sender can advance past the 10-digit display, and it indexes the
+  // 5-entry buffer_a/buffer_b below. Clamp to each orientation's valid range so a stray or
+  // garbled '.' in the UART stream can't drive a negative / out-of-range index into RAM.
   if (!dp_pos) return;
+  if (inverted) { if (dp_pos > 9) return; }   // inverted: 9-dp_pos goes negative at 10
+  else          { if (dp_pos > 10) return; }  // non-inverted: dp_pos-6 tops out at [4]
 
   if (inverted){
     if (dp_pos>=5) {
