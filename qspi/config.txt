@@ -108,3 +108,31 @@ mode_vbat = 0
 # a host that only needs the phase can ignore the extra fields. Enabling this turns on the USB
 # Start-Of-Frame interrupt (a cheap 1 kHz latch, below the display in priority).
 pps = off
+
+
+## astro modes (GPS-derived)
+# These show on the date row while the live clock keeps running on the time row.
+# They use the current position; with no GPS fix they fall back to fake_latitude/
+# fake_longitude below (handy indoors), or show "----" if neither is set.
+
+# Sunrise / sunset / solar noon (local time). Pages every 2 s: RISE -> SET -> SOL.
+MODE_SUN = disabled
+
+# Sun azimuth & elevation right now, e.g. "AZ142EL38" (degrees; elevation may be negative).
+MODE_SUN_AZEL = disabled
+
+# Moon: phase index 0-7 then illuminated %, e.g. "MOON 4 99".
+# Index: 0 new, 1 waxing crescent, 2 first quarter, 3 waxing gibbous,
+#        4 full, 5 waning gibbous, 6 last quarter, 7 waning crescent.
+MODE_MOON = disabled
+
+# Maidenhead grid locator, e.g. "IO91xl".
+MODE_GRID = disabled
+
+# Latitude / longitude in decimal degrees. Pages every 2 s: LAT -> LON.
+MODE_LATLON = disabled
+
+# Fixed position for the astro modes when there is no GPS fix (decimal degrees, N+/E+).
+# Note: setting these also pins the clock's position (GPS position updates are ignored).
+#fake_latitude  = 51.48
+#fake_longitude = -0.01
