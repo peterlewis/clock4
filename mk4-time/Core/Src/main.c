@@ -1516,15 +1516,25 @@ void PPS_Init(void){
 
 // usbd_cdc_if.h isn't pulled into main.c; forward-declare the one symbol we need.
 extern uint8_t CDC_Copy_Transmit(uint8_t* buf, uint16_t Len);
+extern USBD_HandleTypeDef hUsbDeviceFS;
 
 // Format + send one $PMTXTS sentence from the values captured at the last PPS edge.
 // Runs in the main loop (snprintf is fine here, never in the ISR). Clears pps_record_pending
-// itself on a successful send; returns USBD_BUSY/USBD_FAIL otherwise so the caller retries.
+// on a successful send and for any undeliverable record (no host, formatting failure) — a
+// fresh record arrives on the next edge, so only USBD_BUSY is worth retrying.
 // Sentence: $PMTXTS,<seq>,<epoch>,<subms>,<systick>,<load>,<calerr>,<sincecal>,<temp>,<flags>*CC
 //   subms+(load-systick)/(load+1) = modelled sub-second position at the edge (phase error);
 //   ppm = calerr * 1e6 / (32768 * CAL_PERIOD)  [CAL_PERIOD=63];  temp = die °C;
 //   flags: b0 valid, b1 pps, b2 rtc.
 static uint8_t emitPPSTimestamp(void){
+  // With no enumerated host (e.g. charger-only power) CDC can never accept the sentence;
+  // drop the record before doing any formatting work, otherwise the pending flag would
+  // re-run the whole format-and-fail cycle every main-loop pass until a host appears.
+  if (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED) {
+    pps_record_pending = 0;
+    return USBD_FAIL;
+  }
+
   __disable_irq();                       // atomic snapshot of the ISR-written capture
   uint32_t snap_seq = pps_cap.seq;
   uint32_t st       = pps_cap.systick;
@@ -1543,21 +1553,22 @@ static uint8_t emitPPSTimestamp(void){
                    (unsigned long)snap_seq, (unsigned long)epoch, (unsigned)subms,
                    (unsigned long)st, (unsigned long)load, (long)calerr,
                    (unsigned long)sincecal, (int)temp, (unsigned)flags);
-  if (n < 0 || n >= (int)sizeof body) return USBD_FAIL;
+  if (n < 0 || n >= (int)sizeof body) { pps_record_pending = 0; return USBD_FAIL; }
 
   uint8_t cks = 0;                       // standard NMEA XOR checksum
   for (int i = 0; i < n; i++) cks ^= (uint8_t)body[i];
 
   char line[NMEA_BUF_SIZE];              // must fit the CDC txbuf[NMEA_BUF_SIZE] downstream
   int m = snprintf(line, sizeof line, "$%s*%02X\r\n", body, (unsigned)cks);
-  if (m < 0 || m >= (int)sizeof line) return USBD_FAIL;
+  if (m < 0 || m >= (int)sizeof line) { pps_record_pending = 0; return USBD_FAIL; }
 
   // The CDC IN endpoint is shared with the ISR NMEA passthrough; serialise the (tiny) submit,
   // and clear the pending flag only if no fresh PPS edge arrived since the snapshot (so a
-  // record captured mid-send isn't silently dropped).
+  // record captured mid-send isn't silently dropped). FAIL also clears: the record is
+  // undeliverable (USB de-inited under us), unlike BUSY where the host may drain the FIFO.
   __disable_irq();
   uint8_t r = CDC_Copy_Transmit((uint8_t*)line, (uint16_t)m);
-  if (r == USBD_OK && pps_cap.seq == snap_seq) pps_record_pending = 0;
+  if (r != USBD_BUSY && pps_cap.seq == snap_seq) pps_record_pending = 0;
   __enable_irq();
   return r;
 }
@@ -1776,7 +1787,7 @@ void measure_vbat(void){
 
 // Read the STM32 internal die-temperature sensor on hadc3 (shared with VBAT) into die_temp_c.
 // The die sits slightly above ambient on this low-power board, but it tracks the crystal well
-// enough to characterise the oscillator's temperature dependence. needs-hw-test (ADC reconfig).
+// enough to characterise the oscillator's temperature dependence.
 void measure_temp(void){
   ADC_ChannelConfTypeDef s = {0};
   s.Rank = ADC_REGULAR_RANK_1;

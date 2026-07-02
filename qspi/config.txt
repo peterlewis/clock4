@@ -101,6 +101,10 @@ mode_satview = 0
 # show coin cell voltage
 mode_vbat = 0
 
+# output a $PMTXTS timing sentence over USB serial on each GPS PPS pulse, carrying the
+# sub-millisecond phase measurement made at the edge, for host-side jitter/drift analysis.
+pps = off
+
 
 ## astro modes (GPS-derived)
 # These show on the date row while the live clock keeps running on the time row.
