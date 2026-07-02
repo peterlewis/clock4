@@ -38,6 +38,10 @@ int    moon_phase_index(double phase);            /* 0..7, see ASTRO_MOON_NAMES 
 /* (d) Equation of time in minutes (+ = apparent sun ahead of mean/clock sun). */
 double equation_of_time(double unix_s);
 
+/* (d2) Subsolar point at the given UTC instant: latitude = solar declination,
+ *      longitude in [-180,180] (E+). Time-only — needs no observer position. */
+void   sun_subsolar(double unix_s, double *lat, double *lon);
+
 /* (e) 6-character Maidenhead locator for (lat, lon). out must hold >= 7 bytes.
  *     Writes "----\0" if either coordinate is non-finite. */
 void   maidenhead(double lat, double lon, char out[7]);

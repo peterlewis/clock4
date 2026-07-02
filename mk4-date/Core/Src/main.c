@@ -251,6 +251,8 @@ const uint8_t lut_7seg_inv[] = {
 #define CMD_SET_FREQUENCY      0x91
 #define CMD_RELOAD_TEXT        0x92
 #define CMD_SET_SCROLL_SPEED   0x93
+#define CMD_GEM                0x94   // +1 data byte: 0 = off, 1 = larson, 2 = dim-only
+#define CMD_COL_LEVELS         0x95   // +10 data bytes: column brightness 0..15, viewer left->right
 
 #define CMD_SHOW_CRC           0x9D
 #define CMD_REPORT_CRC         0x9E
@@ -299,6 +301,42 @@ const uint16_t cathodes_b[5]={
 uint8_t inverted=0;
 uint8_t b1_held =0;
 uint8_t b2_held =0;
+
+// --- display gems (opt-in effects, commanded by the time board; DISPLAY_GEMS.md A1/B1) ---
+// Per-digit brightness by sigma-delta dithering in the matrix scan: each slot's segments
+// are blanked or shown per scan pass so a 0..15 level becomes a duty cycle. At the default
+// 20 kHz slot rate each digit refreshes at 4 kHz, so the 16-level pattern repeats at 250 Hz.
+#define GEM_OFF     0
+#define GEM_LARSON  1
+#define GEM_DIM     2
+volatile uint8_t gem_mode = GEM_OFF;
+volatile uint8_t dimming  = 0;                        // fast gate for the scan ISR
+volatile uint8_t dim_a[5] = {15,15,15,15,15};         // per-slot level, a-half
+volatile uint8_t dim_b[5] = {15,15,15,15,15};         // per-slot level, b-half
+uint8_t dim_acc_a[5], dim_acc_b[5];                   // sigma-delta accumulators (TIM2 ISR only)
+uint8_t levels_idx = 0;                               // CMD_COL_LEVELS payload cursor
+volatile uint8_t gem_alive = 0;                       // TIM21 ticks since the last gem command
+
+// The dither adds ~120 cycles to the worst-case scan slot; above ~50 kHz MATRIX_FREQUENCY
+// that saturates the CPU and starves the polled UART RX (including the gem-off command).
+// While dimming, floor ARR at ~26 kHz matrix rate (~50% CPU worst case); restored on gem off.
+#define GEM_ARR_MIN 239
+
+// segment + DP bits per half (everything that isn't cathode select)
+#define SEGMASK_A ((uint16_t)((0x7F<<4) | (1<<14)))
+#define SEGMASK_B ((uint16_t)((0x7F<<4) | 1))
+
+static void gemOff(void);   // defined after latchDisplay/setFrequency
+
+// map a viewer column (0 = left) to its dim slot, same indexing as setDigitPre
+static void setColLevel(uint8_t col, uint8_t lvl){
+  if (lvl > 15) lvl = 15;
+  if (inverted) {
+    if (col >= 5) dim_b[9-col] = lvl; else dim_a[4-col] = lvl;
+  } else {
+    if (col >= 5) dim_a[col-5] = lvl; else dim_b[col] = lvl;
+  }
+}
 
 /* USER CODE END PV */
 
@@ -395,8 +433,25 @@ void TIM2_IRQHandler(void)
 {
   if (TIM2->SR & TIM_SR_UIF){
 
-    GPIOA->ODR = buffer_a[buffer_idx];
-    GPIOB->ODR = buffer_b[buffer_idx];
+    uint16_t a = buffer_a[buffer_idx];
+    uint16_t b = buffer_b[buffer_idx];
+    if (dimming){
+      // sigma-delta duty per slot; level 15 short-circuits to always-on (true full)
+      uint8_t d = dim_a[buffer_idx];
+      if (d < 15){
+        uint8_t acc = dim_acc_a[buffer_idx] + d;
+        dim_acc_a[buffer_idx] = acc & 15;
+        if (acc < 16) a &= (uint16_t)~SEGMASK_A;
+      }
+      d = dim_b[buffer_idx];
+      if (d < 15){
+        uint8_t acc = dim_acc_b[buffer_idx] + d;
+        dim_acc_b[buffer_idx] = acc & 15;
+        if (acc < 16) b &= (uint16_t)~SEGMASK_B;
+      }
+    }
+    GPIOA->ODR = a;
+    GPIOB->ODR = b;
 
     buffer_idx ++;
     if (buffer_idx>=5) buffer_idx=0;
@@ -463,6 +518,39 @@ void TIM21_IRQHandler(void){
         b1_held = b2_held = btn_delay+1;
       }
     }
+
+    // Gem watchdog: the time board re-asserts the active gem at 1 Hz (CMD_GEM for the
+    // larson, the levels frame for the terminator). If ~3 s pass with no re-assert —
+    // time-board reboot, a truncated gem-off frame, line noise — fail safe back to text.
+    // The OFF transition is otherwise a one-shot and must never be able to wedge.
+    if (gem_mode != GEM_OFF && ++gem_alive >= 150){
+      gemOff();
+    }
+
+    // Larson scanner (GEM_LARSON), animated locally at this timer's 50 Hz: a pip sweeps
+    // the ten middle segments, sharp leading edge, stepped decay tail behind its
+    // direction of travel. 70 ticks per leg = 1.4 s per sweep. Runs entirely on this
+    // board — the time board only switches it on and off.
+    if (gem_mode == GEM_LARSON){
+      static uint8_t gtick = 0;
+      if (++gtick >= 140) gtick = 0;
+      uint8_t leg = gtick / 70;                       // 0 = left->right, 1 = right->left
+      uint8_t x10 = (uint8_t)(((gtick % 70) * 90u) / 69u);  // pip position, tenths of a column
+      if (leg) x10 = 90 - x10;
+      for (uint8_t c = 0; c < 10; c++){
+        int16_t d10 = leg ? ((int16_t)(c*10) - (int16_t)x10)
+                          : ((int16_t)x10 - (int16_t)(c*10)); // >0 = behind the pip
+        uint8_t lvl;
+        if      (d10 < -5)  lvl = 0;                  // ahead of the pip
+        else if (d10 <= 5)  lvl = 15;                 // the pip
+        else if (d10 <= 15) lvl = 7;                  // decay tail
+        else if (d10 <= 25) lvl = 3;
+        else if (d10 <= 40) lvl = 1;
+        else                lvl = 0;
+        setDigitDirect(c, '-');                       // seg g only; also repaints over any latch
+        setColLevel(c, lvl);
+      }
+    }
   }
 }
 
@@ -473,10 +561,26 @@ static inline void setFrequency(void){
   uint32_t arr = round(6400000.0 / (float)target_freq) -1.0;
   if (arr > ARR_MAX) arr = ARR_MAX;
   if (arr < ARR_MIN) arr = ARR_MIN;
+  if (dimming && arr < GEM_ARR_MIN) arr = GEM_ARR_MIN;  // keep the dithered scan ISR sane
   TIM2->ARR= arr;
 }
 
+static inline void latchDisplay(void);
+// leave any gem cleanly: restore levels, scan rate and the latched text.
+// gem_mode clears FIRST so the latch gate passes. Called from parseByte (thread)
+// and from the TIM21 watchdog (ISR) — both write the same source data.
+static void gemOff(void){
+  gem_mode = GEM_OFF;
+  dimming = 0;
+  for (uint8_t i = 0; i < 5; i++){ dim_a[i] = 15; dim_b[i] = 15; }
+  setFrequency();      // undo the GEM_ARR_MIN floor (no-op if never configured)
+  latchDisplay();      // text returns immediately, not at the next 1 Hz repaint
+}
+
 static inline void latchDisplay(void){
+  // While the Larson gem owns the display, keep honouring the latch handshake but skip
+  // the copy — pre_buffers stay current, so leaving the gem restores the text instantly.
+  if (gem_mode == GEM_LARSON) return;
   buffer_b[0] = pre_buffer_b[0];
   buffer_b[1] = pre_buffer_b[1];
   buffer_b[2] = pre_buffer_b[2];
@@ -566,6 +670,13 @@ static inline void parseByte(uint8_t x){
       case CMD_SET_SCROLL_SPEED:
         break;
 
+      case CMD_GEM:
+        break;
+
+      case CMD_COL_LEVELS:
+        levels_idx=0;
+        break;
+
       case CMD_SET_FREQUENCY:
       case CMD_SET_FREQUENCY_B2:
       case CMD_SET_FREQUENCY_B3:
@@ -614,6 +725,32 @@ static inline void parseByte(uint8_t x){
     return;
 
   case CMD_SET_SCROLL_SPEED:
+    return;
+
+  case CMD_GEM:
+    gem_alive = 0;
+    if (x == GEM_OFF || x > GEM_DIM){
+      gemOff();
+    } else {
+      gem_mode = x;
+      dimming = 1;
+      if (TIM2->ARR < GEM_ARR_MIN) TIM2->ARR = GEM_ARR_MIN;
+    }
+    status = 0;
+    return;
+
+  case CMD_COL_LEVELS:
+    // ten data bytes, viewer left->right; a complete frame is authoritative for dim mode
+    // (so a lost larson-kill still converges when the terminator levels arrive)
+    setColLevel(levels_idx, x & 0x0F);
+    if (++levels_idx >= 10){
+      levels_idx = 0;
+      status = 0;
+      gem_alive = 0;
+      if (gem_mode != GEM_DIM) gem_mode = GEM_DIM;
+      dimming = 1;
+      if (TIM2->ARR < GEM_ARR_MIN) TIM2->ARR = GEM_ARR_MIN;
+    }
     return;
 
   case CMD_SET_FREQUENCY:

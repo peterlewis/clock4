@@ -277,6 +277,25 @@ static int astro_local_minutes(double utc_h){
 // Recompute the astro cache (called from the main loop, never the ISR). The
 // double soft-float maths runs here, then the small result struct is swapped in
 // under a brief IRQ mask so sendDate() always reads a consistent snapshot.
+// MODE_TERMINATOR: ten date-row column brightness levels (0..15), column i spanning
+// longitudes [-180+36i, -144+36i). Level follows the sun's elevation at the equator at
+// the column's centre longitude, smoothstepped across civil twilight (elevation ±6°,
+// i.e. sin(el) ±0.1045), floored at 2 so the date stays readable at night. Needs only
+// UTC time — no GPS fix. Runs in the main loop (soft-double, ~10 cos per second).
+static void terminator_levels(uint8_t *out){
+  double slat, slon;
+  sun_subsolar((double)currentTime, &slat, &slon);
+  double cosd = cos(slat * 0.017453292519943295);
+  for (int i = 0; i < 10; i++){
+    double lon = -180.0 + 36.0 * i + 18.0;
+    double sinEl = cosd * cos((lon - slon) * 0.017453292519943295);
+    double t = (sinEl + 0.10453) / 0.20906;
+    if (t < 0.0) t = 0.0; else if (t > 1.0) t = 1.0;
+    double s = t * t * (3.0 - 2.0 * t);
+    out[i] = (uint8_t)(2.0 + 13.0 * s + 0.5);
+  }
+}
+
 static void astro_update(void){
   if (astro.epoch == (uint32_t)currentTime) return;     // at most once a second
   struct astro_cache_s c = {0};
@@ -1148,6 +1167,10 @@ void parseConfigString(char *key, char *value) {
     set_mode_enabled(MODE_GRID, value);
   } else if (strcasecmp(key, "MODE_LATLON") == 0) {
     set_mode_enabled(MODE_LATLON, value);
+  } else if (strcasecmp(key, "MODE_LARSON") == 0) {
+    set_mode_enabled(MODE_LARSON, value);
+  } else if (strcasecmp(key, "MODE_TERMINATOR") == 0) {
+    set_mode_enabled(MODE_TERMINATOR, value);
   } else if (strcasecmp(key, "astro_page_ms") == 0) {
     int v = atoi(value);
     config.astro_page_ms = v < 0 ? 0 : (v > 65535 ? 65535 : v);   // fits uint16; 0 -> default
@@ -2434,6 +2457,37 @@ int main(void)
         static uint32_t last_pg = 0;
         uint32_t pg = uwTick / astro_pm();
         if (pg != last_pg && decisec != 9) { last_pg = pg; sendDate(1); }
+      }
+    }
+
+    // Display gems (MODE_LARSON / MODE_TERMINATOR): the DATE BOARD renders the effect;
+    // this loop only switches it on/off and, for the terminator, streams ten brightness
+    // levels once a second. uart2 is shared with the SysTick sendDate(0) repaint and the
+    // latch handshake, so frames go out only in a safe window: decisec < 8 leaves >100 ms
+    // before the ISR's 0.900 slot (an 11-byte frame needs ~1 ms at 115200 — decisec != 9
+    // alone would let a frame started at 0.8999 collide with the ISR and cost it a
+    // repaint), never mid-latch, and only when the DMA is idle.
+    // DMA source buffers are static: they must outlive the call.
+    {
+      static uint8_t lastGem = 0;                 // 0 none, 1 larson, 2 terminator
+      static uint32_t lastLvlSec = 0;
+      static uint8_t gem_cmd[2];
+      static uint8_t gem_lvls[11];
+      uint8_t g = displayMode == MODE_LARSON ? 1 : displayMode == MODE_TERMINATOR ? 2 : 0;
+      if (decisec < 8 && !waitingForLatch && huart2.gState == HAL_UART_STATE_READY) {
+        if (g != lastGem) {
+          gem_cmd[0] = CMD_GEM;
+          gem_cmd[1] = (g == 1) ? 1 : 0;          // larson on; terminator/none start from off
+          if (HAL_UART_Transmit_DMA(&huart2, gem_cmd, 2) == HAL_OK) { lastGem = g; lastLvlSec = 0; }
+        } else if (g == 1 && (uint32_t)currentTime != lastLvlSec) {
+          // re-assert once a second (idempotent) so a date-board reboot mid-gem recovers
+          gem_cmd[0] = CMD_GEM; gem_cmd[1] = 1;
+          if (HAL_UART_Transmit_DMA(&huart2, gem_cmd, 2) == HAL_OK) lastLvlSec = (uint32_t)currentTime;
+        } else if (g == 2 && (uint32_t)currentTime != lastLvlSec) {
+          gem_lvls[0] = CMD_COL_LEVELS;           // levels imply dim mode on the date board
+          terminator_levels(&gem_lvls[1]);        // 1 Hz levels double as the reboot re-assert
+          if (HAL_UART_Transmit_DMA(&huart2, gem_lvls, 11) == HAL_OK) lastLvlSec = (uint32_t)currentTime;
+        }
       }
     }
 

@@ -1,8 +1,10 @@
 
 # Matrix refresh rate, in Hz. Min 1000, max 100000
 # This number is only a target, exact frequency will be a division of processor clock speed.
-# Note the display is split into four matrices of 5 digits each. The number given here is the 
+# Note the display is split into four matrices of 5 digits each. The number given here is the
 # refresh rate of the display - the clock frequency of the matrix will be five times this number.
+# While a display gem is active (see below) the date board caps its own rate near 26000 so the
+# per-column dimming never starves its processor; the configured rate returns when the gem ends.
 MATRIX_FREQUENCY = 20000
 
 
@@ -136,3 +138,15 @@ astro_page_ms = 5500
 # Note: setting these also pins the clock's position (GPS position updates are ignored).
 #fake_latitude  = 51.48
 #fake_longitude = -0.01
+
+
+## display gems
+# Opt-in effects on the date row; the time row keeps telling the time.
+
+# Larson scanner: a light sweeps the row with a fading tail.
+MODE_LARSON = disabled
+
+# Day/night terminator: each column is 36 degrees of longitude and its brightness
+# follows live daylight there, so the terminator crosses the display once a day.
+# Needs only the time - works without a GPS fix.
+MODE_TERMINATOR = disabled
