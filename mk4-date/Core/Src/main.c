@@ -607,7 +607,7 @@ static inline void parseByte(uint8_t x){
       dp_pos = text_idx;
       return;
     }
-    if(text_idx > MAX_TEXT_LEN) return;
+    if(text_idx >= MAX_TEXT_LEN) return;  // was '>': at text_idx==MAX_TEXT_LEN this wrote text[32], 1 byte past the buffer
 
     if (text_idx < 10) setDigitPre(text_idx, x);
     text[text_idx++] = x;
