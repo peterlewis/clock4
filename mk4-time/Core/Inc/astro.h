@@ -42,6 +42,9 @@ int    moon_phase_index(double phase);            /* 0..7, see ASTRO_MOON_NAMES 
 /* (d) Equation of time in minutes (+ = apparent sun ahead of mean/clock sun). */
 double equation_of_time(double unix_s);
 
+double local_sidereal_time(double unix_s, double lon); /* LMST, hours [0,24), lon E+ */
+double local_solar_time(double unix_s, double lon);    /* apparent solar, hours [0,24) */
+
 /* (e) 6-character Maidenhead locator for (lat, lon). out must hold >= 7 bytes.
  *     Writes "----\0" if either coordinate is non-finite. */
 void   maidenhead(double lat, double lon, char out[7]);

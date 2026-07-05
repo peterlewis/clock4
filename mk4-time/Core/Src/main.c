@@ -202,6 +202,13 @@ _Bool resendDate = 0;
 uint32_t LPTIM1_high;
 
 uint8_t displayMode = 0, countMode = 0, colonMode = 0;
+// Civil vs alternate-timebase colon animation: colonMode is the ACTIVE selection that
+// loadColonAnimation() renders; the per-context choices live here and applyColonForMode()
+// swaps between them. The sidereal default must stay visually distinct from civil so
+// MODE_LST/MODE_SOLAR can never masquerade as civil time.
+uint8_t colonModeCivil = 0;
+uint8_t colonModeAlt = COLON_MODE_ALT_SAWTOOTH;
+_Bool colonAltExplicit = 0;    // user explicitly set alt_colon_mode
 uint8_t requestMode = 255;
 uint8_t nmea_cdc_level=0;
 int debug_rtc_val = 0;
@@ -361,6 +368,8 @@ void sendDate( _Bool now ){
 
   switch (displayMode) {
   default:
+  case MODE_LST:       // alt-timebase modes keep the civil date on the date row —
+  case MODE_SOLAR:   // the bottom row stays an unambiguous civil anchor
   case MODE_ISO8601_STD:
     uart2_tx_buffer[1] ='2';
     uart2_tx_buffer[2] ='0';
@@ -760,6 +769,119 @@ void setNextCountdown(time_t nextTime){
 // Store UTC on RTC
 // need to also write zone into backup registers
 // Only called at the start of a second, don't attempt to write subseconds.
+// --- Alternate timebase (MODE_LST / MODE_SOLAR) ------------------------------------------
+// The TIME ROW ticks Local Sidereal Time or apparent solar time. Heavy double
+// math runs in THREAD context once per second (alt_update), staging the reading for the
+// coming civil boundary; the SysTick_Alt_* handlers latch it at the .900 prep mark. The
+// display is quantized to civil second boundaries — value = floor(alt time at the boundary),
+// reseeded every second — so GPS discipline and holdover honesty are inherited from
+// currentTime for free. Sidereal runs 1.00273791x civil: the seconds display double-steps
+// once every ~6 min 5 s. That skip is the authentic signature of a true sidereal clock.
+static volatile struct {
+  uint8_t hh, mm, ss;
+  uint32_t for_time;            // civil epoch this reading is the floor of; 0 = invalid
+} alt_stage;
+static uint8_t alt_hh, alt_mm, alt_ss;   // ISR-owned: what the row currently shows
+static volatile _Bool alt_have_pos = 0;
+static volatile _Bool alt_seed_pending = 0;  // mode entered: thread must seed the row
+static volatile uint8_t alt_gen = 0;         // bumped on mode entry; cancels in-flight staging
+
+// Overlay an alternate HH:MM:SS onto the next7seg staging buffer. The stock
+// setNextTimestamp() has just run (keeping nextBcd / DST / date-row bookkeeping fresh);
+// only the six time-row digit patterns are replaced.
+#define alt_render_next7seg(hh, mm, ss) do { \
+    next7seg.c    = cLut[(ss) % 10]; \
+    next7seg.b[0] = bCat0 | cLut[(hh) / 10] << 2; \
+    next7seg.b[1] = bCat1 | cLut[(hh) % 10] << 2; \
+    next7seg.b[2] = bCat2 | cLut[(mm) / 10] << 2; \
+    next7seg.b[3] = bCat3 | cLut[(mm) % 10] << 2; \
+    next7seg.b[4] = bCat4 | cLut[(ss) / 10] << 2; \
+  } while (0)
+
+// The .900 prep for the alternate modes: stock next-second bookkeeping first, then latch
+// the staged reading — or, if the main loop was starved past the boundary, advance the last
+// shown reading by one second. LST's fallback runs SLOW (2.74 ms/s; the reseed snap is
+// always forward), SOLAR's runs fast by at most ~0.35 ms/s at the EoT extremes — a
+// visible backwards reseed would need ~48+ minutes of continuous main-loop starvation.
+#define alt_prep_next() do { \
+    currentTime++; \
+    setNextTimestamp( currentTime ); \
+    if (alt_stage.for_time == (uint32_t)currentTime) { \
+      alt_hh = alt_stage.hh; alt_mm = alt_stage.mm; alt_ss = alt_stage.ss; \
+    } else if (++alt_ss >= 60) { \
+      alt_ss = 0; \
+      if (++alt_mm >= 60) { alt_mm = 0; if (++alt_hh >= 24) alt_hh = 0; } \
+    } \
+    alt_render_next7seg(alt_hh, alt_mm, alt_ss); \
+    sendDate(0); \
+  } while (0)
+
+// Compute floor-HH:MM:SS of the alternate time at `when` (thread context only: doubles).
+static _Bool alt_compute(uint32_t when, uint8_t *hh, uint8_t *mm, uint8_t *ss){
+  float lat = latitude, lon = longitude;   // one consistent snapshot (astro_update pattern)
+  if (!astro_pos_ok(lat, lon)) return 0;
+  double hours = (displayMode == MODE_LST)
+               ? local_sidereal_time((double)when, (double)lon)
+               : local_solar_time((double)when, (double)lon);
+  if (!(hours >= 0.0) || hours >= 24.0) hours = 0.0;  // NaN / float-residue guard
+  int h2 = (int)hours;
+  double fm = (hours - h2) * 60.0;
+  int m2 = (int)fm;
+  int s2 = (int)((fm - m2) * 60.0);
+  if (h2 > 23) h2 = 23;
+  if (m2 > 59) m2 = 59;
+  if (s2 > 59) s2 = 59;
+  *hh = (uint8_t)h2; *mm = (uint8_t)m2; *ss = (uint8_t)s2;
+  return 1;
+}
+
+// Main-loop staging (thread context — ALL the double math for these modes lives here).
+// Two jobs: (a) SEED after mode entry or position go-live — render + latch the current
+// reading immediately and install the live handlers, so a PPS latch can never show civil
+// digits under the alternate colon; (b) STAGE the reading for the coming civil boundary.
+// A generation counter cancels any in-flight computation when the mode flips mid-pass, so
+// a stale timebase can never be stamped as valid.
+void alt_update(void){
+  if (displayMode != MODE_LST && displayMode != MODE_SOLAR) return;
+
+  uint8_t gen = alt_gen;                 // snapshot: mode flips abort the publish below
+
+  if (alt_seed_pending || !alt_have_pos) {
+    uint8_t hh, mm, ss;
+    if (!alt_compute((uint32_t)currentTime, &hh, &mm, &ss)) {
+      alt_have_pos = 0;                  // stay dashed; retried every pass
+      return;
+    }
+    __disable_irq();
+    if (gen == alt_gen) {
+      alt_hh = hh; alt_mm = mm; alt_ss = ss;
+      alt_render_next7seg(alt_hh, alt_mm, alt_ss);   // alt digits now staged: any latch is honest
+      latchSegments()                                 // and shown immediately (countdown precedent)
+      alt_have_pos = 1;
+      alt_seed_pending = 0;
+    }
+    __enable_irq();
+    if (gen == alt_gen) setPrecision();  // install Alt_Px/PPS now — don't wait for PendSV,
+                                         // or the NoUpdate .900 prep could stage civil digits
+    return;                              // stage the coming boundary on the next pass
+  }
+
+  uint32_t target = (uint32_t)currentTime + 1;
+  if (alt_stage.for_time == target) return;
+  uint8_t hh, mm, ss;
+  if (!alt_compute(target, &hh, &mm, &ss)) {
+    alt_have_pos = 0;                    // position lost: setPrecision dashes it this second
+    alt_stage.for_time = 0;
+    return;
+  }
+  __disable_irq();
+  if (gen == alt_gen) {                  // publish only if no mode flip happened mid-compute
+    alt_stage.hh = hh; alt_stage.mm = mm; alt_stage.ss = ss;
+    alt_stage.for_time = target;         // IRQs masked: fields and stamp are one atomic unit
+  }
+  __enable_irq();
+}
+
 void write_rtc(void){
 
   RTC_DateTypeDef sdatestructure;
@@ -926,6 +1048,9 @@ void decodeRMC(void){
       // Under normal conditions, we should only be parsing nmea at around .300 to .400
       // USART1 preemption priority is currently 1, so we could be interrupted by systick here
       setNextTimestamp( currentTime );
+      // In the alternate time-row modes the civil digits just staged must not reach the
+      // display: restore the alt overlay so the boundary latch stays honest.
+      if (countMode == COUNT_ALT) alt_render_next7seg(alt_hh, alt_mm, alt_ss);
       sendDate(0);
     }
   }
@@ -1132,6 +1257,26 @@ float parseBrightness(char *v, _Bool invert){
 #define set_mode_enabled(mode, value) \
   if ((config.modes_enabled[mode] = truthy(value))) requestMode=mode;
 
+static uint8_t parseColonName(const char *value){
+  if (strcasecmp(value, "solid") == 0)        return COLON_MODE_SOLID;
+  if (strcasecmp(value, "heartbeat") == 0)    return COLON_MODE_HEARTBEAT;
+  if (strcasecmp(value, "sawtooth") == 0)     return COLON_MODE_1PPS_SAWTOOTH;
+  if (strcasecmp(value, "alt_sawtooth") == 0) return COLON_MODE_ALT_SAWTOOTH;
+  if (strcasecmp(value, "toggle") == 0)       return COLON_MODE_TOGGLE;
+  return COLON_MODE_SLOWFADE;
+}
+
+// Select the colon animation for the current display mode (idempotent, thread context).
+// Alternate-timebase modes get their own animation so they read as "not civil" at a glance.
+void applyColonForMode(void){
+  uint8_t want = (displayMode == MODE_LST || displayMode == MODE_SOLAR)
+               ? colonModeAlt : colonModeCivil;
+  if (want != colonMode) {
+    colonMode = want;
+    loadColonAnimation();
+  }
+}
+
 void parseConfigString(char *key, char *value) {
 
   if (strcasecmp(key, "text") == 0) {
@@ -1229,6 +1374,10 @@ void parseConfigString(char *key, char *value) {
   } else if (strcasecmp(key, "page_ms") == 0) {
     int v = atoi(value);
     config.page_ms = v < 0 ? 0 : (v > 65535 ? 65535 : v);   // fits uint16; 0 -> default
+  } else if (strcasecmp(key, "MODE_LST") == 0) {
+    set_mode_enabled(MODE_LST, value);
+  } else if (strcasecmp(key, "MODE_SOLAR") == 0) {
+    set_mode_enabled(MODE_SOLAR, value);
   } else if (strcasecmp(key, "Tolerance_time_1ms") == 0) {
     config.tolerance_1ms = atoi(value);
   } else if (strcasecmp(key, "Tolerance_time_10ms") == 0) {
@@ -1241,17 +1390,12 @@ void parseConfigString(char *key, char *value) {
     config.fake_lat = atof(value);
   } else if (strcasecmp(key, "colon_mode") == 0) {
 
-    if (strcasecmp(value, "solid") == 0) {
-      colonMode = COLON_MODE_SOLID;
-    } else if (strcasecmp(value, "heartbeat") == 0) {
-      colonMode = COLON_MODE_HEARTBEAT;
-    } else if (strcasecmp(value, "sawtooth") == 0) {
-      colonMode = COLON_MODE_1PPS_SAWTOOTH;
-    } else if (strcasecmp(value, "alt_sawtooth") == 0) {
-      colonMode = COLON_MODE_ALT_SAWTOOTH;
-    } else if (strcasecmp(value, "toggle") == 0) {
-      colonMode = COLON_MODE_TOGGLE;
-    } else colonMode = COLON_MODE_SLOWFADE;
+    colonModeCivil = parseColonName(value);
+
+  } else if (strcasecmp(key, "alt_colon_mode") == 0) {
+
+    colonModeAlt = parseColonName(value);   // shared by MODE_LST and MODE_SOLAR
+    colonAltExplicit = 1;
 
   } else if (strcasecmp(key, "nmea") == 0) {
 
@@ -1285,7 +1429,13 @@ void parseConfigString(char *key, char *value) {
 }
 
 void postConfigCleanup(void){
-  loadColonAnimation();
+  // Keep the alternate-timebase colon distinct unless the user EXPLICITLY matched them.
+  if (!colonAltExplicit && colonModeAlt == colonModeCivil) {
+    colonModeAlt = (colonModeCivil != COLON_MODE_ALT_SAWTOOTH) ? COLON_MODE_ALT_SAWTOOTH
+                 : COLON_MODE_TOGGLE;
+  }
+  colonMode = 0xFF;             // force applyColonForMode to reload exactly once
+  applyColonForMode();
 
   // check at least one mode is enabled
   uint8_t j = 0;
@@ -1388,7 +1538,9 @@ void readConfigFile(void){
   config.tolerance_100ms = 100000;
   config.zone_override = 0;
   config.brightness_override = -1.0;
-  colonMode = 0;
+  colonModeCivil = 0;
+  colonModeAlt = COLON_MODE_ALT_SAWTOOTH;
+  colonAltExplicit = 0;
 
   FIL file;
 
@@ -1847,6 +1999,59 @@ void SysTick_CountDown_P0(void)
   }
 }
 
+// Alternate-timebase handlers (MODE_LST / MODE_SOLAR): identical to the CountUp family —
+// same cascade, same sub-second painting, same precision ladder — except the .900 prep
+// overlays the staged alternate HH:MM:SS onto next7seg (see alt_prep_next).
+void SysTick_Alt_P3(void)
+{
+  timetick()
+
+  buffer_c[3].low=cLut[millisec];
+  buffer_c[2].low=cLut[centisec];
+  buffer_c[1].low=cLut[decisec];
+
+  HAL_IncTick();
+
+  if (decisec==9 && centisec==0 && millisec==0){
+    alt_prep_next();
+  }
+}
+
+void SysTick_Alt_P2(void) {
+  timetick()
+
+  buffer_c[2].low=cLut[centisec];
+  buffer_c[1].low=cLut[decisec];
+
+  HAL_IncTick();
+
+  if (decisec==9 && centisec==0 && millisec==0){
+    alt_prep_next();
+  }
+}
+
+void SysTick_Alt_P1(void) {
+  timetick()
+
+  buffer_c[1].low=cLut[decisec];
+
+  HAL_IncTick();
+
+  if (decisec==9 && centisec==0 && millisec==0){
+    alt_prep_next();
+  }
+}
+
+void SysTick_Alt_P0(void) {
+  timetick()
+
+  HAL_IncTick();
+
+  if (decisec==9 && centisec==0 && millisec==0){
+    alt_prep_next();
+  }
+}
+
 void SysTick_Dummy(void){
   HAL_IncTick();
 }
@@ -2049,6 +2254,51 @@ void setPrecision(void){
       SetSysTick( &SysTick_CountUp_P0 );
     }
 
+  } else if (countMode == COUNT_ALT) {
+
+    if (!alt_have_pos) {
+      // No usable position (no fix, no fake_longitude): dashes, digits not ticking —
+      // never GMST-as-LST, never a guessed longitude. Re-evaluated every second; the
+      // row goes live the moment a position appears. resendDate keeps the civil date
+      // row refreshing (PendSV's resend check runs right after this) — without it the
+      // date would freeze across midnight while dashed.
+      resendDate = 1;
+      SetPPS( &PPS_NoUpdate );
+      SetSysTick( &SysTick_CountUp_NoUpdate );
+      buffer_b[0] = bCat0 | 0b01000000 << 2;
+      buffer_b[1] = bCat1 | 0b01000000 << 2;
+      buffer_b[2] = bCat2 | 0b01000000 << 2;
+      buffer_b[3] = bCat3 | 0b01000000 << 2;
+      buffer_b[4] = bCat4 | 0b01000000 << 2;
+      buffer_c[0].low = 0b01000000;
+      buffer_c[3].low = 0b01000000;
+      buffer_c[2].low = 0b01000000;
+      buffer_c[1].low = 0b01000000;
+      buffer_c[0].high= 0b11001110;
+    } else if (currentTime - last_pps_time < config.tolerance_1ms){
+      SetPPS( &PPS );
+      buffer_c[0].high= 0b11001110 | cSegDP;
+      SetSysTick( &SysTick_Alt_P3 );
+    } else if (currentTime - last_pps_time < config.tolerance_10ms){
+      SetPPS( &PPS );
+      buffer_c[3].low = 0b01000000;
+      buffer_c[0].high= 0b11001110 | cSegDP;
+      SetSysTick( &SysTick_Alt_P2 );
+    } else if (currentTime - rtc_last_calibration < config.tolerance_100ms){
+      SetPPS( &PPS );
+      buffer_c[3].low = 0b01000000;
+      buffer_c[2].low = 0b01000000;
+      buffer_c[0].high= 0b11001110 | cSegDP;
+      SetSysTick( &SysTick_Alt_P1 );
+    } else {
+      SetPPS( &PPS );
+      buffer_c[3].low = 0b01000000;
+      buffer_c[2].low = 0b01000000;
+      buffer_c[1].low = 0b01000000;
+      buffer_c[0].high= 0b11001110;
+      SetSysTick( &SysTick_Alt_P0 );
+    }
+
   } else if (displayMode == MODE_COUNTDOWN) {
 
     if (config.countdown_to >= currentTime) {
@@ -2124,8 +2374,9 @@ void nextMode(_Bool reverse){
     buffer_c[2].high &= ~cSegDP;
     buffer_c[3].high &= ~cSegDP;
   }
-  if ( displayMode == MODE_ISO_WEEK || justExited(MODE_COUNTDOWN)) {
-    // If we exit countdown mode at .9 seconds
+  if ( displayMode == MODE_ISO_WEEK || justExited(MODE_COUNTDOWN)
+       || justExited(MODE_LST) || justExited(MODE_SOLAR)) {
+    // If we exit countdown/alt mode at .9 seconds
     // it will show the wrong time for .1 seconds
     setNextTimestamp(currentTime);
   }
@@ -2151,6 +2402,22 @@ void nextMode(_Bool reverse){
     TIM2->CCR2 = 0;
     latchSegments();
 
+  } else if (displayMode == MODE_LST || displayMode == MODE_SOLAR) {
+
+    countMode = COUNT_ALT;
+    setNextTimestamp(currentTime);   // stock civil bookkeeping (integer path; countdown-arm cost)
+    // NO double math here: nextMode can run in the USART2 button ISR (priority 0, which
+    // blocks SysTick and the PPS EXTI), and the LST/solar computation is ~100 µs of
+    // soft-double. Invalidate and let the main-loop alt_update() seed within one pass
+    // (<100 ms); until then setPrecision shows the dashed state.
+    alt_gen++;                       // cancels any in-flight staging for the previous timebase
+    alt_stage.for_time = 0;
+    alt_have_pos = 0;
+    alt_seed_pending = 1;
+    setPrecision();
+    TIM2->CCR1 = 0;
+    TIM2->CCR2 = 0;
+
   }
   else {
     if (countMode != COUNT_NORMAL) {
@@ -2162,6 +2429,7 @@ void nextMode(_Bool reverse){
       latchSegments();
     }
   }
+  applyColonForMode();   // idempotent: alt colon on entry, civil colon on exit
   sendDate(1);
 }
 void button1pressed(void){
@@ -2543,6 +2811,10 @@ int main(void)
         if (pg != last_pg && decisec != 9) { last_pg = pg; sendDate(1); }
       }
     }
+
+    // MODE_LST / MODE_SOLAR: stage the next civil boundary's alternate reading
+    // (thread-context doubles; no-op in every other mode)
+    alt_update();
 
 
     /* USER CODE END WHILE */
