@@ -138,7 +138,7 @@ mode_tempcomp = 0
 # They use the current position; with no GPS fix they fall back to fake_latitude/
 # fake_longitude below (handy indoors), or show "----" if neither is set.
 
-# Sunrise / sunset / solar noon (local time). Pages RISE -> SET -> SOL (see astro_page_ms).
+# Sunrise / sunset / solar noon (local time). Pages RISE -> SET -> SOL (see page_ms).
 MODE_SUN = disabled
 
 # Sun azimuth & elevation right now, e.g. "AZ142EL38" (degrees; elevation may be negative).
@@ -152,7 +152,7 @@ MODE_MOON = disabled
 # Maidenhead grid locator, e.g. "IO91xl".
 MODE_GRID = disabled
 
-# Latitude / longitude in decimal degrees. Pages LAT -> LON (see astro_page_ms).
+# Latitude / longitude in decimal degrees. Pages LAT -> LON (see page_ms).
 MODE_LATLON = disabled
 
 # Local Sidereal Time as a LIVE TICKING CLOCK on the time row (big digits). The date row
@@ -162,21 +162,21 @@ MODE_LATLON = disabled
 # not a glitch. Needs a position (GPS fix or fake_longitude); shows dashes without one.
 MODE_LST = disabled
 
-# Apparent solar ("sundial") time on the time row: what a sundial reads — UTC shifted by
-# your longitude plus the equation of time. Reads exactly 12:00:00 at local solar noon.
-MODE_SUNDIAL = disabled
+# Apparent solar time on the time row — what a sundial reads: UTC shifted by your
+# longitude plus the equation of time. Reads exactly 12:00:00 at local solar noon.
+MODE_SOLAR = disabled
 
-# Colon animation while an alternate-timebase mode (MODE_LST / MODE_SUNDIAL) is shown, so
-# it can never be mistaken for civil time at a glance — sundial especially, which can sit
+# Colon animation while an alternate-timebase mode (MODE_LST / MODE_SOLAR) is shown, so
+# it can never be mistaken for civil time at a glance — solar especially, which can sit
 # within minutes of civil. Same names as colon_mode; automatically kept different from
 # your civil colon unless you explicitly set them equal here. Leave commented to keep the
 # automatic distinctness guarantee (an explicit value disables the auto-demotion).
 # One of: slowfade, heartbeat, sawtooth, alt_sawtooth, toggle, solid
 #alt_colon_mode = alt_sawtooth
 
-# Dwell per sub-screen for the paged modes (MODE_SUN, MODE_LATLON), in milliseconds.
+# Dwell per sub-screen for the paged modes (MODE_SUN, MODE_LATLON, MODE_TEMPCOMP), in ms.
 # Default 5500 (a subjectively-tuned cadence, found by feel); floored at 250.
-astro_page_ms = 5500
+page_ms = 5500
 
 # Fixed position for the astro modes when there is no GPS fix (decimal degrees, N+/E+).
 # Note: setting these also pins the clock's position (GPS position updates are ignored).

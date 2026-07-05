@@ -195,7 +195,7 @@ uint8_t displayMode = 0, countMode = 0, colonMode = 0;
 // Civil vs alternate-timebase colon animation: colonMode is the ACTIVE selection that
 // loadColonAnimation() renders; the per-context choices live here and applyColonForMode()
 // swaps between them. The sidereal default must stay visually distinct from civil so
-// MODE_LST/MODE_SUNDIAL can never masquerade as civil time.
+// MODE_LST/MODE_SOLAR can never masquerade as civil time.
 uint8_t colonModeCivil = 0;
 uint8_t colonModeAlt = COLON_MODE_ALT_SAWTOOTH;
 _Bool colonAltExplicit = 0;    // user explicitly set alt_colon_mode
@@ -291,7 +291,7 @@ struct {
   time_t countdown_to;
   float brightness_override;
   volatile _Bool zone_override;
-  uint16_t astro_page_ms;       // paged astro modes (SUN/LATLON): sub-screen dwell, ms
+  uint16_t page_ms;       // paged astro modes (SUN/LATLON): sub-screen dwell, ms
   _Bool modes_enabled[NUM_DISPLAY_MODES];
 
 } config = {0};
@@ -326,7 +326,7 @@ static _Bool astro_pos_ok(float lat, float lon){
 // Sub-screen dwell (ms) for the paged astro modes (SUN, LATLON). Unset -> 5500 ms,
 // a subjectively-tuned cadence, found by feel. Floored at 250 ms so a tiny value
 // can't flood the date-board UART.
-static uint32_t astro_pm(void){ uint32_t m = config.astro_page_ms; return m == 0 ? 5500 : (m < 250 ? 250 : m); }
+static uint32_t page_ms(void){ uint32_t m = config.page_ms; return m == 0 ? 5500 : (m < 250 ? 250 : m); }
 // Decimal UTC hour (sun_times may return <0 or >24) -> local minutes-of-day [0,1440).
 static int astro_local_minutes(double utc_h){
   double h = fmod(utc_h + currentOffset / 3600.0, 24.0);
@@ -390,7 +390,7 @@ void sendDate( _Bool now ){
   switch (displayMode) {
   default:
   case MODE_LST:       // alt-timebase modes keep the civil date on the date row —
-  case MODE_SUNDIAL:   // the bottom row stays an unambiguous civil anchor
+  case MODE_SOLAR:   // the bottom row stays an unambiguous civil anchor
   case MODE_ISO8601_STD:
     uart2_tx_buffer[1] ='2';
     uart2_tx_buffer[2] ='0';
@@ -533,12 +533,12 @@ void sendDate( _Bool now ){
     }
     break;
   case MODE_TEMPCOMP: {
-    // Pages: die temp -> HSE model -> LSE model -> samples+state, astro_page_ms dwell each.
+    // Pages: die temp -> HSE model -> LSE model -> samples+state, page_ms dwell each.
     // Values are the governor's display cache (clamped so the row never overflows). Layout is
     // the RISE/SET style: label, separator space, a sign slot (space when positive), then the
     // digits — numbers align whether signed or not, and short values keep clear space at the
     // row's end beside the time row: "tC  32C" / "HSE -0.25" / "rtC  18.68" / "n 159 L".
-    int tcp = (int)((uwTick / astro_pm()) % 4);
+    int tcp = (int)((uwTick / page_ms()) % 4);
     char num[12];
     if (tcp == 0) {
       int t2 = (int)die_temp_c;
@@ -663,7 +663,7 @@ void sendDate( _Bool now ){
   //     leaving the time row as the running clock (SATVIEW-style). --------------
   case MODE_SUN: {
     if (!astro.have_pos || !astro.epoch) { i = sprintf((char*)&uart2_tx_buffer[1], "RISE  ----"); break; }
-    int page = (uwTick / astro_pm()) % 3;              // rise -> set -> solar noon, astro_page_ms each
+    int page = (uwTick / page_ms()) % 3;              // rise -> set -> solar noon, page_ms each
     // labels padded to 4 chars in the literal ("SET "/"SOL ") so the time digits
     // line up under RISE without relying on the nano printf honouring "%-4s"
     const char *lbl = page == 0 ? "RISE" : page == 1 ? "SET " : "SOL ";
@@ -695,7 +695,7 @@ void sendDate( _Bool now ){
     // ("LON 179.99" / "LON-179.99").
     if (!astro.have_pos || !astro.epoch) { i = sprintf((char*)&uart2_tx_buffer[1], "LAT  ----"); }
     else {
-      _Bool lat = (uwTick / astro_pm()) % 2 == 0;      // page latitude / longitude, astro_page_ms each
+      _Bool lat = (uwTick / page_ms()) % 2 == 0;      // page latitude / longitude, page_ms each
       double v = lat ? astro.lat_show : astro.lon_show;
       long h = (long)(v * 100.0 + (v < 0 ? -0.5 : 0.5));  // hundredths, rounded
       long a2 = h < 0 ? -h : h;
@@ -773,8 +773,8 @@ void setNextCountdown(time_t nextTime){
   next7seg.c = cLut[seconds % 10];
 }
 
-// --- Alternate timebase (MODE_LST / MODE_SUNDIAL) ------------------------------------------
-// The TIME ROW ticks Local Sidereal Time or apparent solar ("sundial") time. Heavy double
+// --- Alternate timebase (MODE_LST / MODE_SOLAR) ------------------------------------------
+// The TIME ROW ticks Local Sidereal Time or apparent solar time. Heavy double
 // math runs in THREAD context once per second (alt_update), staging the reading for the
 // coming civil boundary; the SysTick_Alt_* handlers latch it at the .900 prep mark. The
 // display is quantized to civil second boundaries — value = floor(alt time at the boundary),
@@ -805,7 +805,7 @@ static volatile uint8_t alt_gen = 0;         // bumped on mode entry; cancels in
 // The .900 prep for the alternate modes: stock next-second bookkeeping first, then latch
 // the staged reading — or, if the main loop was starved past the boundary, advance the last
 // shown reading by one second. LST's fallback runs SLOW (2.74 ms/s; the reseed snap is
-// always forward), SUNDIAL's runs fast by at most ~0.35 ms/s at the EoT extremes — a
+// always forward), SOLAR's runs fast by at most ~0.35 ms/s at the EoT extremes — a
 // visible backwards reseed would need ~48+ minutes of continuous main-loop starvation.
 #define alt_prep_next() do { \
     currentTime++; \
@@ -846,7 +846,7 @@ static _Bool alt_compute(uint32_t when, uint8_t *hh, uint8_t *mm, uint8_t *ss){
 // A generation counter cancels any in-flight computation when the mode flips mid-pass, so
 // a stale timebase can never be stamped as valid.
 void alt_update(void){
-  if (displayMode != MODE_LST && displayMode != MODE_SUNDIAL) return;
+  if (displayMode != MODE_LST && displayMode != MODE_SOLAR) return;
 
   uint8_t gen = alt_gen;                 // snapshot: mode flips abort the publish below
 
@@ -1237,7 +1237,7 @@ void loadColonAnimation(void){
 // Select the colon animation for the current display mode (idempotent, thread context).
 // Alternate-timebase modes get their own animation so they read as "not civil" at a glance.
 void applyColonForMode(void){
-  uint8_t want = (displayMode == MODE_LST || displayMode == MODE_SUNDIAL)
+  uint8_t want = (displayMode == MODE_LST || displayMode == MODE_SOLAR)
                ? colonModeAlt : colonModeCivil;
   if (want != colonMode) {
     colonMode = want;
@@ -1376,9 +1376,9 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     set_mode_enabled(MODE_GRID, value);
   } else if (strcasecmp(key, "MODE_LATLON") == 0) {
     set_mode_enabled(MODE_LATLON, value);
-  } else if (strcasecmp(key, "astro_page_ms") == 0) {
+  } else if (strcasecmp(key, "page_ms") == 0) {
     int v = atoi(value);
-    config.astro_page_ms = v < 0 ? 0 : (v > 65535 ? 65535 : v);   // fits uint16; 0 -> default
+    config.page_ms = v < 0 ? 0 : (v > 65535 ? 65535 : v);   // fits uint16; 0 -> default
   } else if (strcasecmp(key, "Tolerance_time_1ms") == 0) {
     config.tolerance_1ms = atoi(value);
   } else if (strcasecmp(key, "Tolerance_time_10ms") == 0) {
@@ -1395,7 +1395,7 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
 
   } else if (strcasecmp(key, "alt_colon_mode") == 0) {
 
-    colonModeAlt = parseColonName(value);   // shared by MODE_LST and MODE_SUNDIAL
+    colonModeAlt = parseColonName(value);   // shared by MODE_LST and MODE_SOLAR
     colonAltExplicit = 1;
 
   } else if (strcasecmp(key, "nmea") == 0) {
@@ -1414,8 +1414,8 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     set_mode_enabled(MODE_TEMPCOMP, value);
   } else if (strcasecmp(key, "MODE_LST") == 0) {
     set_mode_enabled(MODE_LST, value);
-  } else if (strcasecmp(key, "MODE_SUNDIAL") == 0) {
-    set_mode_enabled(MODE_SUNDIAL, value);
+  } else if (strcasecmp(key, "MODE_SOLAR") == 0) {
+    set_mode_enabled(MODE_SOLAR, value);
   } else if (strcasecmp(key, "tc_learn") == 0) {
     tc_learn = truthy(value);         // accumulate (die temp, ppm) samples while GPS-locked
   } else if (strcasecmp(key, "tc_apply") == 0) {
@@ -2468,7 +2468,7 @@ void SysTick_CountDown_P0(void)
   }
 }
 
-// Alternate-timebase handlers (MODE_LST / MODE_SUNDIAL): identical to the CountUp family —
+// Alternate-timebase handlers (MODE_LST / MODE_SOLAR): identical to the CountUp family —
 // same cascade, same sub-second painting, same precision ladder — except the .900 prep
 // overlays the staged alternate HH:MM:SS onto next7seg (see alt_prep_next).
 void SysTick_Alt_P3(void)
@@ -2844,7 +2844,7 @@ void nextMode(_Bool reverse){
     buffer_c[3].high &= ~cSegDP;
   }
   if ( displayMode == MODE_ISO_WEEK || justExited(MODE_COUNTDOWN)
-       || justExited(MODE_LST) || justExited(MODE_SUNDIAL)) {
+       || justExited(MODE_LST) || justExited(MODE_SOLAR)) {
     // If we exit countdown/alt mode at .9 seconds
     // it will show the wrong time for .1 seconds
     setNextTimestamp(currentTime);
@@ -2871,7 +2871,7 @@ void nextMode(_Bool reverse){
     TIM2->CCR2 = 0;
     latchSegments();
 
-  } else if (displayMode == MODE_LST || displayMode == MODE_SUNDIAL) {
+  } else if (displayMode == MODE_LST || displayMode == MODE_SOLAR) {
 
     countMode = COUNT_ALT;
     setNextTimestamp(currentTime);   // stock civil bookkeeping (integer path; countdown-arm cost)
@@ -3266,7 +3266,7 @@ int main(void)
       // unchanged when skipped, so the flip just shows on the next loop (<=100 ms later).
       if ((displayMode == MODE_SUN || displayMode == MODE_LATLON) && astro.have_pos && astro.epoch) {
         static uint32_t last_pg = 0;
-        uint32_t pg = uwTick / astro_pm();
+        uint32_t pg = uwTick / page_ms();
         if (pg != last_pg && decisec != 9) { last_pg = pg; sendDate(1); }
       }
     }
@@ -3274,11 +3274,11 @@ int main(void)
     // MODE_TEMPCOMP pages on the same dwell: repaint on the page flip (same guard as above)
     if (displayMode == MODE_TEMPCOMP) {
       static uint32_t tc_last_pg = 0;
-      uint32_t pg = uwTick / astro_pm();
+      uint32_t pg = uwTick / page_ms();
       if (pg != tc_last_pg && decisec != 9) { tc_last_pg = pg; sendDate(1); }
     }
 
-    // MODE_LST / MODE_SUNDIAL: stage the next civil boundary's alternate reading
+    // MODE_LST / MODE_SOLAR: stage the next civil boundary's alternate reading
     // (thread-context doubles; no-op in every other mode)
     alt_update();
 
