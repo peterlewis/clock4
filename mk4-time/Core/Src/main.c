@@ -239,6 +239,7 @@ struct {
   time_t countdown_to;
   float brightness_override;
   volatile _Bool zone_override;
+  uint16_t page_ms;             // paged modes (SUN/LATLON): sub-screen dwell, ms
   _Bool modes_enabled[NUM_DISPLAY_MODES];
 
 } config = {0};
@@ -270,6 +271,10 @@ void memcpyword(volatile uint32_t *dest, volatile uint32_t *src, size_t n){
 static _Bool astro_pos_ok(float lat, float lon){
   return lat >= -90.0f && lat <= 90.0f && lon >= -180.0f && lon <= 180.0f;
 }
+// Sub-screen dwell (ms) for the paged modes (SUN, LATLON). Unset -> 5500 ms, a
+// subjectively-tuned cadence found by feel. Floored at 250 ms so a tiny value can't
+// flood the date-board UART.
+static uint32_t page_ms(void){ uint32_t m = config.page_ms; return m == 0 ? 5500 : (m < 250 ? 250 : m); }
 // Decimal UTC hour (sun_times may return <0 or >24) -> local minutes-of-day [0,1440).
 static int astro_local_minutes(double utc_h){
   double h = fmod(utc_h + currentOffset / 3600.0, 24.0);
@@ -575,7 +580,7 @@ void sendDate( _Bool now ){
   //     leaving the time row as the running clock (SATVIEW-style). --------------
   case MODE_SUN: {
     if (!astro.have_pos || !astro.epoch) { i = sprintf((char*)&uart2_tx_buffer[1], "RISE  ----"); break; }
-    int page = (currentTime / 2) % 3;                  // rise -> set -> solar noon, 2 s each
+    int page = (uwTick / page_ms()) % 3;               // rise -> set -> solar noon, page_ms each
     // labels padded to 4 chars in the literal ("SET "/"SOL ") so the time digits
     // line up under RISE without relying on the nano printf honouring "%-4s"
     const char *lbl = page == 0 ? "RISE" : page == 1 ? "SET " : "SOL ";
@@ -606,7 +611,7 @@ void sendDate( _Bool now ){
     // 10 chars, so the separator is dropped just for that case ("LON 179.99" / "LON-179.99").
     if (!astro.have_pos || !astro.epoch) { i = sprintf((char*)&uart2_tx_buffer[1], "LAT  ----"); }
     else {
-      _Bool lat = (currentTime / 2) % 2 == 0;          // page latitude / longitude, 2 s each
+      _Bool lat = (uwTick / page_ms()) % 2 == 0;       // page latitude / longitude, page_ms each
       double v = lat ? astro.lat_show : astro.lon_show;
       long h = (long)(v * 100.0 + (v < 0 ? -0.5 : 0.5));  // hundredths, rounded
       long a2 = h < 0 ? -h : h;
@@ -1151,6 +1156,9 @@ void parseConfigString(char *key, char *value) {
     set_mode_enabled(MODE_GRID, value);
   } else if (strcasecmp(key, "MODE_LATLON") == 0) {
     set_mode_enabled(MODE_LATLON, value);
+  } else if (strcasecmp(key, "page_ms") == 0) {
+    int v = atoi(value);
+    config.page_ms = v < 0 ? 0 : (v > 65535 ? 65535 : v);   // fits uint16; 0 -> default
   } else if (strcasecmp(key, "Tolerance_time_1ms") == 0) {
     config.tolerance_1ms = atoi(value);
   } else if (strcasecmp(key, "Tolerance_time_10ms") == 0) {
@@ -2421,8 +2429,19 @@ int main(void)
       measure_vbat();
 
     if (displayMode == MODE_SUN  || displayMode == MODE_SUN_AZEL || displayMode == MODE_MOON
-        || displayMode == MODE_GRID || displayMode == MODE_LATLON)
+        || displayMode == MODE_GRID || displayMode == MODE_LATLON) {
       astro_update();
+      // honour the ms page dwell: the date row otherwise only repaints at 1 Hz, so repaint
+      // the moment a paged mode flips sub-screen. Only with a fix (no-fix shows a
+      // page-independent "----"), and never in the last decisecond -- there the SysTick ISR
+      // runs its own (non-reentrant, shared-UART) sendDate(0), so we'd race it. Same
+      // decisec!=9 guard the existing main-loop sendDate(1) calls use.
+      if ((displayMode == MODE_SUN || displayMode == MODE_LATLON) && astro.have_pos && astro.epoch) {
+        static uint32_t last_pg = 0;
+        uint32_t pg = uwTick / page_ms();
+        if (pg != last_pg && decisec != 9) { last_pg = pg; sendDate(1); }
+      }
+    }
 
 
     /* USER CODE END WHILE */

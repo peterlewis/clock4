@@ -115,7 +115,7 @@ pps = off
 # They use the current position; with no GPS fix they fall back to fake_latitude/
 # fake_longitude below (handy indoors), or show "----" if neither is set.
 
-# Sunrise / sunset / solar noon (local time). Pages every 2 s: RISE -> SET -> SOL.
+# Sunrise / sunset / solar noon (local time). Pages RISE -> SET -> SOL (see page_ms).
 MODE_SUN = disabled
 
 # Sun azimuth & elevation right now, e.g. "AZ142EL38" (degrees; elevation may be negative).
@@ -129,8 +129,12 @@ MODE_MOON = disabled
 # Maidenhead grid locator, e.g. "IO91xl".
 MODE_GRID = disabled
 
-# Latitude / longitude in decimal degrees. Pages every 2 s: LAT -> LON.
+# Latitude / longitude in decimal degrees. Pages LAT -> LON (see page_ms).
 MODE_LATLON = disabled
+
+# Dwell per sub-screen for the paged modes (MODE_SUN, MODE_LATLON), in milliseconds.
+# Default 5500 (a subjectively-tuned cadence, found by feel); floored at 250.
+page_ms = 5500
 
 # Fixed position for the astro modes when there is no GPS fix (decimal degrees, N+/E+).
 # Note: setting these also pins the clock's position (GPS position updates are ignored).
