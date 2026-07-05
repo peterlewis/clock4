@@ -132,8 +132,6 @@ extern _Bool resendDate;
 #define CMD_LOAD_TEXT          0x90
 #define CMD_SET_FREQUENCY      0x91
 #define CMD_RELOAD_TEXT        0x92
-#define CMD_GEM                0x94   // +1 byte: 0 off, 1 larson (date board effect)
-#define CMD_COL_LEVELS         0x95   // +10 bytes: date-row column brightness 0..15
 #define CMD_SHOW_CRC           0x9D
 
 //#define NONCOMPLIANT_DATE_MODES
@@ -173,11 +171,6 @@ enum {
   MODE_MOON,       // moon phase index + illuminated %
   MODE_GRID,       // Maidenhead grid locator
   MODE_LATLON,     // latitude / longitude, auto-paged
-
-  // Display gems — opt-in date-row effects rendered BY THE DATE BOARD (the time row
-  // keeps telling the time; the precision paths are untouched). See DISPLAY_GEMS.md.
-  MODE_LARSON,     // A1: scanner pip with a fading tail
-  MODE_TERMINATOR, // B1: column brightness follows live daylight at that longitude
 
   // Temperature-compensation diagnostics: die temp / model offsets / sample count
   // paged on the date row (satview pattern). Values come from the tempcomp module.
