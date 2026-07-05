@@ -179,13 +179,24 @@ enum {
   MODE_LARSON,     // A1: scanner pip with a fading tail
   MODE_TERMINATOR, // B1: column brightness follows live daylight at that longitude
 
+  // Temperature-compensation diagnostics: die temp / model offsets / sample count
+  // paged on the date row (satview pattern). Values come from the tempcomp module.
+  MODE_TEMPCOMP,
+
+  // Alternate-timebase TIME-ROW modes: the big digits tick Local Sidereal Time or
+  // apparent solar ("sundial") time, reseeded from the GPS-disciplined second; the
+  // date row keeps the civil date and a dedicated colon animation marks the mode.
+  MODE_LST,
+  MODE_SUNDIAL,
+
   NUM_DISPLAY_MODES
 };
 
 enum {
   COUNT_NORMAL =0,
   COUNT_HIDDEN,
-  COUNT_DOWN
+  COUNT_DOWN,
+  COUNT_ALT      // time row driven by the alternate timebase (MODE_LST / MODE_SUNDIAL)
 };
 
 enum {

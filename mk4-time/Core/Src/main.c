@@ -192,6 +192,13 @@ _Bool resendDate = 0;
 uint32_t LPTIM1_high;
 
 uint8_t displayMode = 0, countMode = 0, colonMode = 0;
+// Civil vs alternate-timebase colon animation: colonMode is the ACTIVE selection that
+// loadColonAnimation() renders; the per-context choices live here and applyColonForMode()
+// swaps between them. The sidereal default must stay visually distinct from civil so
+// MODE_LST/MODE_SUNDIAL can never masquerade as civil time.
+uint8_t colonModeCivil = 0;
+uint8_t colonModeAlt = COLON_MODE_ALT_SAWTOOTH;
+_Bool colonAltExplicit = 0;    // user explicitly set sidereal_colon_mode
 uint8_t requestMode = 255;
 uint8_t nmea_cdc_level=0;
 int debug_rtc_val = 0;
@@ -214,6 +221,60 @@ volatile struct {
   int16_t  temp;       // die temperature (°C) — for host-side ppm-vs-temperature characterisation
   uint8_t  flags;      // bit0 data_valid, bit1 had_pps, bit2 rtc_good
 } pps_cap;
+
+// --- Temperature compensation (opt-in) ------------------------------------------------------
+// Learns ppm-vs-die-temperature for both oscillators while GPS-locked (tc_learn), then during
+// GPS-loss holdover steers the SysTick timebase from the HSE model (tc_apply) and optionally
+// trims RTC->CALR from the LSE model (tc_rtc) so the battery RTC hands over better time across
+// a power loss. "tc_dump = on" over serial prints the learned coefficients as ready-to-paste
+// config lines; non-NAN tc_hse_a/tc_lse_a in config freeze the model (config overrides learning).
+// All defaults off: with none of the keys set, behaviour is identical to stock.
+// Config-key scalars are written from the USB OTG ISR (parseConfigString) and read by the
+// main loop: volatile, matching the pps_ts_enabled precedent.
+volatile _Bool tc_learn = 0, tc_apply = 0, tc_rtc = 0;
+volatile int16_t  tc_t0 = 40;              // model centre temperature (°C)
+volatile uint16_t tc_engage_s = 2;         // seconds of PPS absence before steering engages (min 2)
+volatile uint16_t tc_max_ppm = 100;        // hard clamp on the applied correction magnitude
+// Frozen coefficients (ppm units at tc_t0). Elements are single-word (atomic) reads/writes;
+// consumers snapshot each element once. HSE has NO 'a': its learned origin is arbitrary and
+// steering uses temperature differences only, so freezing needs just b (and optionally c).
+float tc_cfg_hse[3] = {NAN, NAN, NAN};     // [0] unused, [1] ppm/°C, [2] ppm/°C²
+float tc_cfg_lse[3] = {NAN, NAN, NAN};     // absolute: ppm, ppm/°C, ppm/°C²
+volatile _Bool tc_dump_pending = 0;        // set by the serial parser, serviced in the main loop
+volatile _Bool tc_reset_pending = 0;
+
+// Validated coefficient parse: garbage/'----'/empty leaves the value untouched (a pasted-back
+// commented dump line must not freeze 0.0); an explicit "nan" parses and UNFREEZES the slot.
+static void tc_parse_coeff(const char *v, float *out){
+  char *end;
+  float f = strtof(v, &end);
+  if (end != v) *out = f;
+}
+
+// Steering handoff, governor (main loop) -> tick ISR. base/rem are written together under
+// IRQ-off; the ISR Bresenham distributes `rem` one-tick-longer periods per 1000 ms so the
+// average period is (tc_load_base+1) + rem/1000 ticks — fractional-ppm rate steering.
+volatile uint8_t tc_steer_on = 0;
+volatile int32_t tc_load_base = 0;         // SysTick->LOAD for the shorter of the two periods
+volatile int32_t tc_rem = 0;               // extra-tick remainder, always in [0,1000)
+volatile int32_t tc_acc = 0;               // Bresenham accumulator (ISR-owned)
+
+// Learned state (main-loop only). 2 °C bins spanning die temp -8..71 °C; sums are bounded by
+// the halving-at-32768 aging rule (max |sum| ~ 6400*32768 < 2^31), so int32 cannot overflow.
+struct tc_bin { int32_t hse_sum, lse_sum; uint16_t hse_n, lse_n; };
+struct tc_bin tc_bins[40];
+float tc_hse_m[3], tc_lse_m[3];            // learned models (ppm at powers of T - tc_t0)
+_Bool tc_hse_valid = 0, tc_lse_valid = 0;
+int16_t tc_hse_tmin = 0, tc_hse_tmax = 0;  // learned coverage: model is clamped to this range
+int16_t tc_lse_tmin = 0, tc_lse_tmax = 0;
+uint32_t tc_n_hse = 0, tc_n_lse = 0;       // lifetime sample counts (display + dump)
+
+// Display cache for MODE_TEMPCOMP. Written by the governor (main loop); read by sendDate,
+// which ALSO runs from the SysTick ISRs — each field is a single 32-bit (atomic) access, so
+// the worst case is a one-repaint-stale value pairing, never a torn read.
+float tc_disp_hse = 0, tc_disp_lse = 0;
+_Bool tc_disp_hse_ok = 0, tc_disp_lse_ok = 0;
+char  tc_disp_state = '-';                 // A applying · F frozen (config) · L learning · - idle
 
 #define CHECK_CONFIG_MTIME
 
@@ -347,6 +408,8 @@ void sendDate( _Bool now ){
 
   switch (displayMode) {
   default:
+  case MODE_LST:       // alt-timebase modes keep the civil date on the date row —
+  case MODE_SUNDIAL:   // the bottom row stays an unambiguous civil anchor
   case MODE_ISO8601_STD:
     uart2_tx_buffer[1] ='2';
     uart2_tx_buffer[2] ='0';
@@ -488,6 +551,31 @@ void sendDate( _Bool now ){
       }
     }
     break;
+  case MODE_TEMPCOMP: {
+    // Pages: die temp -> HSE model -> LSE model -> samples+state, astro_page_ms dwell each.
+    // Values are the governor's display cache (clamped so the row never overflows). Layout is
+    // the RISE/SET style: label, separator space, a sign slot (space when positive), then the
+    // digits — numbers align whether signed or not, and short values keep clear space at the
+    // row's end beside the time row: "tC  32C" / "HSE -0.25" / "rtC  18.68" / "n 159 L".
+    int tcp = (int)((uwTick / astro_pm()) % 4);
+    char num[12];
+    if (tcp == 0) {
+      int t2 = (int)die_temp_c;
+      i = sprintf((char*)&uart2_tx_buffer[1], "tC %c%dC", t2 < 0 ? '-' : ' ', t2 < 0 ? -t2 : t2);
+    } else if (tcp == 1 || tcp == 2) {
+      _Bool ok = (tcp == 1) ? tc_disp_hse_ok : tc_disp_lse_ok;
+      float v = (tcp == 1) ? tc_disp_hse : tc_disp_lse;
+      if (!ok) i = sprintf((char*)&uart2_tx_buffer[1], "%s ----", (tcp == 1) ? "HSE" : "rtC");
+      else {
+        sprintf(num, "%.2f", (double)(v < 0 ? -v : v));
+        i = sprintf((char*)&uart2_tx_buffer[1], "%s %c%s", (tcp == 1) ? "HSE" : "rtC", v < 0 ? '-' : ' ', num);
+      }
+    } else {
+      unsigned long ns = tc_n_hse > 999999UL ? 999999UL : tc_n_hse;
+      i = sprintf((char*)&uart2_tx_buffer[1], "n%6lu %c", ns, tc_disp_state);
+    }
+    break;
+  }
   case MODE_STANDBY:
      return;
   case MODE_COUNTDOWN:
@@ -619,15 +707,19 @@ void sendDate( _Bool now ){
     i = sprintf((char*)&uart2_tx_buffer[1], "%s", astro.epoch ? astro.grid : "----");
     break;
   case MODE_LATLON:
+    // RISE/SET-style layout: label, separator space, a sign slot (space when positive), then
+    // the digits — numbers align whether signed or not, and short values keep clear space at
+    // the row's end: "LAT  51.48" / "LAT -51.48". A 3-digit longitude can't fit both the
+    // separator and the sign slot in 10 chars, so the separator is dropped just for that case
+    // ("LON 179.99" / "LON-179.99").
     if (!astro.have_pos || !astro.epoch) { i = sprintf((char*)&uart2_tx_buffer[1], "LAT  ----"); }
-    else if ((uwTick / astro_pm()) % 2 == 0) {         // page latitude / longitude, astro_page_ms each
-      long h = (long)(astro.lat_show * 100.0 + (astro.lat_show < 0 ? -0.5 : 0.5)); // hundredths, rounded
-      if (h < 0) i = sprintf((char*)&uart2_tx_buffer[1], "LAT-%ld.%02ld", -h / 100, -h % 100);
-      else       i = sprintf((char*)&uart2_tx_buffer[1], "LAT %ld.%02ld",  h / 100,  h % 100);
-    } else {
-      long h = (long)(astro.lon_show * 100.0 + (astro.lon_show < 0 ? -0.5 : 0.5));
-      if (h < 0) i = sprintf((char*)&uart2_tx_buffer[1], "LON-%ld.%02ld", -h / 100, -h % 100);
-      else       i = sprintf((char*)&uart2_tx_buffer[1], "LON %ld.%02ld",  h / 100,  h % 100);
+    else {
+      _Bool lat = (uwTick / astro_pm()) % 2 == 0;      // page latitude / longitude, astro_page_ms each
+      double v = lat ? astro.lat_show : astro.lon_show;
+      long h = (long)(v * 100.0 + (v < 0 ? -0.5 : 0.5));  // hundredths, rounded
+      long a2 = h < 0 ? -h : h;
+      i = sprintf((char*)&uart2_tx_buffer[1], (a2 >= 10000) ? "%s%c%ld.%02ld" : "%s %c%ld.%02ld",
+                  lat ? "LAT" : "LON", h < 0 ? '-' : ' ', a2 / 100, a2 % 100);
     }
     break;
   }
@@ -698,6 +790,81 @@ void setNextCountdown(time_t nextTime){
   next7seg.b[3] = bCat3 | cLut[minutes % 10]<<2;
   next7seg.b[4] = bCat4 | cLut[seconds / 10]<<2;
   next7seg.c = cLut[seconds % 10];
+}
+
+// --- Alternate timebase (MODE_LST / MODE_SUNDIAL) ------------------------------------------
+// The TIME ROW ticks Local Sidereal Time or apparent solar ("sundial") time. Heavy double
+// math runs in THREAD context once per second (alt_update), staging the reading for the
+// coming civil boundary; the SysTick_Alt_* handlers latch it at the .900 prep mark. The
+// display is quantized to civil second boundaries — value = floor(alt time at the boundary),
+// reseeded every second — so GPS discipline and holdover honesty are inherited from
+// currentTime for free. Sidereal runs 1.00273791x civil: the seconds display double-steps
+// once every ~6 min 5 s. That skip is the authentic signature of a true sidereal clock.
+static volatile struct {
+  uint8_t hh, mm, ss;
+  uint32_t for_time;            // civil epoch this reading is the floor of; 0 = invalid
+} alt_stage;
+static uint8_t alt_hh, alt_mm, alt_ss;   // ISR-owned: what the row currently shows
+static volatile _Bool alt_have_pos = 0;
+
+// Overlay an alternate HH:MM:SS onto the next7seg staging buffer. The stock
+// setNextTimestamp() has just run (keeping nextBcd / DST / date-row bookkeeping fresh);
+// only the six time-row digit patterns are replaced.
+#define alt_render_next7seg(hh, mm, ss) do { \
+    next7seg.c    = cLut[(ss) % 10]; \
+    next7seg.b[0] = bCat0 | cLut[(hh) / 10] << 2; \
+    next7seg.b[1] = bCat1 | cLut[(hh) % 10] << 2; \
+    next7seg.b[2] = bCat2 | cLut[(mm) / 10] << 2; \
+    next7seg.b[3] = bCat3 | cLut[(mm) % 10] << 2; \
+    next7seg.b[4] = bCat4 | cLut[(ss) / 10] << 2; \
+  } while (0)
+
+// The .900 prep for the alternate modes: stock next-second bookkeeping first, then latch
+// the staged reading — or, if the main loop was starved past the boundary, advance the last
+// shown reading by one second (bounded 2.74 ms/s drift, snapped back by the next reseed).
+#define alt_prep_next() do { \
+    currentTime++; \
+    setNextTimestamp( currentTime ); \
+    if (alt_stage.for_time == (uint32_t)currentTime) { \
+      alt_hh = alt_stage.hh; alt_mm = alt_stage.mm; alt_ss = alt_stage.ss; \
+    } else if (++alt_ss >= 60) { \
+      alt_ss = 0; \
+      if (++alt_mm >= 60) { alt_mm = 0; if (++alt_hh >= 24) alt_hh = 0; } \
+    } \
+    alt_render_next7seg(alt_hh, alt_mm, alt_ss); \
+    sendDate(0); \
+  } while (0)
+
+// Compute floor-HH:MM:SS of the alternate time at `when` (thread context only: doubles).
+static _Bool alt_compute(uint32_t when, uint8_t *hh, uint8_t *mm, uint8_t *ss){
+  float lat = latitude, lon = longitude;   // one consistent snapshot (astro_update pattern)
+  if (!astro_pos_ok(lat, lon)) return 0;
+  double hours = (displayMode == MODE_LST)
+               ? local_sidereal_time((double)when, (double)lon)
+               : local_solar_time((double)when, (double)lon);
+  if (!(hours >= 0.0) || hours >= 24.0) hours = 0.0;  // NaN / float-residue guard
+  int h2 = (int)hours;
+  double fm = (hours - h2) * 60.0;
+  int m2 = (int)fm;
+  int s2 = (int)((fm - m2) * 60.0);
+  if (h2 > 23) h2 = 23;
+  if (m2 > 59) m2 = 59;
+  if (s2 > 59) s2 = 59;
+  *hh = (uint8_t)h2; *mm = (uint8_t)m2; *ss = (uint8_t)s2;
+  return 1;
+}
+
+// Main-loop staging: once per second, prepare the reading for the coming civil boundary.
+void alt_update(void){
+  if (displayMode != MODE_LST && displayMode != MODE_SUNDIAL) return;
+  uint32_t target = (uint32_t)currentTime + 1;
+  if (alt_stage.for_time == target) return;
+  uint8_t hh, mm, ss;
+  if (!alt_compute(target, &hh, &mm, &ss)) { alt_have_pos = 0; alt_stage.for_time = 0; return; }
+  alt_have_pos = 1;
+  alt_stage.hh = hh; alt_stage.mm = mm; alt_stage.ss = ss;
+  __DMB();
+  alt_stage.for_time = target;    // stamp LAST: the ISR consumes only on exact match
 }
 
 // Store UTC on RTC
@@ -1045,6 +1212,17 @@ void loadColonAnimation(void){
 
 }
 
+// Select the colon animation for the current display mode (idempotent, thread context).
+// Alternate-timebase modes get their own animation so they read as "not civil" at a glance.
+void applyColonForMode(void){
+  uint8_t want = (displayMode == MODE_LST || displayMode == MODE_SUNDIAL)
+               ? colonModeAlt : colonModeCivil;
+  if (want != colonMode) {
+    colonMode = want;
+    loadColonAnimation();
+  }
+}
+
 _Bool truthy(char const* str){
   if (strcasecmp(str, "on")==0) return 1;
   if (strcasecmp(str, "enabled")==0) return 1;
@@ -1075,7 +1253,16 @@ float parseBrightness(char *v, _Bool invert){
 #define set_mode_enabled(mode, value) \
   if ((config.modes_enabled[mode] = truthy(value))) requestMode=mode;
 
-void parseConfigString(char *key, char *value) {
+static uint8_t parseColonName(const char *value){
+  if (strcasecmp(value, "solid") == 0)        return COLON_MODE_SOLID;
+  if (strcasecmp(value, "heartbeat") == 0)    return COLON_MODE_HEARTBEAT;
+  if (strcasecmp(value, "sawtooth") == 0)     return COLON_MODE_1PPS_SAWTOOTH;
+  if (strcasecmp(value, "alt_sawtooth") == 0) return COLON_MODE_ALT_SAWTOOTH;
+  if (strcasecmp(value, "toggle") == 0)       return COLON_MODE_TOGGLE;
+  return COLON_MODE_SLOWFADE;
+}
+
+void parseConfigString(char *key, char *value, _Bool from_serial) {
 
   if (strcasecmp(key, "text") == 0) {
 
@@ -1186,17 +1373,12 @@ void parseConfigString(char *key, char *value) {
     config.fake_lat = atof(value);
   } else if (strcasecmp(key, "colon_mode") == 0) {
 
-    if (strcasecmp(value, "solid") == 0) {
-      colonMode = COLON_MODE_SOLID;
-    } else if (strcasecmp(value, "heartbeat") == 0) {
-      colonMode = COLON_MODE_HEARTBEAT;
-    } else if (strcasecmp(value, "sawtooth") == 0) {
-      colonMode = COLON_MODE_1PPS_SAWTOOTH;
-    } else if (strcasecmp(value, "alt_sawtooth") == 0) {
-      colonMode = COLON_MODE_ALT_SAWTOOTH;
-    } else if (strcasecmp(value, "toggle") == 0) {
-      colonMode = COLON_MODE_TOGGLE;
-    } else colonMode = COLON_MODE_SLOWFADE;
+    colonModeCivil = parseColonName(value);
+
+  } else if (strcasecmp(key, "sidereal_colon_mode") == 0) {
+
+    colonModeAlt = parseColonName(value);   // shared by MODE_LST and MODE_SUNDIAL
+    colonAltExplicit = 1;
 
   } else if (strcasecmp(key, "nmea") == 0) {
 
@@ -1209,6 +1391,38 @@ void parseConfigString(char *key, char *value) {
   } else if (strcasecmp(key, "pps") == 0) {
 
     pps_ts_enabled = truthy(value);   // emit a $PMTXTS timing sentence on each PPS edge
+
+  } else if (strcasecmp(key, "MODE_TEMPCOMP") == 0) {
+    set_mode_enabled(MODE_TEMPCOMP, value);
+  } else if (strcasecmp(key, "MODE_LST") == 0) {
+    set_mode_enabled(MODE_LST, value);
+  } else if (strcasecmp(key, "MODE_SUNDIAL") == 0) {
+    set_mode_enabled(MODE_SUNDIAL, value);
+  } else if (strcasecmp(key, "tc_learn") == 0) {
+    tc_learn = truthy(value);         // accumulate (die temp, ppm) samples while GPS-locked
+  } else if (strcasecmp(key, "tc_apply") == 0) {
+    tc_apply = truthy(value);         // steer the SysTick timebase during GPS-loss holdover
+  } else if (strcasecmp(key, "tc_rtc") == 0) {
+    tc_rtc = truthy(value);           // additionally trim RTC->CALR while GPS is absent
+  } else if (strcasecmp(key, "tc_t0") == 0) {
+    int v = atoi(value); tc_t0 = v < -30 ? -30 : (v > 80 ? 80 : v);
+  } else if (strcasecmp(key, "tc_engage_s") == 0) {
+    // Floor of 2: currentTime pre-increments at the modelled .900 mark, so "fresh" reads 1
+    // for the last 100 ms of every LOCKED second — a floor of 1 would engage during lock.
+    int v = atoi(value); tc_engage_s = v < 2 ? 2 : (v > 3600 ? 3600 : v);
+  } else if (strcasecmp(key, "tc_max_ppm") == 0) {
+    int v = atoi(value); tc_max_ppm = v < 1 ? 1 : (v > 200 ? 200 : v);
+  } else if (strcasecmp(key, "tc_hse_b") == 0) { tc_parse_coeff(value, &tc_cfg_hse[1]);
+  } else if (strcasecmp(key, "tc_hse_c") == 0) { tc_parse_coeff(value, &tc_cfg_hse[2]);
+  } else if (strcasecmp(key, "tc_lse_a") == 0) { tc_parse_coeff(value, &tc_cfg_lse[0]);
+  } else if (strcasecmp(key, "tc_lse_b") == 0) { tc_parse_coeff(value, &tc_cfg_lse[1]);
+  } else if (strcasecmp(key, "tc_lse_c") == 0) { tc_parse_coeff(value, &tc_cfg_lse[2]);
+  } else if (strcasecmp(key, "tc_dump") == 0) {
+    // Serial-only trigger: print the learned model as paste-ready config lines. A stray
+    // tc_dump left in config.txt must not fire on every (re)load, hence the origin guard.
+    if (from_serial && truthy(value)) tc_dump_pending = 1;
+  } else if (strcasecmp(key, "tc_reset") == 0) {
+    if (from_serial && truthy(value)) tc_reset_pending = 1;   // serial-only, same guard
 
   } else if (key[0]=='B' && key[1]=='S' && key[3]==0) { //BS1, BS2, etc
     if (!key[2] || key[2]<'1' || key[2]>'0'+sizeof(brightnessCurve)/sizeof(brightnessCurve[0])) return;
@@ -1230,6 +1444,13 @@ void parseConfigString(char *key, char *value) {
 }
 
 void postConfigCleanup(void){
+  // Keep the sidereal colon distinct unless the user EXPLICITLY matched the two.
+  if (!colonAltExplicit && colonModeAlt == colonModeCivil) {
+    colonModeAlt = (colonModeCivil != COLON_MODE_ALT_SAWTOOTH) ? COLON_MODE_ALT_SAWTOOTH
+                 : COLON_MODE_TOGGLE;
+  }
+  colonMode = colonModeCivil;   // active selection re-derived below for the current mode
+  applyColonForMode();
   loadColonAnimation();
 
   // check at least one mode is enabled
@@ -1277,7 +1498,7 @@ void rxConfigString(char c){
       NVIC_SystemReset();
     }
     if (k && (v || state>=2)) {
-      parseConfigString(key, value);
+      parseConfigString(key, value, 1);   // serial origin: tc_dump/tc_reset may fire
       // rxConfigString runs in the USB OTG ISR; postConfigCleanup() calls nextMode()
       // and sendDate(), which are non-reentrant against the SysTick repaint. Defer it
       // to the main loop so it runs in thread context, like the file-config path does.
@@ -1333,7 +1554,9 @@ void readConfigFile(void){
   config.tolerance_100ms = 100000;
   config.zone_override = 0;
   config.brightness_override = -1.0;
-  colonMode = 0;
+  colonModeCivil = 0;
+  colonModeAlt = COLON_MODE_ALT_SAWTOOTH;
+  colonAltExplicit = 0;
 
   FIL file;
 
@@ -1373,7 +1596,7 @@ void readConfigFile(void){
        value[col]=0;
        col=0;
 
-       parseConfigString(key, value);
+       parseConfigString(key, value, 0);   // file origin: serial-only triggers inert
 
      }
    }
@@ -1596,7 +1819,459 @@ static uint8_t emitPPSTimestamp(void){
   return r;
 }
 
+// ==================== Temperature compensation (opt-in; state near pps_cap) ====================
+// Everything below runs in the MAIN LOOP only (float allowed, calibrateRTC precedent). The tick
+// ISRs see just three precomputed int32s via the tc_steer_* handoff in the timetick() hook.
+
+static uint32_t tc_nom_load = 0;    // SysTick->LOAD captured before any steering (80 MHz: 79999)
+
+// Ticks per ppm, derived from the captured nominal period so no core-clock assumption is baked
+// in: one second is (LOAD+1)*1000 ticks, so 1 ppm = (LOAD+1)/1000 ticks (80 at 80 MHz).
+// Verified against the live unit: $PMTXTS reports load=79999 (10 MHz TCXO -> PLL -> 80 MHz).
+static int32_t tc_tpp(void){ return (int32_t)((tc_nom_load + 1) / 1000); }
+
+static int tc_bin_i(int t){ int i = (t + 8) / 2; return i < 0 ? 0 : (i > 39 ? 39 : i); }
+
+// One HSE sample per GPS-locked second. The PPS ISRs re-zero the ms cascade at every edge
+// (SysTick->VAL reload + counter reset), so each capture is already a SELF-CONTAINED one-second
+// accumulation: pos = const + tpp·ppm(T), where const is a fixed capture/reload offset and
+// tpp = ticks per ppm. Measured on the live unit: pos = 79925.8 ± 0.67 ticks (~8 ns RMS) — the
+// constant dominates and is unknowable from lock data alone, so the model is learned in ticks
+// with an ARBITRARY ORIGIN, rebased to the first accepted sample to keep bin sums small. Its
+// differences over temperature are exact, and holdover steering only ever applies
+// model(T_now) − model(T_at_loss), from which the origin cancels. (An earlier draft differenced
+// consecutive captures — but the per-edge cascade reset makes that identically ~0; verified on
+// hardware: dpos = 0.05 ± 1.1 ticks.)
+static int32_t tc_e0 = 0;                     // origin rebase: first accepted sample
+static _Bool   tc_e0_set = 0;
+static int32_t tc_ema = 0;                    // slow tracker for the glitch gate
+static void tc_hse_learn(void){
+  static uint32_t last_seq = 0;
+  static uint8_t  warm = 0;
+
+  __disable_irq();                            // tear-free copy (emitPPSTimestamp pattern)
+  uint32_t seq   = pps_cap.seq;
+  uint16_t subms = pps_cap.subms;
+  uint32_t st    = pps_cap.systick;
+  int16_t  temp  = pps_cap.temp;
+  uint8_t  flags = pps_cap.flags;
+  __enable_irq();
+
+  if (seq == last_seq) return;                // no new edge since last pass
+  _Bool contiguous = (seq == last_seq + 1);
+  last_seq = seq;
+
+  if ((flags & 0x3) != 0x3 || subms > 999) { warm = 0; return; }
+  if (!contiguous) { warm = 0; return; }      // edges were missed: settle again
+  if (warm < 10) { warm++; return; }          // settle after (re)acquisition
+
+  int32_t half = (int32_t)(tc_nom_load + 1) * 500;   // half a second in ticks
+  int32_t e = (int32_t)subms * (int32_t)(tc_nom_load + 1)
+            + (int32_t)tc_nom_load - (int32_t)st;    // this second's accumulation (+ const)
+  if (e >  half) e -= 2 * half;               // fold the origin into ±half a second
+  if (e < -half) e += 2 * half;
+
+  int32_t tpp = tc_tpp();                     // ticks per ppm (80 at 80 MHz)
+  if (!tc_e0_set) { tc_e0 = e; tc_ema = 0; tc_e0_set = 1; }
+  e -= tc_e0;                                 // arbitrary-origin rebase (keeps sums int32-safe)
+  if (e - tc_ema > 100 * tpp || e - tc_ema < -100 * tpp) return; // >100 ppm step: glitch
+  if (e > 30000 || e < -30000) return;        // hard cap so 32768·|e| can never overflow int32
+  tc_ema += (e - tc_ema) / 16;
+
+  struct tc_bin *b = &tc_bins[tc_bin_i(temp)];
+  if (b->hse_n >= 8) {                        // per-bin outlier gate: 10 ppm off the mean
+    int32_t d = e - b->hse_sum / (int32_t)b->hse_n;
+    if (d > 10 * tpp || d < -10 * tpp) return;
+  }
+  if (b->hse_n >= 32768) { b->hse_sum /= 2; b->hse_n /= 2; }   // overflow-proof aging
+  b->hse_sum += e; b->hse_n++;
+  tc_n_hse++;
+}
+
+// One LSE sample per successful RTC calibration: calibrateRTC only advances the BKP31R stamp
+// on an in-range 63 s measurement, so watching the stamp inherits its validity gate for free.
+static void tc_lse_learn(void){
+  static uint32_t seen = 0;
+  uint32_t cal = rtc_last_calibration;
+  if (cal == seen) return;
+  _Bool first = (seen == 0);
+  seen = cal;
+  if (first) return;                          // boot-time stamp, not a fresh measurement
+  int32_t v = debug_rtc_val;                  // raw LSE cycle error over CAL_PERIOD (63 s)
+  if (v > 1000 || v < -1000) return;
+  struct tc_bin *b = &tc_bins[tc_bin_i(die_temp_c)];
+  if (b->lse_n >= 32768) { b->lse_sum /= 2; b->lse_n /= 2; }
+  b->lse_sum += v; b->lse_n++;
+  tc_n_lse++;
+}
+
+// Solve A·x = y for a 3x3 symmetric system by Gaussian elimination with partial pivoting.
+static _Bool tc_gauss3(float A[3][3], float y[3], float x[3]){
+  int p[3] = {0, 1, 2};
+  for (int c = 0; c < 3; c++){
+    int best = c;
+    for (int r = c + 1; r < 3; r++)
+      if (fabsf(A[p[r]][c]) > fabsf(A[p[best]][c])) best = r;
+    int t = p[c]; p[c] = p[best]; p[best] = t;
+    if (fabsf(A[p[c]][c]) < 1e-9f) return 0;
+    for (int r = c + 1; r < 3; r++){
+      float f = A[p[r]][c] / A[p[c]][c];
+      for (int k = c; k < 3; k++) A[p[r]][k] -= f * A[p[c]][k];
+      y[p[r]] -= f * y[p[c]];
+    }
+  }
+  for (int c = 2; c >= 0; c--){
+    float s = y[p[c]];
+    for (int k = c + 1; k < 3; k++) s -= A[p[c]][k] * x[k];
+    x[c] = s / A[p[c]][c];
+  }
+  return 1;
+}
+
+// Weighted least-squares fit of y(T) = a + b·x + c·x², x = T - tc_t0, over bin means.
+// Falls back quadratic -> linear -> constant as temperature coverage thins. `scale` converts
+// bin units (HSE: 1.0 — model stays in ticks, arbitrary origin; LSE: raw 63 s cal cycles → ppm).
+// A fit is only accepted if every coefficient is finite: a near-singular system can pass the
+// pivot threshold yet overflow to Inf/NaN, and NaN must never reach the steering or display.
+static _Bool tc_fin3(const float m[3]){ return isfinite(m[0]) && isfinite(m[1]) && isfinite(m[2]); }
+
+static _Bool tc_fit_one(_Bool lse, float scale, uint16_t n_quad, float m[3],
+                        int16_t *tmin_out, int16_t *tmax_out){
+  float S[5] = {0,0,0,0,0}, T[3] = {0,0,0};
+  float S0a = 0, T0a = 0;                     // all-samples weighted mean (constant fallback)
+  int nb = 0, tmin = 127, tmax = -128;
+  int tmin_a = 127, tmax_a = -128;
+
+  for (int i = 0; i < 40; i++){
+    uint16_t n  = lse ? tc_bins[i].lse_n   : tc_bins[i].hse_n;
+    if (!n) continue;
+    int32_t sum = lse ? tc_bins[i].lse_sum : tc_bins[i].hse_sum;
+    int   t = i * 2 - 8;                      // bin low edge; bin holds {t, t+1}
+    float y = ((float)sum / (float)n) * scale;
+    float w = (float)n;
+    S0a += w; T0a += w * y;
+    if (t < tmin_a) tmin_a = t;
+    if (t > tmax_a) tmax_a = t;
+    if (n < n_quad) continue;                 // curve terms only from well-filled bins
+    float x = ((float)t + 0.5f) - (float)tc_t0;   // true bin centre: t + 0.5
+    nb++;
+    if (t < tmin) tmin = t;
+    if (t > tmax) tmax = t;
+    S[0] += w;         S[1] += w*x;       S[2] += w*x*x;
+    S[3] += w*x*x*x;   S[4] += w*x*x*x*x;
+    T[0] += w*y;       T[1] += w*x*y;     T[2] += w*x*x*y;
+  }
+
+  if (nb >= 3 && (tmax - tmin) >= 6) {        // quadratic
+    float A[3][3] = {{S[0],S[1],S[2]},{S[1],S[2],S[3]},{S[2],S[3],S[4]}};
+    float yv[3]   = {T[0],T[1],T[2]};
+    if (tc_gauss3(A, yv, m) && tc_fin3(m)) { *tmin_out = tmin; *tmax_out = tmax; return 1; }
+  }
+  if (nb >= 2 && (tmax - tmin) >= 4) {        // linear
+    float det = S[0]*S[2] - S[1]*S[1];
+    if (fabsf(det) > 1e-9f){
+      m[0] = (T[0]*S[2] - T[1]*S[1]) / det;
+      m[1] = (S[0]*T[1] - S[1]*T[0]) / det;
+      m[2] = 0;
+      if (tc_fin3(m)) { *tmin_out = tmin; *tmax_out = tmax; return 1; }
+    }
+  }
+  if (S0a >= (lse ? 8.0f : 60.0f)) {          // constant: the dominant fixed offset
+    m[0] = T0a / S0a; m[1] = 0; m[2] = 0;
+    if (tc_fin3(m)) { *tmin_out = tmin_a; *tmax_out = tmax_a; return 1; }
+  }
+  return 0;
+}
+
+static void tc_fit(void){
+  tc_hse_valid = tc_fit_one(0, 1.0f, 64, tc_hse_m, &tc_hse_tmin, &tc_hse_tmax);
+  tc_lse_valid = tc_fit_one(1, 1e6f/(32768.0f*63.0f), 4, tc_lse_m, &tc_lse_tmin, &tc_lse_tmax);
+}
+
+static float tc_poly(const float m[3], float x){ return m[0] + m[1]*x + m[2]*x*x; }
+
+// LSE model (absolute ppm): non-NAN config a freezes it (the user asserted the values);
+// otherwise the learned fit, clamped to its observed temperature range (no extrapolation).
+// Config values are USB-ISR-written; snapshot each element once (single-word reads are atomic).
+static _Bool tc_model_lse(int t, float *ppm){
+  float a = tc_cfg_lse[0], b = tc_cfg_lse[1], c = tc_cfg_lse[2];
+  if (!isnan(a)) {
+    if (isnan(b)) b = 0;
+    if (isnan(c)) c = 0;
+    float x = (float)t - (float)tc_t0;
+    *ppm = a + b*x + c*x*x;
+    return isfinite(*ppm);
+  }
+  if (!tc_lse_valid) return 0;
+  if (t < tc_lse_tmin) t = tc_lse_tmin;
+  if (t > tc_lse_tmax) t = tc_lse_tmax;
+  *ppm = tc_poly(tc_lse_m, (float)t - (float)tc_t0);
+  return 1;
+}
+
+// HSE steering delta in TICKS between two temperatures. The learned model's origin is
+// arbitrary (see tc_hse_learn), so only differences are meaningful — which is exactly what
+// holdover needs: at GPS loss the display is phase-true, and the error that then accrues is
+// the temperature-driven CHANGE of the oscillator, model(T_now) − model(T_loss). Frozen config
+// coefficients are in ppm; a cancels in the difference, so only tc_hse_b/c are required.
+static _Bool tc_hse_delta(int t_now, int t_ref, int32_t *dticks){
+  float b = tc_cfg_hse[1], c = tc_cfg_hse[2];
+  if (!isnan(b)) {                            // frozen: b (and optionally c) from config
+    if (isnan(c)) c = 0;
+    float x1 = (float)t_now - (float)tc_t0, x0 = (float)t_ref - (float)tc_t0;
+    float dppm = (b*x1 + c*x1*x1) - (b*x0 + c*x0*x0);
+    if (!isfinite(dppm)) return 0;
+    *dticks = (int32_t)lroundf(dppm * (float)tc_tpp());
+    return 1;
+  }
+  if (!tc_hse_valid) return 0;
+  if (t_now < tc_hse_tmin) t_now = tc_hse_tmin;   // no extrapolation past learned coverage
+  if (t_now > tc_hse_tmax) t_now = tc_hse_tmax;
+  if (t_ref < tc_hse_tmin) t_ref = tc_hse_tmin;
+  if (t_ref > tc_hse_tmax) t_ref = tc_hse_tmax;
+  float d = tc_poly(tc_hse_m, (float)t_now - (float)tc_t0)
+          - tc_poly(tc_hse_m, (float)t_ref - (float)tc_t0);
+  if (!isfinite(d)) return 0;
+  *dticks = (int32_t)lroundf(d);              // learned model is already in ticks
+  return 1;
+}
+
+// Once-per-second control: evaluate the models at the current die temperature, refresh the
+// display cache, engage/disengage SysTick steering, and (optionally) trim RTC->CALR.
+static void tc_governor(void){
+  static uint32_t last_run = 0;
+  static int32_t  applied_E = 0;              // ticks/second currently steered
+  static _Bool    was_on = 0;
+  static int16_t  t_loss = 0;                 // die temp captured when steering engaged
+  static int32_t  last_steps = 0x7FFF;        // last CALR trim written (sentinel: none)
+  static uint32_t last_calr = 0;
+
+  // Snapshot the two ISR-written time variables together: currentTime increments at the
+  // modelled .900 mark while last_pps_time updates at the edge, and reading them separately
+  // can interleave with both ISRs and yield a wrapped-huge "fresh" that spuriously engages.
+  __disable_irq();
+  uint32_t now  = (uint32_t)currentTime;
+  uint32_t lpps = last_pps_time;
+  __enable_irq();
+  if (now == last_run) return;
+  last_run = now;
+
+  uint32_t fresh = now - lpps;                // seconds since the last PPS edge
+  if (fresh > 0x80000000u) fresh = 0;         // interleaved-read underflow: treat as fresh
+
+  int t = die_temp_c;
+  float lp = 0;
+  _Bool have_l = tc_model_lse(t, &lp);
+  int32_t tpp = tc_tpp();
+
+  // Would-be steering delta at the current temperatures (also feeds the display)
+  int32_t dt_now = 0;
+  _Bool have_h = tc_hse_delta(t, was_on ? t_loss : t, &dt_now);
+
+  // display cache (clamped so "HSE -99.99" never exceeds the 10-char row).
+  // HSE page shows the ACTIVE steering correction in ppm (0.00 while locked — the PPS
+  // discipline owns the phase then); LSE page shows the absolute model ppm.
+  float dh = was_on ? (float)applied_E / (float)tpp : 0.0f;
+  float dl = lp;
+  if (dh >  99.99f) dh =  99.99f;
+  if (dh < -99.99f) dh = -99.99f;
+  if (dl >  99.99f) dl =  99.99f;
+  if (dl < -99.99f) dl = -99.99f;
+  tc_disp_hse = dh;  tc_disp_hse_ok = have_h;
+  tc_disp_lse = dl;  tc_disp_lse_ok = have_l;
+  tc_disp_state = tc_steer_on ? 'A'
+                : (!isnan(tc_cfg_hse[1]) || !isnan(tc_cfg_lse[0])) ? 'F'
+                : (tc_learn && fresh < 5) ? 'L' : '-';
+
+  // --- HSE steering: engage only in holdover, after first-ever fix, with a usable model.
+  // The correction is the temperature-driven CHANGE since GPS loss (origin cancels; see
+  // tc_hse_delta). At the loss instant the delta is 0 by construction and grows only as the
+  // die temperature moves, so engage is glitch-free and re-lock needs no unwinding beyond
+  // the LOAD restore (the per-edge phase snap owns lock).
+  if (tc_apply && had_pps && fresh >= tc_engage_s) {
+    if (!was_on) t_loss = (int16_t)t;         // remember the temperature we lost GPS at
+    int32_t target = 0;
+    if (tc_hse_delta(t, t_loss, &target)) {
+      int32_t lim = (int32_t)tc_max_ppm * tpp;
+      if (target >  lim) target =  lim;
+      if (target < -lim) target = -lim;
+      if (!was_on) applied_E = target;        // 0 at engage by construction...
+      else {                                  // ...then gentle slew (temp-quantisation steps)
+        int32_t slew = tpp / 4;               // 0.25 ppm per second
+        int32_t d = target - applied_E;
+        if (d >  slew) d =  slew;
+        if (d < -slew) d = -slew;
+        applied_E += d;
+      }
+      int32_t base = applied_E >= 0 ? applied_E / 1000 : -((-applied_E + 999) / 1000);
+      int32_t rem  = applied_E - base * 1000; // floor-division remainder, always [0,1000)
+      __disable_irq();
+      tc_load_base = (int32_t)tc_nom_load + base;
+      tc_rem = rem;
+      tc_steer_on = 1;
+      __enable_irq();
+      was_on = 1;
+    } else if (was_on) {                      // model became unusable mid-holdover
+      tc_steer_on = 0;
+      SysTick->LOAD = tc_nom_load;
+      tc_acc = 0;
+      applied_E = 0;
+      was_on = 0;
+    }
+  } else if (was_on) {
+    tc_steer_on = 0;                          // flag first: the ISR stops writing LOAD...
+    SysTick->LOAD = tc_nom_load;              // ...then restore the nominal period
+    tc_acc = 0;
+    applied_E = 0;
+    was_on = 0;
+  }
+
+  // --- LSE -> RTC->CALR trim: power-loss insurance only (display time is HSE-driven) ---
+  // calibrateRTC() owns CALR while locked (it runs from the PPS ISRs, which are silent now);
+  // the first successful calibration after re-lock re-measures and overwrites this trim.
+  // While PPS is fresh, forget our last write: calibrateRTC has since replaced CALR, so an
+  // equal-valued model trim in the NEXT outage must not be skipped by the != guard.
+  if (fresh <= 63) last_steps = 0x7FFF;
+  if (tc_rtc && have_l && fresh > 63 && now - last_calr >= 60) {
+    int32_t steps = (int32_t)lroundf(lp * (1048576.0f / 1000000.0f));  // ppm -> CALM steps
+    if (steps >  255) steps =  255;
+    if (steps < -255) steps = -255;
+    if (steps != last_steps && !(RTC->ISR & RTC_ISR_RECALPF)) {
+      // IRQ-off around the WPR unlock/write/relock triplet: PendSV's write_rtc() (runs each
+      // second in holdover) does its own WPR sequence, and a preemption between our key
+      // writes and the CALR store would leave the store silently ignored.
+      __disable_irq();
+      __HAL_RTC_WRITEPROTECTION_DISABLE(&hrtc);
+      RTC->CALR = 0x100 + steps;              // same midpoint convention as calibrateRTC
+      __HAL_RTC_WRITEPROTECTION_ENABLE(&hrtc);
+      __enable_irq();
+      last_steps = steps;
+      last_calr = now;                        // note: BKP31R deliberately NOT updated
+    }
+  }
+}
+
+// "tc_dump = on" over serial: emit the learned model as ready-to-paste config.txt lines plus
+// two checksummed $PMTXTC sentences (H and L — split so each fits NMEA_BUF_SIZE). One line per
+// main-loop pass; each line is FORMATTED ONCE and only the CDC submit is retried on BUSY (float
+// snprintf must not re-run thousands of times against the ISR's own float sprintf — newlib-nano
+// shares one _reent). A stuck host aborts the dump after a bounded number of BUSY passes.
+// HSE coefficients are printed in ppm/°C (per-degree slope b and curvature c, converted from
+// the tick-domain model); the HSE 'a' term has an arbitrary instrument origin and is neither
+// printed nor needed — steering uses temperature DIFFERENCES only (see tc_hse_delta).
+static void tc_dump_step(void){
+  static uint8_t  idx = 0;
+  static int      dn = -1;                    // formatted length; -1 = line not built yet
+  static uint16_t busy_ct = 0;
+  static char     dline[NMEA_BUF_SIZE];
+  if (!tc_dump_pending) return;
+  if (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED) { tc_dump_pending = 0; idx = 0; dn = -1; return; }
+
+  if (dn < 0) {                               // build the current line exactly once
+    float tpp = (float)tc_tpp();
+    int n = 0;
+    switch (idx) {
+      case 0:
+        n = snprintf(dline, sizeof dline, "# tempcomp: hse n=%lu lse n=%lu, die %d..%d C, state %c\r\n",
+                     (unsigned long)tc_n_hse, (unsigned long)tc_n_lse,
+                     (int)tc_hse_tmin, (int)tc_hse_tmax, tc_disp_state);
+        break;
+      case 1: n = snprintf(dline, sizeof dline, "tc_t0 = %d\r\n", (int)tc_t0); break;
+      case 2:                                 // HSE slope, ppm/degC (origin-free)
+        if (tc_hse_valid) n = snprintf(dline, sizeof dline, "tc_hse_b = %.5f\r\n", (double)(tc_hse_m[1] / tpp));
+        else              n = snprintf(dline, sizeof dline, "# tc_hse_b = ----\r\n");
+        break;
+      case 3:                                 // HSE curvature, ppm/degC^2
+        if (tc_hse_valid) n = snprintf(dline, sizeof dline, "tc_hse_c = %.6f\r\n", (double)(tc_hse_m[2] / tpp));
+        else              n = snprintf(dline, sizeof dline, "# tc_hse_c = ----\r\n");
+        break;
+      case 4: case 5: case 6: {               // LSE a/b/c, absolute ppm at tc_t0
+        static const char nm[3] = {'a','b','c'};
+        static const char *fm[3] = {"tc_lse_%c = %.4f\r\n", "tc_lse_%c = %.5f\r\n", "tc_lse_%c = %.6f\r\n"};
+        int k = idx - 4;
+        if (tc_lse_valid) n = snprintf(dline, sizeof dline, fm[k], nm[k], (double)tc_lse_m[k]);
+        else              n = snprintf(dline, sizeof dline, "# tc_lse_%c = ----\r\n", nm[k]);
+        break;
+      }
+      case 7: case 8: {                       // machine-parsable pair for the web app
+        char body[72];
+        int nb;
+        if (idx == 7)
+          nb = snprintf(body, sizeof body, "PMTXTC,H,%lu,%d,%d,%.5f,%.6f,%c",
+                        (unsigned long)tc_n_hse, (int)tc_hse_tmin, (int)tc_hse_tmax,
+                        (double)(tc_hse_valid ? tc_hse_m[1] / tpp : 0),
+                        (double)(tc_hse_valid ? tc_hse_m[2] / tpp : 0), tc_hse_valid ? 'V' : '-');
+        else
+          nb = snprintf(body, sizeof body, "PMTXTC,L,%lu,%.4f,%.5f,%.6f,%c",
+                        (unsigned long)tc_n_lse,
+                        (double)(tc_lse_valid ? tc_lse_m[0] : 0), (double)(tc_lse_valid ? tc_lse_m[1] : 0),
+                        (double)(tc_lse_valid ? tc_lse_m[2] : 0), tc_lse_valid ? 'V' : '-');
+        if (nb < 0 || nb >= (int)sizeof body) { tc_dump_pending = 0; idx = 0; return; }
+        uint8_t cks = 0;
+        for (int i2 = 0; i2 < nb; i2++) cks ^= (uint8_t)body[i2];
+        n = snprintf(dline, sizeof dline, "$%s*%02X\r\n", body, (unsigned)cks);
+        break;
+      }
+    }
+    if (n <= 0 || n >= (int)sizeof dline) { tc_dump_pending = 0; idx = 0; dn = -1; return; }
+    dn = n;
+    busy_ct = 0;
+  }
+
+  __disable_irq();                            // serialise against the ISR NMEA passthrough
+  uint8_t r = CDC_Copy_Transmit((uint8_t*)dline, (uint16_t)dn);
+  __enable_irq();
+  if (r == USBD_BUSY) {                       // retry the SUBMIT only; the line stays built
+    if (++busy_ct > 5000) { tc_dump_pending = 0; idx = 0; dn = -1; }  // host stopped reading
+    return;
+  }
+  dn = -1;
+  if (++idx > 8) { idx = 0; tc_dump_pending = 0; }
+}
+
+// Main-loop entry point, called every pass. With every tc key at its default this reduces to
+// four flag checks — no measurable cost, no behaviour change.
+void tc_housekeeping(void){
+  if (!tc_nom_load) tc_nom_load = SysTick->LOAD;       // capture the nominal period once
+
+  if (tc_reset_pending) {
+    memset(tc_bins, 0, sizeof tc_bins);
+    tc_hse_valid = tc_lse_valid = 0;
+    tc_n_hse = tc_n_lse = 0;
+    tc_e0_set = 0; tc_ema = 0;                // new origin rebase with the next sample
+    tc_reset_pending = 0;
+  }
+
+  if (tc_learn) {
+    tc_hse_learn();
+    tc_lse_learn();
+    static uint32_t last_fit = 0;
+    uint32_t now = (uint32_t)currentTime;
+    if (now - last_fit >= 300) { last_fit = now; tc_fit(); }   // refit at most every 5 min
+  }
+
+  // tc_steer_on in the gate: the governor owns DISENGAGE, so it must stay reachable even if
+  // the user turns every tc key off while steering is engaged mid-holdover — otherwise the
+  // tick ISR would keep applying a stale frozen correction forever.
+  if (tc_learn || tc_apply || tc_rtc || tc_steer_on || displayMode == MODE_TEMPCOMP) tc_governor();
+
+  tc_dump_step();
+}
+
+// tc_steer(): holdover rate steering (see tc_governor). Sets the length of the NEXT 1 ms
+// period: LOAD writes take effect at the following reload, so distributing tc_rem longer
+// periods per 1000 gives an average of base + rem/1000 extra ticks per ms — fractional-ppm
+// rate control with three int32 ops. tc_steer_on is 0 unless tc_apply engaged in holdover,
+// so the stock cost is one predicted-untaken branch per ms.
+#define tc_steer() \
+    if (tc_steer_on) { \
+      tc_acc += tc_rem; \
+      if (tc_acc >= 1000) { tc_acc -= 1000; SysTick->LOAD = (uint32_t)(tc_load_base + 1); } \
+      else                { SysTick->LOAD = (uint32_t)tc_load_base; } \
+    }
+
 #define timetick() \
+    tc_steer(); \
     millisec++; \
     if (millisec>=10) { \
       millisec=0; \
@@ -1677,6 +2352,7 @@ void SysTick_CountUp_P0(void) {
 }
 
 void SysTick_CountUp_NoUpdate(void) {
+  tc_steer();                         // this handler inlines its own cascade: hook it too
   millisec++;
   if (millisec>=10) {
     millisec=0;
@@ -1772,6 +2448,59 @@ void SysTick_CountDown_P0(void)
     currentTime++;
     setNextCountdown( currentTime );
     sendDate(0);
+  }
+}
+
+// Alternate-timebase handlers (MODE_LST / MODE_SUNDIAL): identical to the CountUp family —
+// same cascade, same sub-second painting, same precision ladder — except the .900 prep
+// overlays the staged alternate HH:MM:SS onto next7seg (see alt_prep_next).
+void SysTick_Alt_P3(void)
+{
+  timetick()
+
+  buffer_c[3].low=cLut[millisec];
+  buffer_c[2].low=cLut[centisec];
+  buffer_c[1].low=cLut[decisec];
+
+  HAL_IncTick();
+
+  if (decisec==9 && centisec==0 && millisec==0){
+    alt_prep_next();
+  }
+}
+
+void SysTick_Alt_P2(void) {
+  timetick()
+
+  buffer_c[2].low=cLut[centisec];
+  buffer_c[1].low=cLut[decisec];
+
+  HAL_IncTick();
+
+  if (decisec==9 && centisec==0 && millisec==0){
+    alt_prep_next();
+  }
+}
+
+void SysTick_Alt_P1(void) {
+  timetick()
+
+  buffer_c[1].low=cLut[decisec];
+
+  HAL_IncTick();
+
+  if (decisec==9 && centisec==0 && millisec==0){
+    alt_prep_next();
+  }
+}
+
+void SysTick_Alt_P0(void) {
+  timetick()
+
+  HAL_IncTick();
+
+  if (decisec==9 && centisec==0 && millisec==0){
+    alt_prep_next();
   }
 }
 
@@ -1977,6 +2706,48 @@ void setPrecision(void){
       SetSysTick( &SysTick_CountUp_P0 );
     }
 
+  } else if (countMode == COUNT_ALT) {
+
+    if (!alt_have_pos) {
+      // No usable position (no fix, no fake_longitude): dashes, digits not ticking —
+      // never GMST-as-LST, never a guessed longitude. Re-evaluated every second; the
+      // row goes live the moment a position appears.
+      SetPPS( &PPS_NoUpdate );
+      SetSysTick( &SysTick_CountUp_NoUpdate );
+      buffer_b[0] = bCat0 | 0b01000000 << 2;
+      buffer_b[1] = bCat1 | 0b01000000 << 2;
+      buffer_b[2] = bCat2 | 0b01000000 << 2;
+      buffer_b[3] = bCat3 | 0b01000000 << 2;
+      buffer_b[4] = bCat4 | 0b01000000 << 2;
+      buffer_c[0].low = 0b01000000;
+      buffer_c[3].low = 0b01000000;
+      buffer_c[2].low = 0b01000000;
+      buffer_c[1].low = 0b01000000;
+      buffer_c[0].high= 0b11001110;
+    } else if (currentTime - last_pps_time < config.tolerance_1ms){
+      SetPPS( &PPS );
+      buffer_c[0].high= 0b11001110 | cSegDP;
+      SetSysTick( &SysTick_Alt_P3 );
+    } else if (currentTime - last_pps_time < config.tolerance_10ms){
+      SetPPS( &PPS );
+      buffer_c[3].low = 0b01000000;
+      buffer_c[0].high= 0b11001110 | cSegDP;
+      SetSysTick( &SysTick_Alt_P2 );
+    } else if (currentTime - rtc_last_calibration < config.tolerance_100ms){
+      SetPPS( &PPS );
+      buffer_c[3].low = 0b01000000;
+      buffer_c[2].low = 0b01000000;
+      buffer_c[0].high= 0b11001110 | cSegDP;
+      SetSysTick( &SysTick_Alt_P1 );
+    } else {
+      SetPPS( &PPS );
+      buffer_c[3].low = 0b01000000;
+      buffer_c[2].low = 0b01000000;
+      buffer_c[1].low = 0b01000000;
+      buffer_c[0].high= 0b11001110;
+      SetSysTick( &SysTick_Alt_P0 );
+    }
+
   } else if (displayMode == MODE_COUNTDOWN) {
 
     if (config.countdown_to >= currentTime) {
@@ -2052,8 +2823,9 @@ void nextMode(_Bool reverse){
     buffer_c[2].high &= ~cSegDP;
     buffer_c[3].high &= ~cSegDP;
   }
-  if ( displayMode == MODE_ISO_WEEK || justExited(MODE_COUNTDOWN)) {
-    // If we exit countdown mode at .9 seconds
+  if ( displayMode == MODE_ISO_WEEK || justExited(MODE_COUNTDOWN)
+       || justExited(MODE_LST) || justExited(MODE_SUNDIAL)) {
+    // If we exit countdown/alt mode at .9 seconds
     // it will show the wrong time for .1 seconds
     setNextTimestamp(currentTime);
   }
@@ -2079,6 +2851,25 @@ void nextMode(_Bool reverse){
     TIM2->CCR2 = 0;
     latchSegments();
 
+  } else if (displayMode == MODE_LST || displayMode == MODE_SUNDIAL) {
+
+    countMode = COUNT_ALT;
+    setNextTimestamp(currentTime);   // keep civil date-row/DST bookkeeping fresh
+    alt_stage.for_time = 0;          // fresh stage for the new mode's timebase
+    // Seed the row immediately mid-second (countdown precedent): show floor(alt time NOW),
+    // then stage the coming boundary so the first .900 prep latches a fresh reading.
+    if (alt_compute((uint32_t)currentTime, &alt_hh, &alt_mm, &alt_ss)) {
+      alt_have_pos = 1;
+      alt_render_next7seg(alt_hh, alt_mm, alt_ss);
+    } else {
+      alt_have_pos = 0;
+    }
+    alt_update();
+    setPrecision();                  // installs Alt_Px + PPS, or the dashed no-fix state
+    TIM2->CCR1 = 0;
+    TIM2->CCR2 = 0;
+    if (alt_have_pos) latchSegments();
+
   }
   else {
     if (countMode != COUNT_NORMAL) {
@@ -2090,6 +2881,7 @@ void nextMode(_Bool reverse){
       latchSegments();
     }
   }
+  applyColonForMode();   // idempotent: sidereal colon on entry, civil colon on exit
   sendDate(1);
 }
 void button1pressed(void){
@@ -2432,14 +3224,16 @@ int main(void)
 
     monitor_vbus();
 
-    if (pps_ts_enabled) {
+    if (pps_ts_enabled || tc_learn || tc_apply || tc_rtc || displayMode == MODE_TEMPCOMP) {
       static uint32_t last_temp_read = 0;
       if ((uint32_t)currentTime - last_temp_read >= 4) {   // refresh die temp every ~4 s
         last_temp_read = (uint32_t)currentTime;
         measure_temp();
       }
-      if (pps_record_pending) emitPPSTimestamp();           // emit clears pending itself on success
     }
+    if (pps_ts_enabled && pps_record_pending) emitPPSTimestamp(); // emit clears pending itself on success
+
+    tc_housekeeping();   // temp-comp learn/steer/dump; four flag checks when everything is off
 
     if (displayMode == MODE_VBAT)
       measure_vbat();
@@ -2459,6 +3253,17 @@ int main(void)
         if (pg != last_pg && decisec != 9) { last_pg = pg; sendDate(1); }
       }
     }
+
+    // MODE_TEMPCOMP pages on the same dwell: repaint on the page flip (same guard as above)
+    if (displayMode == MODE_TEMPCOMP) {
+      static uint32_t tc_last_pg = 0;
+      uint32_t pg = uwTick / astro_pm();
+      if (pg != tc_last_pg && decisec != 9) { tc_last_pg = pg; sendDate(1); }
+    }
+
+    // MODE_LST / MODE_SUNDIAL: stage the next civil boundary's alternate reading
+    // (thread-context doubles; no-op in every other mode)
+    alt_update();
 
     // Display gems (MODE_LARSON / MODE_TERMINATOR): the DATE BOARD renders the effect;
     // this loop only switches it on/off and, for the terminator, streams ten brightness

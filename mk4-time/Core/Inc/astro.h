@@ -38,6 +38,9 @@ int    moon_phase_index(double phase);            /* 0..7, see ASTRO_MOON_NAMES 
 /* (d) Equation of time in minutes (+ = apparent sun ahead of mean/clock sun). */
 double equation_of_time(double unix_s);
 
+double local_sidereal_time(double unix_s, double lon); /* LMST, hours [0,24), lon E+ */
+double local_solar_time(double unix_s, double lon);    /* apparent solar, hours [0,24) */
+
 /* (d2) Subsolar point at the given UTC instant: latitude = solar declination,
  *      longitude in [-180,180] (E+). Time-only — needs no observer position. */
 void   sun_subsolar(double unix_s, double *lat, double *lon);

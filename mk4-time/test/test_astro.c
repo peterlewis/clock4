@@ -116,6 +116,27 @@ int main(void) {
         sun_subsolar(V2.t, &slat, NULL); chk("decl jan 1",   slat, -23.06, 0.10);
     }
 
+    printf("local_sidereal_time (h):\n");
+    /* Absolute anchors: GMST at J2000.0 = 18.697374558 h (IAU); Meeus "Astronomical
+     * Algorithms" ex. 12.b, 1987-04-10 19:21:00 UT -> mean GMST 8h34m57.1s = 8.582525 h.
+     * LST = GMST + lon/15, so longitude shifts and 24 h wrap are checked too. */
+    chk("LST J2000 lon0",        local_sidereal_time(946728000.0,   0.0), 18.697375, 0.001);
+    chk("LST Meeus lon0",        local_sidereal_time(545080860.0,   0.0),  8.582525, 0.002);
+    chk("LST J2000 lon -75",     local_sidereal_time(946728000.0, -75.0), 13.697375, 0.001);
+    chk("LST J2000 lon +90wrap", local_sidereal_time(946728000.0,  90.0),  0.697375, 0.001);
+
+    printf("local_solar_time (h):\n");
+    /* Independent of the implementation: at the sun's meridian transit the apparent
+     * solar time is 12:00 exactly. Build that instant from sun_times()'s solar_noon
+     * (validated above) and confirm — catches any longitude/EoT sign or wrap error. */
+    for (int i = 0; i < 4; i++) {
+        double nn;
+        sun_times(V[i]->lat, V[i]->lon, V[i]->t, NULL, NULL, &nn, NULL, NULL, NULL);
+        double noon_unix = trunc(V[i]->t / 86400.0) * 86400.0 + nn * 3600.0;
+        char nm[40]; sprintf(nm, "solar@noon %s", V[i]->tag);
+        chk(nm, local_solar_time(noon_unix, V[i]->lon), 12.0, 0.02);
+    }
+
     printf("\n%d/%d passed, %d failed\n", total - fails, total, fails);
     return fails ? 1 : 0;
 }
