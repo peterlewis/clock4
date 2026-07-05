@@ -171,13 +171,20 @@ enum {
   MODE_GRID,       // Maidenhead grid locator
   MODE_LATLON,     // latitude / longitude, auto-paged
 
+  // Alternate-timebase TIME-ROW modes: the big digits tick Local Sidereal Time or
+  // apparent solar ("sundial") time, reseeded from the GPS-disciplined second; the
+  // date row keeps the civil date and a dedicated colon animation marks the mode.
+  MODE_LST,
+  MODE_SUNDIAL,
+
   NUM_DISPLAY_MODES
 };
 
 enum {
   COUNT_NORMAL =0,
   COUNT_HIDDEN,
-  COUNT_DOWN
+  COUNT_DOWN,
+  COUNT_ALT      // time row driven by the alternate timebase (MODE_LST / MODE_SUNDIAL)
 };
 
 enum {
