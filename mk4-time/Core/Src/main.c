@@ -568,15 +568,18 @@ void sendDate( _Bool now ){
     i = sprintf((char*)&uart2_tx_buffer[1], "%s", astro.epoch ? astro.grid : "----");
     break;
   case MODE_LATLON:
+    // RISE/SET-style layout: label, separator space, a sign slot (space when positive), then
+    // the digits — numbers align whether signed or not, and short values keep clear space at
+    // the row's end. A 3-digit longitude can't fit both the separator and the sign slot in
+    // 10 chars, so the separator is dropped just for that case ("LON 179.99" / "LON-179.99").
     if (!astro.have_pos || !astro.epoch) { i = sprintf((char*)&uart2_tx_buffer[1], "LAT  ----"); }
-    else if ((currentTime / 2) % 2 == 0) {             // page latitude / longitude, 2 s each
-      long h = (long)(astro.lat_show * 100.0 + (astro.lat_show < 0 ? -0.5 : 0.5)); // hundredths, rounded
-      if (h < 0) i = sprintf((char*)&uart2_tx_buffer[1], "LAT-%ld.%02ld", -h / 100, -h % 100);
-      else       i = sprintf((char*)&uart2_tx_buffer[1], "LAT %ld.%02ld",  h / 100,  h % 100);
-    } else {
-      long h = (long)(astro.lon_show * 100.0 + (astro.lon_show < 0 ? -0.5 : 0.5));
-      if (h < 0) i = sprintf((char*)&uart2_tx_buffer[1], "LON-%ld.%02ld", -h / 100, -h % 100);
-      else       i = sprintf((char*)&uart2_tx_buffer[1], "LON %ld.%02ld",  h / 100,  h % 100);
+    else {
+      _Bool lat = (currentTime / 2) % 2 == 0;          // page latitude / longitude, 2 s each
+      double v = lat ? astro.lat_show : astro.lon_show;
+      long h = (long)(v * 100.0 + (v < 0 ? -0.5 : 0.5));  // hundredths, rounded
+      long a2 = h < 0 ? -h : h;
+      i = sprintf((char*)&uart2_tx_buffer[1], (a2 >= 10000) ? "%s%c%ld.%02ld" : "%s %c%ld.%02ld",
+                  lat ? "LAT" : "LON", h < 0 ? '-' : ' ', a2 / 100, a2 % 100);
     }
     break;
   }
