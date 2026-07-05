@@ -198,7 +198,7 @@ uint8_t displayMode = 0, countMode = 0, colonMode = 0;
 // MODE_LST/MODE_SUNDIAL can never masquerade as civil time.
 uint8_t colonModeCivil = 0;
 uint8_t colonModeAlt = COLON_MODE_ALT_SAWTOOTH;
-_Bool colonAltExplicit = 0;    // user explicitly set sidereal_colon_mode
+_Bool colonAltExplicit = 0;    // user explicitly set alt_colon_mode
 uint8_t requestMode = 255;
 uint8_t nmea_cdc_level=0;
 int debug_rtc_val = 0;
@@ -787,6 +787,8 @@ static volatile struct {
 } alt_stage;
 static uint8_t alt_hh, alt_mm, alt_ss;   // ISR-owned: what the row currently shows
 static volatile _Bool alt_have_pos = 0;
+static volatile _Bool alt_seed_pending = 0;  // mode entered: thread must seed the row
+static volatile uint8_t alt_gen = 0;         // bumped on mode entry; cancels in-flight staging
 
 // Overlay an alternate HH:MM:SS onto the next7seg staging buffer. The stock
 // setNextTimestamp() has just run (keeping nextBcd / DST / date-row bookkeeping fresh);
@@ -802,7 +804,9 @@ static volatile _Bool alt_have_pos = 0;
 
 // The .900 prep for the alternate modes: stock next-second bookkeeping first, then latch
 // the staged reading — or, if the main loop was starved past the boundary, advance the last
-// shown reading by one second (bounded 2.74 ms/s drift, snapped back by the next reseed).
+// shown reading by one second. LST's fallback runs SLOW (2.74 ms/s; the reseed snap is
+// always forward), SUNDIAL's runs fast by at most ~0.35 ms/s at the EoT extremes — a
+// visible backwards reseed would need ~48+ minutes of continuous main-loop starvation.
 #define alt_prep_next() do { \
     currentTime++; \
     setNextTimestamp( currentTime ); \
@@ -835,17 +839,51 @@ static _Bool alt_compute(uint32_t when, uint8_t *hh, uint8_t *mm, uint8_t *ss){
   return 1;
 }
 
-// Main-loop staging: once per second, prepare the reading for the coming civil boundary.
+// Main-loop staging (thread context — ALL the double math for these modes lives here).
+// Two jobs: (a) SEED after mode entry or position go-live — render + latch the current
+// reading immediately and install the live handlers, so a PPS latch can never show civil
+// digits under the alternate colon; (b) STAGE the reading for the coming civil boundary.
+// A generation counter cancels any in-flight computation when the mode flips mid-pass, so
+// a stale timebase can never be stamped as valid.
 void alt_update(void){
   if (displayMode != MODE_LST && displayMode != MODE_SUNDIAL) return;
+
+  uint8_t gen = alt_gen;                 // snapshot: mode flips abort the publish below
+
+  if (alt_seed_pending || !alt_have_pos) {
+    uint8_t hh, mm, ss;
+    if (!alt_compute((uint32_t)currentTime, &hh, &mm, &ss)) {
+      alt_have_pos = 0;                  // stay dashed; retried every pass
+      return;
+    }
+    __disable_irq();
+    if (gen == alt_gen) {
+      alt_hh = hh; alt_mm = mm; alt_ss = ss;
+      alt_render_next7seg(alt_hh, alt_mm, alt_ss);   // alt digits now staged: any latch is honest
+      latchSegments()                                 // and shown immediately (countdown precedent)
+      alt_have_pos = 1;
+      alt_seed_pending = 0;
+    }
+    __enable_irq();
+    if (gen == alt_gen) setPrecision();  // install Alt_Px/PPS now — don't wait for PendSV,
+                                         // or the NoUpdate .900 prep could stage civil digits
+    return;                              // stage the coming boundary on the next pass
+  }
+
   uint32_t target = (uint32_t)currentTime + 1;
   if (alt_stage.for_time == target) return;
   uint8_t hh, mm, ss;
-  if (!alt_compute(target, &hh, &mm, &ss)) { alt_have_pos = 0; alt_stage.for_time = 0; return; }
-  alt_have_pos = 1;
-  alt_stage.hh = hh; alt_stage.mm = mm; alt_stage.ss = ss;
-  __DMB();
-  alt_stage.for_time = target;    // stamp LAST: the ISR consumes only on exact match
+  if (!alt_compute(target, &hh, &mm, &ss)) {
+    alt_have_pos = 0;                    // position lost: setPrecision dashes it this second
+    alt_stage.for_time = 0;
+    return;
+  }
+  __disable_irq();
+  if (gen == alt_gen) {                  // publish only if no mode flip happened mid-compute
+    alt_stage.hh = hh; alt_stage.mm = mm; alt_stage.ss = ss;
+    alt_stage.for_time = target;         // IRQs masked: fields and stamp are one atomic unit
+  }
+  __enable_irq();
 }
 
 // Store UTC on RTC
@@ -1017,6 +1055,9 @@ void decodeRMC(void){
       // Under normal conditions, we should only be parsing nmea at around .300 to .400
       // USART1 preemption priority is currently 1, so we could be interrupted by systick here
       setNextTimestamp( currentTime );
+      // In the alternate time-row modes the civil digits just staged must not reach the
+      // display: restore the alt overlay so the boundary latch stays honest.
+      if (countMode == COUNT_ALT) alt_render_next7seg(alt_hh, alt_mm, alt_ss);
       sendDate(0);
     }
   }
@@ -1352,7 +1393,7 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
 
     colonModeCivil = parseColonName(value);
 
-  } else if (strcasecmp(key, "sidereal_colon_mode") == 0) {
+  } else if (strcasecmp(key, "alt_colon_mode") == 0) {
 
     colonModeAlt = parseColonName(value);   // shared by MODE_LST and MODE_SUNDIAL
     colonAltExplicit = 1;
@@ -1426,9 +1467,8 @@ void postConfigCleanup(void){
     colonModeAlt = (colonModeCivil != COLON_MODE_ALT_SAWTOOTH) ? COLON_MODE_ALT_SAWTOOTH
                  : COLON_MODE_TOGGLE;
   }
-  colonMode = colonModeCivil;   // active selection re-derived below for the current mode
+  colonMode = 0xFF;             // force applyColonForMode to reload exactly once
   applyColonForMode();
-  loadColonAnimation();
 
   // check at least one mode is enabled
   uint8_t j = 0;
@@ -2688,7 +2728,10 @@ void setPrecision(void){
     if (!alt_have_pos) {
       // No usable position (no fix, no fake_longitude): dashes, digits not ticking —
       // never GMST-as-LST, never a guessed longitude. Re-evaluated every second; the
-      // row goes live the moment a position appears.
+      // row goes live the moment a position appears. resendDate keeps the civil date
+      // row refreshing (PendSV's resend check runs right after this) — without it the
+      // date would freeze across midnight while dashed.
+      resendDate = 1;
       SetPPS( &PPS_NoUpdate );
       SetSysTick( &SysTick_CountUp_NoUpdate );
       buffer_b[0] = bCat0 | 0b01000000 << 2;
@@ -2831,21 +2874,18 @@ void nextMode(_Bool reverse){
   } else if (displayMode == MODE_LST || displayMode == MODE_SUNDIAL) {
 
     countMode = COUNT_ALT;
-    setNextTimestamp(currentTime);   // keep civil date-row/DST bookkeeping fresh
-    alt_stage.for_time = 0;          // fresh stage for the new mode's timebase
-    // Seed the row immediately mid-second (countdown precedent): show floor(alt time NOW),
-    // then stage the coming boundary so the first .900 prep latches a fresh reading.
-    if (alt_compute((uint32_t)currentTime, &alt_hh, &alt_mm, &alt_ss)) {
-      alt_have_pos = 1;
-      alt_render_next7seg(alt_hh, alt_mm, alt_ss);
-    } else {
-      alt_have_pos = 0;
-    }
-    alt_update();
-    setPrecision();                  // installs Alt_Px + PPS, or the dashed no-fix state
+    setNextTimestamp(currentTime);   // stock civil bookkeeping (integer path; countdown-arm cost)
+    // NO double math here: nextMode can run in the USART2 button ISR (priority 0, which
+    // blocks SysTick and the PPS EXTI), and the LST/solar computation is ~100 µs of
+    // soft-double. Invalidate and let the main-loop alt_update() seed within one pass
+    // (<100 ms); until then setPrecision shows the dashed state.
+    alt_gen++;                       // cancels any in-flight staging for the previous timebase
+    alt_stage.for_time = 0;
+    alt_have_pos = 0;
+    alt_seed_pending = 1;
+    setPrecision();
     TIM2->CCR1 = 0;
     TIM2->CCR2 = 0;
-    if (alt_have_pos) latchSegments();
 
   }
   else {

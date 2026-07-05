@@ -156,7 +156,7 @@ MODE_GRID = disabled
 MODE_LATLON = disabled
 
 # Local Sidereal Time as a LIVE TICKING CLOCK on the time row (big digits). The date row
-# keeps the civil date, and the colons animate differently (sidereal_colon_mode below) so
+# keeps the civil date, and the colons animate differently (alt_colon_mode below) so
 # it can never be mistaken for civil time. Sidereal runs 1.00273791x faster than civil, so
 # the seconds display double-steps about once every 6 minutes — real sidereal behaviour,
 # not a glitch. Needs a position (GPS fix or fake_longitude); shows dashes without one.
@@ -166,11 +166,13 @@ MODE_LST = disabled
 # your longitude plus the equation of time. Reads exactly 12:00:00 at local solar noon.
 MODE_SUNDIAL = disabled
 
-# Colon animation while MODE_LST / MODE_SUNDIAL is shown, so the alternate timebase is
-# unmistakable at a glance. Same names as colon_mode; automatically kept different from
-# your civil colon unless you explicitly set them equal here.
+# Colon animation while an alternate-timebase mode (MODE_LST / MODE_SUNDIAL) is shown, so
+# it can never be mistaken for civil time at a glance — sundial especially, which can sit
+# within minutes of civil. Same names as colon_mode; automatically kept different from
+# your civil colon unless you explicitly set them equal here. Leave commented to keep the
+# automatic distinctness guarantee (an explicit value disables the auto-demotion).
 # One of: slowfade, heartbeat, sawtooth, alt_sawtooth, toggle, solid
-sidereal_colon_mode = alt_sawtooth
+#alt_colon_mode = alt_sawtooth
 
 # Dwell per sub-screen for the paged modes (MODE_SUN, MODE_LATLON), in milliseconds.
 # Default 5500 (a subjectively-tuned cadence, found by feel); floored at 250.

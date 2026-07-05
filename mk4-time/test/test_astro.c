@@ -120,10 +120,10 @@ int main(void) {
     /* Absolute anchors: GMST at J2000.0 = 18.697374558 h (IAU); Meeus "Astronomical
      * Algorithms" ex. 12.b, 1987-04-10 19:21:00 UT -> mean GMST 8h34m57.1s = 8.582525 h.
      * LST = GMST + lon/15, so longitude shifts and 24 h wrap are checked too. */
-    chk("LST J2000 lon0",        local_sidereal_time(946728000.0,   0.0), 18.697375, 0.001);
-    chk("LST Meeus lon0",        local_sidereal_time(545080860.0,   0.0),  8.582525, 0.002);
-    chk("LST J2000 lon -75",     local_sidereal_time(946728000.0, -75.0), 13.697375, 0.001);
-    chk("LST J2000 lon +90wrap", local_sidereal_time(946728000.0,  90.0),  0.697375, 0.001);
+    chk("LST J2000 lon0",        local_sidereal_time(946728000.0,   0.0), 18.697375, 0.0001);
+    chk("LST Meeus lon0",        local_sidereal_time(545080860.0,   0.0),  8.582525, 0.0001);
+    chk("LST J2000 lon -75",     local_sidereal_time(946728000.0, -75.0), 13.697375, 0.0001);
+    chk("LST J2000 lon +90wrap", local_sidereal_time(946728000.0,  90.0),  0.697375, 0.0001);
 
     printf("local_solar_time (h):\n");
     /* Independent of the implementation: at the sun's meridian transit the apparent

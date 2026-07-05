@@ -23,10 +23,15 @@ const char *const ASTRO_MOON_NAMES[8] = {
 static double days_since_j2000(double unix_s) { return (unix_s - J2000_UNIX) / 86400.0; }
 
 /* Greenwich Mean Sidereal Time in hours [0,24). One series, shared by sun_az_el,
- * sun_subsolar and local_sidereal_time so the three can never drift apart. */
+ * sun_subsolar and local_sidereal_time so the three can never drift apart. The
+ * quadratic term keeps truncation below ~1 ms for decades (the linear series alone
+ * drifts to ~10 ms by 2033). Note the input is GPS-derived UTC, not UT1: true-sky
+ * sidereal accuracy is floored by DUT1 (up to ±0.9 s) by design. */
 static double gmst_hours(double n) {
-    double g = fmod(18.697374558 + 24.06570982441908 * n, 24.0);
+    double T = n / 36525.0;
+    double g = fmod(18.697374558 + 24.06570982441908 * n + 0.000026 * T * T, 24.0);
     if (g < 0.0) g += 24.0;
+    if (g >= 24.0) g -= 24.0;
     return g;
 }
 
@@ -97,6 +102,7 @@ double equation_of_time(double unix_s) {
 double local_sidereal_time(double unix_s, double lon) {
     double lst = fmod(gmst_hours(days_since_j2000(unix_s)) + lon / 15.0, 24.0);
     if (lst < 0.0) lst += 24.0;
+    if (lst >= 24.0) lst -= 24.0;   /* fmod residue can round the wrap to exactly 24.0 */
     return lst; /* hours [0,24) */
 }
 
@@ -108,6 +114,7 @@ double local_solar_time(double unix_s, double lon) {
     double utc_h = fmod(unix_s / 3600.0, 24.0);
     double t = fmod(utc_h + lon / 15.0 + equation_of_time(unix_s) / 60.0, 24.0);
     if (t < 0.0) t += 24.0;
+    if (t >= 24.0) t -= 24.0;       /* fmod residue can round the wrap to exactly 24.0 */
     return t; /* hours [0,24) */
 }
 
