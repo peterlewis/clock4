@@ -104,3 +104,31 @@ mode_vbat = 0
 # output a $PMTXTS timing sentence over USB serial on each GPS PPS pulse, carrying the
 # sub-millisecond phase measurement made at the edge, for host-side jitter/drift analysis.
 pps = off
+
+
+## temperature compensation (opt-in; all off = stock behaviour)
+# While GPS-locked the clock can LEARN how each oscillator drifts with die temperature
+# (tc_learn), then during a GPS outage steer the display timebase from that model
+# (tc_apply) and/or keep the battery RTC trimmed for the next power-up (tc_rtc).
+# Send "tc_dump = on" over USB serial to print the learned coefficients as lines you can
+# paste below: pasted tc_hse_*/tc_lse_* values freeze the model (they override learning).
+# "tc_reset = on" over serial clears the learned data. Both are ignored inside this file.
+tc_learn = off
+tc_apply = off
+tc_rtc = off
+
+# show die temp / model offsets / sample count on the date row (pages like the astro modes)
+mode_tempcomp = 0
+
+# model centre (deg C) and safety limits; paste frozen coefficients from tc_dump below.
+# HSE uses temperature DIFFERENCES only, so it has no 'a' term — just slope + curvature.
+# Setting a coefficient to "nan" unfreezes it (learning takes over again).
+# tc_t0 = 40
+# tc_hse_b =
+# tc_hse_c =
+# tc_lse_a =
+# tc_lse_b =
+# tc_lse_c =
+# tc_engage_s = 2   (minimum 2)
+# tc_max_ppm = 100
+

@@ -162,6 +162,10 @@ enum {
   MODE_DDMMYYYY,
 #endif
 
+  // Temperature-compensation diagnostics: die temp / model offsets / sample count
+  // paged on the date row (satview pattern). Values come from the tempcomp module.
+  MODE_TEMPCOMP,
+
   NUM_DISPLAY_MODES
 };
 
