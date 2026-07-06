@@ -293,6 +293,10 @@ volatile _Bool   tc_seed = 0;                 // config: warm-start from the see
 volatile int16_t tc_seed_lo = 0, tc_seed_hi = 0;   // seed coverage (die °C): bounds the prior — never extrapolated
 uint8_t tc_hse_prior = 0, tc_lse_prior = 0;   // seed model order still held (0 = handed over to real data)
 _Bool tc_seed_done = 0;                        // one-shot: seed once per power-on (BSS-cleared at reset)
+// Serial "tc_seed = on" arms this (ISR-side single-word write); tc_housekeeping consumes it in the
+// MAIN LOOP, so the learned-state contract ("main-loop only") holds and a paste seeds exactly once,
+// after all its coefficient lines have parsed (send "tc_seed = on" last — the order tc_dump prints).
+volatile _Bool tc_seed_pending = 0;
 static void tc_seed_apply(void);              // defined by the tempcomp block; called after the config load
 
 // Display cache for MODE_TEMPCOMP. Written by the governor (main loop); read by sendDate,
@@ -1465,6 +1469,7 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
   } else if (strcasecmp(key, "tc_lse_c") == 0) { tc_parse_coeff(value, &tc_cfg_lse[2]);
   } else if (strcasecmp(key, "tc_seed") == 0) {
     tc_seed = truthy(value);          // load the coefficients above as an EVOLVING prior, not a freeze
+    if (from_serial && tc_seed) tc_seed_pending = 1;   // serial trigger: apply from the main loop
   } else if (strcasecmp(key, "tc_seed_lo") == 0) {
     tc_seed_lo = (int16_t)atoi(value);   // seed coverage low edge (die °C) — the prior is not extrapolated
   } else if (strcasecmp(key, "tc_seed_hi") == 0) {
@@ -2116,7 +2121,8 @@ static void tc_seed_apply(void){
   if (hi - lo < 4) { lo = (int16_t)(tc_t0 - 6); hi = (int16_t)(tc_t0 + 6); }   // sane span if none given
   // readConfigFile (hence this seed) runs at boot BEFORE the first tc_housekeeping, so tc_nom_load is
   // still 0 and tc_tpp() would return 0 — which would silently zero the tick-domain HSE model. Capture
-  // the nominal SysTick period here (SystemClock_Config set it before the config load), same as line 2430.
+  // the nominal SysTick period here (SystemClock_Config set it before the config load) — the same
+  // capture tc_housekeeping() also performs.
   if (!tc_nom_load) tc_nom_load = SysTick->LOAD;
   float tpp = (float)tc_tpp();
 
@@ -2439,6 +2445,12 @@ static void computeHoldoverFade(void){
 
 void tc_housekeeping(void){
   if (!tc_nom_load) tc_nom_load = SysTick->LOAD;       // capture the nominal period once
+
+  // Serial warm-start (armed by the "tc_seed = on" line) + the evolving seed's freeze guard: with
+  // the seed applied, the same call just re-NANs any tc_hse_*/tc_lse_* coefficients a serial line
+  // reparsed, so the frozen path can't silently reactivate over the evolving model.
+  if (tc_seed_pending) { tc_seed_pending = 0; tc_seed_apply(); }
+  else if (tc_seed_done) tc_seed_apply();
 
   if (tc_reset_pending) {
     memset(tc_bins, 0, sizeof tc_bins);
@@ -3450,8 +3462,9 @@ int main(void)
     if (delayedPostConfigCleanup) {
       delayedPostConfigCleanup=0;
       postConfigCleanup();
-      tc_seed_apply();   // a serial coefficient write is a live reload too: keep the evolving seed
-    }                    // from being silently re-frozen by the reparsed tc_hse_b/tc_lse_a slots
+      // tempcomp seeding/freeze-guard runs from tc_housekeeping (same pass), keyed by
+      // tc_seed_pending / tc_seed_done — one place, serialized with tc_fit/tc_governor.
+    }
 
     fatfs_busy=1;   // FATFS_remount + readConfigFile + checkDelayedLoadRules touch FATFS
     if (delayedReadConfigFile) {
@@ -3467,7 +3480,9 @@ int main(void)
 
     monitor_vbus();
 
-    if (pps_ts_enabled || tc_learn || tc_apply || tc_rtc || displayMode == MODE_TEMPCOMP) {
+    // significance_fade is a die-temp consumer too: computeHoldoverFade charges an out-of-coverage
+    // penalty from die_temp_c, which would otherwise stay at its init 0 with every other flag off.
+    if (pps_ts_enabled || tc_learn || tc_apply || tc_rtc || significance_fade || displayMode == MODE_TEMPCOMP) {
       static uint32_t last_temp_read = 0;
       if ((uint32_t)currentTime - last_temp_read >= 4) {   // refresh die temp every ~4 s
         last_temp_read = (uint32_t)currentTime;
