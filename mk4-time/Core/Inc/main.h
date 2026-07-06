@@ -172,6 +172,10 @@ enum {
   MODE_GRID,       // Maidenhead grid locator
   MODE_LATLON,     // latitude / longitude, auto-paged
 
+  // Temperature-compensation diagnostics: die temp / model offsets / sample count
+  // paged on the date row (satview pattern). Values come from the tempcomp module.
+  MODE_TEMPCOMP,
+
   // Alternate-timebase TIME-ROW modes: the big digits tick Local Sidereal Time or
   // apparent solar time, reseeded from the GPS-disciplined second; the
   // date row keeps the civil date and a dedicated colon animation marks the mode.

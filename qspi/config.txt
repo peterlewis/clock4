@@ -1,7 +1,7 @@
 
 # Matrix refresh rate, in Hz. Min 1000, max 100000
 # This number is only a target, exact frequency will be a division of processor clock speed.
-# Note the display is split into four matrices of 5 digits each. The number given here is the 
+# Note the display is split into four matrices of 5 digits each. The number given here is the
 # refresh rate of the display - the clock frequency of the matrix will be five times this number.
 MATRIX_FREQUENCY = 20000
 
@@ -76,6 +76,10 @@ Tolerance_time_100ms = 100000
 
 # For paranoia, set the 1ms tolerance to 1, which will disable the last digit as soon as GPS fix is lost.
 # To turn off the tolerance feature, set all tolerances to 0.
+# Or replace the fixed ladder with measured uncertainty: with significance_fade on, each digit
+# is dashed when the live 3-sigma holdover error passes its place value (uses the calibration +
+# the learned temperature model), instead of at the fixed times above.
+significance_fade = off
 
 
 # nonlinear brightness curve, five stops of input->output, use brightness-curve.htm for a GUI
@@ -101,6 +105,46 @@ mode_satview = 0
 # show coin cell voltage
 mode_vbat = 0
 
+# output a $PMTXTS timing sentence over USB serial on each GPS PPS pulse, carrying the
+# sub-millisecond phase measurement made at the edge, for host-side jitter/drift analysis.
+pps = off
+
+
+## temperature compensation (opt-in; all off = stock behaviour)
+# While GPS-locked the clock can LEARN how each oscillator drifts with die temperature
+# (tc_learn), then during a GPS outage steer the display timebase from that model
+# (tc_apply) and/or keep the battery RTC trimmed for the next power-up (tc_rtc).
+# Send "tc_dump = on" over USB serial to print the learned coefficients as lines you can
+# paste below: pasted tc_hse_*/tc_lse_* values freeze the model (they override learning).
+# "tc_reset = on" over serial clears the learned data. Both are ignored inside this file.
+tc_learn = off
+tc_apply = off
+tc_rtc = off
+
+# show die temp / model offsets / sample count on the date row (pages like the astro modes)
+mode_tempcomp = 0
+
+# model centre (deg C) and safety limits; paste frozen coefficients from tc_dump below.
+# HSE uses temperature DIFFERENCES only, so it has no 'a' term — just slope + curvature.
+# Setting a coefficient to "nan" unfreezes it (learning takes over again).
+# tc_t0 = 40
+# tc_hse_b =
+# tc_hse_c =
+# tc_lse_a =
+# tc_lse_b =
+# tc_lse_c =
+# tc_engage_s = 2   (minimum 2)
+# tc_max_ppm = 100
+
+# Warm start (seed-and-evolve): with tc_seed on, the pasted coefficients above load as an
+# EVOLVING starting point instead of a freeze — compensated from the first second, refined as
+# the clock learns, handed over once its own data is at least as rich. tc_dump also prints
+# tc_seed_lo/hi (the model's temperature coverage) so a paste round-trips. Over serial, send
+# the coefficients first and "tc_seed = on" last (the order tc_dump prints).
+# tc_seed = on
+# tc_seed_lo =
+# tc_seed_hi =
+
 
 ## astro modes (GPS-derived)
 # These show on the date row while the live clock keeps running on the time row.
@@ -124,29 +168,31 @@ MODE_GRID = disabled
 # Latitude / longitude in decimal degrees. Pages LAT -> LON (see page_ms).
 MODE_LATLON = disabled
 
-# Dwell per sub-screen for the paged modes (MODE_SUN, MODE_LATLON), in milliseconds.
-# Default 5500 (a subjectively-tuned cadence, found by feel); floored at 250.
-page_ms = 5500
-||||||| parent of 2f18d8e (Add sidereal (LST) and apparent-solar time-row modes)
 # Local Sidereal Time as a LIVE TICKING CLOCK on the time row (big digits). The date row
-# keeps the civil date, and the colons animate differently (alt_colon_mode below) so it
-# can never be mistaken for civil time. Sidereal runs 1.00273791x faster than civil, so the
-# seconds display double-steps about once every 6 minutes -- real sidereal behaviour, not a
-# glitch. Needs a position (GPS fix or fake_longitude); shows dashes without one.
+# keeps the civil date, and the colons animate differently (alt_colon_mode below) so
+# it can never be mistaken for civil time. Sidereal runs 1.00273791x faster than civil, so
+# the seconds display double-steps about once every 6 minutes — real sidereal behaviour,
+# not a glitch. Needs a position (GPS fix or fake_longitude); shows dashes without one.
 MODE_LST = disabled
 
-# Apparent solar time on the time row -- what a sundial reads: UTC shifted by
-# your longitude plus the equation of time. Reads exactly 12:00:00 at local solar noon.
+# Apparent solar time on the time row — what a sundial reads: UTC shifted by your
+# longitude plus the equation of time. Reads exactly 12:00:00 at local solar noon.
 MODE_SOLAR = disabled
 
-# Colon animation while MODE_LST / MODE_SOLAR is shown, so the alternate timebase is
-# unmistakable at a glance -- solar especially, which can sit within minutes of civil.
-# Same names as colon_mode; automatically kept different from your civil colon unless you
-# explicitly set them equal here. One of: slowfade, heartbeat, sawtooth, alt_sawtooth,
-# toggle, solid
+# Colon animation while an alternate-timebase mode (MODE_LST / MODE_SOLAR) is shown, so
+# it can never be mistaken for civil time at a glance — solar especially, which can sit
+# within minutes of civil. Same names as colon_mode; automatically kept different from
+# your civil colon unless you explicitly set them equal here. Leave commented to keep the
+# automatic distinctness guarantee (an explicit value disables the auto-demotion).
+# One of: slowfade, heartbeat, sawtooth, alt_sawtooth, toggle, solid
 #alt_colon_mode = alt_sawtooth
+
+# Dwell per sub-screen for the paged modes (MODE_SUN, MODE_LATLON, MODE_TEMPCOMP), in ms.
+# Default 5500 (a subjectively-tuned cadence, found by feel); floored at 250.
+page_ms = 5500
 
 # Fixed position for the astro modes when there is no GPS fix (decimal degrees, N+/E+).
 # Note: setting these also pins the clock's position (GPS position updates are ignored).
 #fake_latitude  = 51.48
 #fake_longitude = -0.01
+
