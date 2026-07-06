@@ -232,6 +232,15 @@ volatile struct {
 // Config-key scalars are written from the USB OTG ISR (parseConfigString) and read by the
 // main loop: volatile, matching the pps_ts_enabled precedent.
 volatile _Bool tc_learn = 0, tc_apply = 0, tc_rtc = 0;
+// Holdover fade (opt-in). A sub-second digit whose accuracy can no longer be held — its time
+// uncertainty during GPS-loss holdover has grown past that digit's place value — FADES to black by
+// its remaining significance instead of dashing, overriding the fixed Tolerance_time_* ladder.
+// digit_bright[] holds per-digit intensity 0..FADE_MAX for the [deciseconds, centiseconds,
+// milliseconds, decimal-point] positions (FADE_MAX = fully lit, i.e. certainly significant).
+volatile _Bool holdover_fade = 0;
+#define FADE_MAX 16
+uint8_t digit_bright[4] = { FADE_MAX, FADE_MAX, FADE_MAX, FADE_MAX };
+float holdover_u_us = 0.0f;                 // last computed 3σ time-interval-error bound U(τ), µs
 volatile int16_t  tc_t0 = 40;              // model centre temperature (°C)
 volatile uint16_t tc_engage_s = 2;         // seconds of PPS absence before steering engages (min 2)
 volatile uint16_t tc_max_ppm = 100;        // hard clamp on the applied correction magnitude
@@ -268,6 +277,23 @@ _Bool tc_hse_valid = 0, tc_lse_valid = 0;
 int16_t tc_hse_tmin = 0, tc_hse_tmax = 0;  // learned coverage: model is clamped to this range
 int16_t tc_lse_tmin = 0, tc_lse_tmax = 0;
 uint32_t tc_n_hse = 0, tc_n_lse = 0;       // lifetime sample counts (display + dump)
+// Weighted-RMS residual of each learned fit (model vs bin means): the model's OWN error, in its
+// fit units (HSE: SysTick ticks/s; LSE: ppm). This is the holdover-fade uncertainty's σ_temp source
+// — how far the temperature model actually is from the measured data, not a guess.
+float tc_hse_resid = 0, tc_lse_resid = 0;
+
+// Warm-start (seed-and-evolve). A previously-learned model — the last tc_dump, written back into
+// config.txt by the host (the firmware never writes the filesystem; the QSPI drive is host-owned) —
+// is reloaded at boot as an evolving PRIOR rather than a hard freeze. The clock is temperature-
+// compensated from the first second and keeps refining: tc_hse_prior/tc_lse_prior hold the model
+// ORDER (1 const, 2 linear, 3 quadratic) currently carried by the seed, and tc_fit keeps that model
+// until real learning supports a fit at least as rich, then hands over. tc_seed = off leaves the
+// existing freeze path (tc_hse_b/… as asserted constants) untouched.
+volatile _Bool   tc_seed = 0;                 // config: warm-start from the seeded coefficients + evolve
+volatile int16_t tc_seed_lo = 0, tc_seed_hi = 0;   // seed coverage (die °C): bounds the prior — never extrapolated
+uint8_t tc_hse_prior = 0, tc_lse_prior = 0;   // seed model order still held (0 = handed over to real data)
+_Bool tc_seed_done = 0;                        // one-shot: seed once per power-on (BSS-cleared at reset)
+static void tc_seed_apply(void);              // defined by the tempcomp block; called after the config load
 
 // Display cache for MODE_TEMPCOMP. Written by the governor (main loop); read by sendDate,
 // which ALSO runs from the SysTick ISRs — each field is a single 32-bit (atomic) access, so
@@ -1420,6 +1446,8 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     tc_learn = truthy(value);         // accumulate (die temp, ppm) samples while GPS-locked
   } else if (strcasecmp(key, "tc_apply") == 0) {
     tc_apply = truthy(value);         // steer the SysTick timebase during GPS-loss holdover
+  } else if (strcasecmp(key, "holdover_fade") == 0) {
+    holdover_fade = truthy(value);      // fade sub-second digits by significance in holdover, not dash
   } else if (strcasecmp(key, "tc_rtc") == 0) {
     tc_rtc = truthy(value);           // additionally trim RTC->CALR while GPS is absent
   } else if (strcasecmp(key, "tc_t0") == 0) {
@@ -1435,6 +1463,12 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
   } else if (strcasecmp(key, "tc_lse_a") == 0) { tc_parse_coeff(value, &tc_cfg_lse[0]);
   } else if (strcasecmp(key, "tc_lse_b") == 0) { tc_parse_coeff(value, &tc_cfg_lse[1]);
   } else if (strcasecmp(key, "tc_lse_c") == 0) { tc_parse_coeff(value, &tc_cfg_lse[2]);
+  } else if (strcasecmp(key, "tc_seed") == 0) {
+    tc_seed = truthy(value);          // load the coefficients above as an EVOLVING prior, not a freeze
+  } else if (strcasecmp(key, "tc_seed_lo") == 0) {
+    tc_seed_lo = (int16_t)atoi(value);   // seed coverage low edge (die °C) — the prior is not extrapolated
+  } else if (strcasecmp(key, "tc_seed_hi") == 0) {
+    tc_seed_hi = (int16_t)atoi(value);
   } else if (strcasecmp(key, "tc_dump") == 0) {
     // Serial-only trigger: print the learned model as paste-ready config lines. A stray
     // tc_dump left in config.txt must not fire on every (re)load, hence the origin guard.
@@ -1623,6 +1657,7 @@ void readConfigFile(void){
    else requestMode=255;
 
    postConfigCleanup();
+   tc_seed_apply();   // warm-start the tempco model from a persisted seed (tc_seed = on), else no-op
 }
 
 void calibrateRTC(void){
@@ -1952,7 +1987,9 @@ static _Bool tc_gauss3(float A[3][3], float y[3], float x[3]){
 // pivot threshold yet overflow to Inf/NaN, and NaN must never reach the steering or display.
 static _Bool tc_fin3(const float m[3]){ return isfinite(m[0]) && isfinite(m[1]) && isfinite(m[2]); }
 
-static _Bool tc_fit_one(_Bool lse, float scale, uint16_t n_quad, float m[3],
+// Returns the ACHIEVED model order: 3 quadratic, 2 linear, 1 constant, 0 no fit. (The order lets the
+// warm-start prior be preserved until real data supports a fit at least as rich — see tc_fit.)
+static int tc_fit_one(_Bool lse, float scale, uint16_t n_quad, float m[3],
                         int16_t *tmin_out, int16_t *tmax_out){
   float S[5] = {0,0,0,0,0}, T[3] = {0,0,0};
   float S0a = 0, T0a = 0;                     // all-samples weighted mean (constant fallback)
@@ -1982,7 +2019,7 @@ static _Bool tc_fit_one(_Bool lse, float scale, uint16_t n_quad, float m[3],
   if (nb >= 3 && (tmax - tmin) >= 6) {        // quadratic
     float A[3][3] = {{S[0],S[1],S[2]},{S[1],S[2],S[3]},{S[2],S[3],S[4]}};
     float yv[3]   = {T[0],T[1],T[2]};
-    if (tc_gauss3(A, yv, m) && tc_fin3(m)) { *tmin_out = tmin; *tmax_out = tmax; return 1; }
+    if (tc_gauss3(A, yv, m) && tc_fin3(m)) { *tmin_out = tmin; *tmax_out = tmax; return 3; }
   }
   if (nb >= 2 && (tmax - tmin) >= 4) {        // linear
     float det = S[0]*S[2] - S[1]*S[1];
@@ -1990,7 +2027,7 @@ static _Bool tc_fit_one(_Bool lse, float scale, uint16_t n_quad, float m[3],
       m[0] = (T[0]*S[2] - T[1]*S[1]) / det;
       m[1] = (S[0]*T[1] - S[1]*T[0]) / det;
       m[2] = 0;
-      if (tc_fin3(m)) { *tmin_out = tmin; *tmax_out = tmax; return 1; }
+      if (tc_fin3(m)) { *tmin_out = tmin; *tmax_out = tmax; return 2; }
     }
   }
   if (S0a >= (lse ? 8.0f : 60.0f)) {          // constant: the dominant fixed offset
@@ -2000,12 +2037,109 @@ static _Bool tc_fit_one(_Bool lse, float scale, uint16_t n_quad, float m[3],
   return 0;
 }
 
+static float tc_poly(const float m[3], float x);   // fwd: the residual pass evaluates the just-fit model
+
+// Weighted-RMS residual of a fitted model over every populated bin (not only the curve-eligible
+// ones): sqrt( Σ n·(bin_mean − model(T))² / Σ n ), in the fit's units. Runs as a second pass, so
+// it never perturbs the fit itself; 40 bins, at most once per 5 min alongside tc_fit().
+// `center` removes the weighted-mean of the residuals before the RMS — i.e. an ORIGIN-INVARIANT error.
+// Needed for HSE: its model origin (m[0]) is arbitrary, so while a warm-start seed is held (m[0]=0) the
+// real bins carry a different DC constant (the tc_e0 rebase); the raw offset would swamp the RMS and
+// corrupt the holdover-fade σ_temp. Mean-centring measures only how well the SLOPE/CURVATURE match,
+// which is all HSE cares about. LSE (absolute ppm, real m[0]) passes center=0 — its offset is real error.
+static float tc_fit_resid(_Bool lse, float scale, const float m[3], _Bool center){
+  float sw = 0, swr = 0, swr2 = 0;
+  for (int i = 0; i < 40; i++){
+    uint16_t n = lse ? tc_bins[i].lse_n : tc_bins[i].hse_n;
+    if (!n) continue;
+    int32_t sum = lse ? tc_bins[i].lse_sum : tc_bins[i].hse_sum;
+    float y = ((float)sum / (float)n) * scale;
+    float x = ((float)(i * 2 - 8) + 0.5f) - (float)tc_t0;   // bin centre − model origin
+    float r = y - tc_poly(m, x);
+    sw += (float)n; swr += (float)n * r; swr2 += (float)n * r * r;
+  }
+  if (!(sw > 0) || !isfinite(swr2)) return 0.0f;
+  if (center) swr2 -= swr * swr / sw;                        // Σn(r−r̄)² = Σn·r² − (Σn·r)²/Σn
+  return (swr2 > 0 && isfinite(swr2)) ? sqrtf(swr2 / sw) : 0.0f;
+}
+
+// Refit both models from the bins. A warm-start prior (tc_*_prior != 0) is PRESERVED until real data
+// supports a fit at least as rich as the seed's order — then real data takes over (prior cleared).
+// With no prior held (the normal cold-learn case) this is the original behaviour: fit -> adopt/invalidate.
+// The residual is always re-measured against whatever model is held; while a seed is still held with no
+// real samples yet, tc_fit_resid returns 0 (no data) and the seed's CARRIED residual is kept.
 static void tc_fit(void){
-  tc_hse_valid = tc_fit_one(0, 1.0f, 64, tc_hse_m, &tc_hse_tmin, &tc_hse_tmax);
-  tc_lse_valid = tc_fit_one(1, 1e6f/(32768.0f*63.0f), 4, tc_lse_m, &tc_lse_tmin, &tc_lse_tmax);
+  int16_t tmn, tmx; float m[3];
+
+  int oh = tc_fit_one(0, 1.0f, 64, m, &tmn, &tmx);
+  if (oh >= tc_hse_prior) {                    // real data at least as rich as the prior -> adopt it
+    tc_hse_valid = (oh > 0);
+    if (oh) { tc_hse_m[0]=m[0]; tc_hse_m[1]=m[1]; tc_hse_m[2]=m[2]; tc_hse_tmin=tmn; tc_hse_tmax=tmx; }
+    tc_hse_prior = 0;
+  }
+  if (tc_hse_valid) { float r = tc_fit_resid(0, 1.0f, tc_hse_m, 1); if (r > 0 || !tc_hse_prior) tc_hse_resid = r; }
+  else tc_hse_resid = 0;
+
+  const float lse_scale = 1e6f/(32768.0f*63.0f);
+  int ol = tc_fit_one(1, lse_scale, 4, m, &tmn, &tmx);
+  if (ol >= tc_lse_prior) {
+    tc_lse_valid = (ol > 0);
+    if (ol) { tc_lse_m[0]=m[0]; tc_lse_m[1]=m[1]; tc_lse_m[2]=m[2]; tc_lse_tmin=tmn; tc_lse_tmax=tmx; }
+    tc_lse_prior = 0;
+  }
+  if (tc_lse_valid) { float r = tc_fit_resid(1, lse_scale, tc_lse_m, 0); if (r > 0 || !tc_lse_prior) tc_lse_resid = r; }
+  else tc_lse_resid = 0;
 }
 
 static float tc_poly(const float m[3], float x){ return m[0] + m[1]*x + m[2]*x*x; }
+
+// Warm-start the tempco model from the seeded coefficients (tc_seed = on). Loads tc_hse_b/c and
+// tc_lse_a/b/c — the last tc_dump, persisted in config.txt by the host — as the LIVE model so the
+// clock is temperature-compensated from the first second, records the seed's order (kept by tc_fit
+// until real data is at least as rich), and seeds a conservative residual so holdover-fade stays
+// honest before real samples arrive. Clearing the frozen slots is what turns a freeze into an
+// evolving prior. Runs once per boot; on a later live config reload it only re-clears the reparsed
+// coefficients so the freeze path can't silently re-activate over the evolving model.
+static void tc_seed_apply(void){
+  if (!tc_seed) return;
+  if (tc_seed_done) {                         // live reload: keep evolving — don't re-freeze or re-seed
+    tc_cfg_hse[0]=tc_cfg_hse[1]=tc_cfg_hse[2]=NAN;
+    tc_cfg_lse[0]=tc_cfg_lse[1]=tc_cfg_lse[2]=NAN;
+    return;
+  }
+  _Bool have_hse = !isnan(tc_cfg_hse[1]) || !isnan(tc_cfg_hse[2]);
+  _Bool have_lse = !isnan(tc_cfg_lse[0]) || !isnan(tc_cfg_lse[1]) || !isnan(tc_cfg_lse[2]);
+  if (!have_hse && !have_lse) return;         // seed enabled but no coefficients yet — wait for a reload
+  tc_seed_done = 1;
+
+  int16_t lo = tc_seed_lo, hi = tc_seed_hi;
+  if (hi - lo < 4) { lo = (int16_t)(tc_t0 - 6); hi = (int16_t)(tc_t0 + 6); }   // sane span if none given
+  // readConfigFile (hence this seed) runs at boot BEFORE the first tc_housekeeping, so tc_nom_load is
+  // still 0 and tc_tpp() would return 0 — which would silently zero the tick-domain HSE model. Capture
+  // the nominal SysTick period here (SystemClock_Config set it before the config load), same as line 2430.
+  if (!tc_nom_load) tc_nom_load = SysTick->LOAD;
+  float tpp = (float)tc_tpp();
+
+  if (have_hse) {
+    tc_hse_m[0] = 0.0f;                        // arbitrary origin — steering uses temperature differences
+    tc_hse_m[1] = isnan(tc_cfg_hse[1]) ? 0.0f : tc_cfg_hse[1] * tpp;
+    tc_hse_m[2] = isnan(tc_cfg_hse[2]) ? 0.0f : tc_cfg_hse[2] * tpp;
+    tc_hse_tmin = lo; tc_hse_tmax = hi; tc_hse_valid = 1;
+    tc_hse_prior = (!isnan(tc_cfg_hse[2]) && tc_cfg_hse[2] != 0.0f) ? 3 : 2;
+    tc_hse_resid = 2.0f * tpp;                 // conservative (~2 ppm) until real data measures it
+    tc_cfg_hse[0] = tc_cfg_hse[1] = tc_cfg_hse[2] = NAN;   // seed replaces freeze -> free to evolve
+  }
+  if (have_lse) {
+    tc_lse_m[0] = isnan(tc_cfg_lse[0]) ? 0.0f : tc_cfg_lse[0];
+    tc_lse_m[1] = isnan(tc_cfg_lse[1]) ? 0.0f : tc_cfg_lse[1];
+    tc_lse_m[2] = isnan(tc_cfg_lse[2]) ? 0.0f : tc_cfg_lse[2];
+    tc_lse_tmin = lo; tc_lse_tmax = hi; tc_lse_valid = 1;
+    tc_lse_prior = (!isnan(tc_cfg_lse[2]) && tc_cfg_lse[2] != 0.0f) ? 3
+                 : (!isnan(tc_cfg_lse[1]) && tc_cfg_lse[1] != 0.0f) ? 2 : 1;
+    tc_lse_resid = 2.0f;
+    tc_cfg_lse[0] = tc_cfg_lse[1] = tc_cfg_lse[2] = NAN;
+  }
+}
 
 // LSE model (absolute ppm): non-NAN config a freezes it (the user asserted the values);
 // otherwise the learned fit, clamped to its observed temperature range (no extrapolation).
@@ -2098,6 +2232,7 @@ static void tc_governor(void){
   tc_disp_lse = dl;  tc_disp_lse_ok = have_l;
   tc_disp_state = tc_steer_on ? 'A'
                 : (!isnan(tc_cfg_hse[1]) || !isnan(tc_cfg_lse[0])) ? 'F'
+                : (tc_hse_prior || tc_lse_prior) ? 'S'          // running on the warm-start seed (evolving)
                 : (tc_learn && fresh < 5) ? 'L' : '-';
 
   // --- HSE steering: engage only in holdover, after first-ever fix, with a usable model.
@@ -2229,6 +2364,13 @@ static void tc_dump_step(void){
         n = snprintf(dline, sizeof dline, "$%s*%02X\r\n", body, (unsigned)cks);
         break;
       }
+      case 9: {                               // seed coverage — with "tc_seed = on" the paste warm-starts
+        int lo = tc_hse_valid ? tc_hse_tmin : tc_lse_tmin;   // (and keeps evolving) instead of freezing
+        int hi = tc_hse_valid ? tc_hse_tmax : tc_lse_tmax;
+        if (tc_lse_valid) { if (tc_lse_tmin < lo) lo = tc_lse_tmin; if (tc_lse_tmax > hi) hi = tc_lse_tmax; }
+        n = snprintf(dline, sizeof dline, "tc_seed_lo = %d\r\ntc_seed_hi = %d\r\n", lo, hi);
+        break;
+      }
     }
     if (n <= 0 || n >= (int)sizeof dline) { tc_dump_pending = 0; idx = 0; dn = -1; return; }
     dn = n;
@@ -2243,17 +2385,65 @@ static void tc_dump_step(void){
     return;
   }
   dn = -1;
-  if (++idx > 8) { idx = 0; tc_dump_pending = 0; }
+  if (++idx > 9) { idx = 0; tc_dump_pending = 0; }
 }
 
 // Main-loop entry point, called every pass. With every tc key at its default this reduces to
 // four flag checks — no measurable cost, no behaviour change.
+// Holdover fade: from the residual 1σ time uncertainty during GPS-loss holdover, set each trailing
+// sub-second digit's intensity by its remaining SIGNIFICANCE. U(τ) = k_σ·σ·τ (µs); σ = RSS of three
+// independent ppm terms — how well the last cal pinned frequency, the MEASURED temp-model residual,
+// and aging. A digit fades over its significance band and goes dark once U exceeds its place value.
+static void computeHoldoverFade(void){
+  uint32_t age = (uint32_t)currentTime - last_pps_time;              // holdover seconds
+
+  // σ_cal — frequency knowledge from the last RTC calibration, decaying with its age.
+  float cal_age = (float)((uint32_t)currentTime - (uint32_t)rtc_last_calibration);
+  float sigma_cal;
+  if (cal_age <= (float)CAL_PERIOD && tc_lse_valid) {
+    float cal_ppm = (float)debug_rtc_val * (1e6f / (32768.0f * (float)CAL_PERIOD));
+    sigma_cal = fabsf(cal_ppm) + 0.05f * sqrtf(cal_age / (float)CAL_PERIOD);
+  } else {
+    sigma_cal = 0.02f * sqrtf(cal_age);                             // stale cal: random-walk bound
+  }
+
+  // σ_temp — the MEASURED tempco-model residual (ppm), plus a penalty beyond the learned range.
+  float sigma_temp;
+  if (tc_hse_valid) {
+    float tpp = (float)tc_tpp();
+    sigma_temp = (tpp > 0.0f) ? tc_hse_resid / tpp : 10.0f;         // HSE residual (ticks/s) → ppm
+    int t = die_temp_c;
+    int over = t < tc_hse_tmin ? tc_hse_tmin - t : t > tc_hse_tmax ? t - tc_hse_tmax : 0;
+    if (over > 0) sigma_temp += 0.3f * (float)over;                 // unvalidated beyond coverage
+  } else {
+    sigma_temp = 10.0f;                                            // no model yet — bare-crystal
+  }
+
+  // σ_age — long-term oscillator aging (negligible over minutes/hours, kept for completeness).
+  float sigma_age = 0.1f * (float)age / 86400.0f;
+
+  float sigma = sqrtf(sigma_cal*sigma_cal + sigma_temp*sigma_temp + sigma_age*sigma_age);
+  float U_us  = 3.0f * sigma * (float)age;                          // k_σ = 3 ("certainly right")
+  holdover_u_us = U_us;                                             // publish for read-back / display
+
+  // Half place values (µs): 0.1 s, 0.01 s, 0.001 s. Fade band β. b_k = (h−U)/(β·h), clamped 0..1.
+  static const float h_us[3] = { 50000.0f, 5000.0f, 500.0f };
+  const float beta = 0.4f;
+  for (int k = 0; k < 3; k++){
+    float b = (h_us[k] - U_us) / (beta * h_us[k]);
+    if (b < 0.0f) b = 0.0f; else if (b > 1.0f) b = 1.0f;
+    digit_bright[k] = (uint8_t)(b * (float)FADE_MAX + 0.5f);
+  }
+  digit_bright[3] = digit_bright[0];   // the decimal point dies with the 0.1 s digit
+}
+
 void tc_housekeeping(void){
   if (!tc_nom_load) tc_nom_load = SysTick->LOAD;       // capture the nominal period once
 
   if (tc_reset_pending) {
     memset(tc_bins, 0, sizeof tc_bins);
     tc_hse_valid = tc_lse_valid = 0;
+    tc_hse_prior = tc_lse_prior = 0;          // drop any held warm-start prior: reset is a cold restart
     tc_n_hse = tc_n_lse = 0;
     tc_e0_set = 0; tc_ema = 0;                // new origin rebase with the next sample
     tc_reset_pending = 0;
@@ -2271,6 +2461,12 @@ void tc_housekeeping(void){
   // the user turns every tc key off while steering is engaged mid-holdover — otherwise the
   // tick ISR would keep applying a stale frozen correction forever.
   if (tc_learn || tc_apply || tc_rtc || tc_steer_on || displayMode == MODE_TEMPCOMP) tc_governor();
+
+  if (holdover_fade) {   // recompute the per-digit fade once per second while enabled
+    static uint32_t last_fade = 0;
+    uint32_t now = (uint32_t)currentTime;
+    if (now != last_fade) { last_fade = now; computeHoldoverFade(); }
+  }
 
   tc_dump_step();
 }
@@ -2698,6 +2894,35 @@ void checkDelayedLoadRules(){
 }
 
 void setPrecision(void){
+  if (holdover_fade && countMode == COUNT_NORMAL) {
+    // Holdover fade replaces the FIXED Tolerance_time_* dash ladder with a SIGNIFICANCE-driven one:
+    // computeHoldoverFade() sets each sub-second digit's intensity in digit_bright[] from the live
+    // time-interval-error bound, and a digit is DASHED the instant its significance reaches zero —
+    // honest on the real display. Digits still significant keep ticking (P3/P2/P1), so the emulator
+    // (and a future per-digit HW dimmer) can render the PARTIAL fade of the one on its way out. At
+    // lock all are FADE_MAX, so this reduces to a plain P3. digit_bright = [ds, cs, ms, dp];
+    // buffer_c[3]/[2]/[1] = ms/cs/ds; the decimal point dies with the 0.1 s digit.
+    if (digit_bright[2]) {                                 // ms still significant
+      buffer_c[0].high = 0b11001110 | cSegDP;
+      SetSysTick( &SysTick_CountUp_P3 );
+    } else if (digit_bright[1]) {                          // ms dark, cs significant
+      buffer_c[3].low = 0b01000000;
+      buffer_c[0].high = 0b11001110 | cSegDP;
+      SetSysTick( &SysTick_CountUp_P2 );
+    } else if (digit_bright[0]) {                          // ds only
+      buffer_c[3].low = 0b01000000;
+      buffer_c[2].low = 0b01000000;
+      buffer_c[0].high = 0b11001110 | cSegDP;
+      SetSysTick( &SysTick_CountUp_P1 );
+    } else {                                               // whole seconds
+      buffer_c[3].low = 0b01000000;
+      buffer_c[2].low = 0b01000000;
+      buffer_c[1].low = 0b01000000;
+      buffer_c[0].high = 0b11001110;
+      SetSysTick( &SysTick_CountUp_P0 );
+    }
+    return;
+  }
   if (countMode == COUNT_NORMAL) {
 
     // situations not covered:
@@ -3225,7 +3450,8 @@ int main(void)
     if (delayedPostConfigCleanup) {
       delayedPostConfigCleanup=0;
       postConfigCleanup();
-    }
+      tc_seed_apply();   // a serial coefficient write is a live reload too: keep the evolving seed
+    }                    // from being silently re-frozen by the reparsed tc_hse_b/tc_lse_a slots
 
     fatfs_busy=1;   // FATFS_remount + readConfigFile + checkDelayedLoadRules touch FATFS
     if (delayedReadConfigFile) {
