@@ -237,7 +237,7 @@ volatile _Bool tc_learn = 0, tc_apply = 0, tc_rtc = 0;
 // its remaining significance instead of dashing, overriding the fixed Tolerance_time_* ladder.
 // digit_bright[] holds per-digit intensity 0..FADE_MAX for the [deciseconds, centiseconds,
 // milliseconds, decimal-point] positions (FADE_MAX = fully lit, i.e. certainly significant).
-volatile _Bool holdover_fade = 0;
+volatile _Bool significance_fade = 0;
 #define FADE_MAX 16
 uint8_t digit_bright[4] = { FADE_MAX, FADE_MAX, FADE_MAX, FADE_MAX };
 float holdover_u_us = 0.0f;                 // last computed 3σ time-interval-error bound U(τ), µs
@@ -1446,8 +1446,8 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     tc_learn = truthy(value);         // accumulate (die temp, ppm) samples while GPS-locked
   } else if (strcasecmp(key, "tc_apply") == 0) {
     tc_apply = truthy(value);         // steer the SysTick timebase during GPS-loss holdover
-  } else if (strcasecmp(key, "holdover_fade") == 0) {
-    holdover_fade = truthy(value);      // fade sub-second digits by significance in holdover, not dash
+  } else if (strcasecmp(key, "significance_fade") == 0) {
+    significance_fade = truthy(value);      // fade sub-second digits by significance in holdover, not dash
   } else if (strcasecmp(key, "tc_rtc") == 0) {
     tc_rtc = truthy(value);           // additionally trim RTC->CALR while GPS is absent
   } else if (strcasecmp(key, "tc_t0") == 0) {
@@ -2462,7 +2462,7 @@ void tc_housekeeping(void){
   // tick ISR would keep applying a stale frozen correction forever.
   if (tc_learn || tc_apply || tc_rtc || tc_steer_on || displayMode == MODE_TEMPCOMP) tc_governor();
 
-  if (holdover_fade) {   // recompute the per-digit fade once per second while enabled
+  if (significance_fade) {   // recompute the per-digit fade once per second while enabled
     static uint32_t last_fade = 0;
     uint32_t now = (uint32_t)currentTime;
     if (now != last_fade) { last_fade = now; computeHoldoverFade(); }
@@ -2894,7 +2894,7 @@ void checkDelayedLoadRules(){
 }
 
 void setPrecision(void){
-  if (holdover_fade && countMode == COUNT_NORMAL) {
+  if (significance_fade && countMode == COUNT_NORMAL) {
     // Holdover fade replaces the FIXED Tolerance_time_* dash ladder with a SIGNIFICANCE-driven one:
     // computeHoldoverFade() sets each sub-second digit's intensity in digit_bright[] from the live
     // time-interval-error bound, and a digit is DASHED the instant its significance reaches zero —
