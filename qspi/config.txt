@@ -76,6 +76,10 @@ Tolerance_time_100ms = 100000
 
 # For paranoia, set the 1ms tolerance to 1, which will disable the last digit as soon as GPS fix is lost.
 # To turn off the tolerance feature, set all tolerances to 0.
+# Or replace the fixed ladder with measured uncertainty: with significance_fade on, each digit
+# is dashed when the live 3-sigma holdover error passes its place value (uses the calibration +
+# the learned temperature model), instead of at the fixed times above.
+significance_fade = off
 
 
 # nonlinear brightness curve, five stops of input->output, use brightness-curve.htm for a GUI
@@ -131,6 +135,15 @@ mode_tempcomp = 0
 # tc_lse_c =
 # tc_engage_s = 2   (minimum 2)
 # tc_max_ppm = 100
+
+# Warm start (seed-and-evolve): with tc_seed on, the pasted coefficients above load as an
+# EVOLVING starting point instead of a freeze — compensated from the first second, refined as
+# the clock learns, handed over once its own data is at least as rich. tc_dump also prints
+# tc_seed_lo/hi (the model's temperature coverage) so a paste round-trips. Over serial, send
+# the coefficients first and "tc_seed = on" last (the order tc_dump prints).
+# tc_seed = on
+# tc_seed_lo =
+# tc_seed_hi =
 
 
 ## astro modes (GPS-derived)
