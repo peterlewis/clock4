@@ -76,6 +76,7 @@ extern uint16_t buffer_b[];
 
 extern _Bool delayedReadConfigFile;
 extern _Bool delayedCheckOnEject;
+extern volatile uint8_t fatfs_busy;
 
 extern _Bool waitingForLatch;
 extern _Bool resendDate;
