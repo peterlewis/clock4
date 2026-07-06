@@ -117,7 +117,7 @@ tc_learn = off
 tc_apply = off
 tc_rtc = off
 
-# show die temp / model offsets / sample count on the date row (pages like the astro modes)
+# show die temp / model offsets / sample count on the date row (four pages, 5.5 s each)
 mode_tempcomp = 0
 
 # model centre (deg C) and safety limits; paste frozen coefficients from tc_dump below.
@@ -131,4 +131,20 @@ mode_tempcomp = 0
 # tc_lse_c =
 # tc_engage_s = 2   (minimum 2)
 # tc_max_ppm = 100
+
+# Warm start (seed-and-evolve): with tc_seed on, the pasted coefficients above load as an
+# EVOLVING prior instead of a freeze — the clock is temperature-compensated from the first
+# second and keeps refining until its own data is at least as rich, then hands over.
+# tc_dump also prints tc_seed_lo/hi (the model's temperature coverage) so a paste
+# round-trips. Over serial, the "tc_seed = on" line is the trigger — send it last, after
+# the coefficients (the order tc_dump prints).
+# tc_seed = on
+# tc_seed_lo =
+# tc_seed_hi =
+
+# During a GPS-loss holdover, dash each sub-second digit once the live 3-sigma time
+# uncertainty (from the calibration + the measured temperature-model residual) passes that
+# digit's place value — the same dash glyph as the Tolerance_time_* ladder, but driven by
+# measured significance instead of fixed timeouts (which it replaces while enabled).
+# significance_fade = on
 
