@@ -224,12 +224,16 @@ volatile struct {
 } pps_cap;
 
 // --- SOF correlation (experimental: sub-ms USB timestamping without a hardware PPS wire) -----------
-// Latched by the USB SOF interrupt (PCD_SOFCallback, usbd_conf.c) every 1ms: the 11-bit USB frame
-// number and the DWT count at that Start-Of-Frame. Emitted in $PMTXTS so a host — which can read each
-// USB frame's own arrival time in hardware — can place the PPS edge on its clock via the frame, immune
-// to the ~6ms host-driven read jitter. Written in the SOF ISR, read at emit under __disable_irq.
+// Latched by the USB SOF interrupt (PCD_SOFCallback, usbd_conf.c) every 1ms WHEN pps_ts_enabled: the
+// 11-bit USB frame number and the DWT count at that Start-Of-Frame. Emitted in $PMTXTS so a host —
+// which can read each USB frame's own arrival time in hardware — can place the PPS edge on its clock
+// via the frame, immune to the ~6ms host-driven read jitter. Written in the SOF ISR, read at emit
+// under __disable_irq. pps_sof_valid gates emission of the tail: it is 0 until the first SOF has
+// latched a real anchor (so the first PPS after enumeration, or with pps just toggled on, or the
+// emulator which has no SOF, emits the plain 9-field sentence rather than a stale (0,0) anchor).
 volatile uint32_t pps_sof_dwt   = 0;   // DWT->CYCCNT at the most recent SOF
 volatile uint16_t pps_sof_frame = 0;   // USB 11-bit frame number at that SOF (matches host frame mod 2048)
+volatile uint8_t  pps_sof_valid = 0;   // 1 once a real SOF anchor has been latched; 0 = emit 9-field only
 
 // --- Temperature compensation (opt-in) ------------------------------------------------------
 // Learns ppm-vs-die-temperature for both oscillators while GPS-locked (tc_learn), then during
@@ -1863,18 +1867,26 @@ static uint8_t emitPPSTimestamp(void){
   uint8_t  flags    = pps_cap.flags;
   uint32_t dwt_pps  = pps_cap.dwt_pps;   // DWT at the PPS edge (SOF-correlation timebase)
   uint32_t sof_dwt  = pps_sof_dwt;       // DWT at the most recent SOF ...
-  uint16_t sof_fr   = pps_sof_frame;     // ... and that SOF's 11-bit USB frame number
+  uint16_t sof_fr   = pps_sof_frame;     // ... and that SOF's 11-bit USB frame number ...
+  uint8_t  sof_ok   = pps_sof_valid;     // ... valid only once a real SOF has latched an anchor
   __enable_irq();
 
   uint32_t load = SysTick->LOAD;         // constant; sent so the host needn't assume core clock
 
   char body[128];                        // everything between '$' and '*'
-  int n = snprintf(body, sizeof body, "PMTXTS,%lu,%lu,%u,%lu,%lu,%ld,%lu,%d,%X,%lu,%u,%lu",
+  int n = snprintf(body, sizeof body, "PMTXTS,%lu,%lu,%u,%lu,%lu,%ld,%lu,%d,%X",
                    (unsigned long)snap_seq, (unsigned long)epoch, (unsigned)subms,
                    (unsigned long)st, (unsigned long)load, (long)calerr,
-                   (unsigned long)sincecal, (int)temp, (unsigned)flags,
-                   (unsigned long)dwt_pps, (unsigned)sof_fr, (unsigned long)sof_dwt);
+                   (unsigned long)sincecal, (int)temp, (unsigned)flags);
   if (n < 0 || n >= (int)sizeof body) { pps_record_pending = 0; return USBD_FAIL; }
+  // Append the SOF-correlation tail only when a real anchor exists — never a stale (0,0). Absent tail =
+  // the plain sentence a 9-field parser expects (also the emulator's output, which has no USB SOF).
+  if (sof_ok) {
+    int t = snprintf(body + n, sizeof body - n, ",%lu,%u,%lu",
+                     (unsigned long)dwt_pps, (unsigned)sof_fr, (unsigned long)sof_dwt);
+    if (t < 0 || t >= (int)(sizeof body - n)) { pps_record_pending = 0; return USBD_FAIL; }
+    n += t;
+  }
 
   uint8_t cks = 0;                       // standard NMEA XOR checksum
   for (int i = 0; i < n; i++) cks ^= (uint8_t)body[i];
