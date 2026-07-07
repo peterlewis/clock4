@@ -70,6 +70,21 @@ void sun_az_el(double lat, double lon, double unix_s, double *az, double *el) {
     if (az) *az = a;
 }
 
+void sun_subsolar(double unix_s, double *lat, double *lon) {
+    double n = days_since_j2000(unix_s);
+    double alpha, delta;
+    sun_ecliptic(n, NULL, NULL, NULL, NULL, &alpha, &delta);
+    /* Subsolar point: latitude = solar declination; longitude where the local hour
+     * angle is zero, i.e. lst == alpha  =>  lon = alpha - gmst*15  (same GMST series
+     * as sun_az_el). */
+    double gmst = gmst_hours(n);
+    double l = fmod(alpha - gmst * 15.0, 360.0);
+    if (l < -180.0) l += 360.0;
+    else if (l > 180.0) l -= 360.0;
+    if (lat) *lat = delta * RAD;
+    if (lon) *lon = l;
+}
+
 double equation_of_time(double unix_s) {
     double n = days_since_j2000(unix_s);
     double L, alpha;

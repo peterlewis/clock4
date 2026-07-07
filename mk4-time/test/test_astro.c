@@ -109,6 +109,23 @@ int main(void) {
     maidenhead(-41.283, 174.745, g); chks("Wellington", g, "RE78ir");
     maidenhead(1.0 / 0.0, 0.0, g); chks("non-finite", g, "----");
 
+    printf("sun_subsolar:\n");
+    /* Self-consistency (non-circular vs the sun_az_el vectors above): the sun must be
+     * at the zenith of its own subsolar point — elevation 90 deg at every test instant. */
+    for (int i = 0; i < 4; i++) {
+        double slat, slon, e;
+        sun_subsolar(V[i]->t, &slat, &slon);
+        sun_az_el(slat, slon, V[i]->t, NULL, &e);
+        char nm[40]; sprintf(nm, "zenith %s", V[i]->tag);
+        chk(nm, e, 90.0, 0.01);
+    }
+    /* Declination anchors: June solstice ~ +23.44, deep northern winter ~ -23. */
+    {
+        double slat;
+        sun_subsolar(V1.t, &slat, NULL); chk("decl solstice", slat, 23.436, 0.05);
+        sun_subsolar(V2.t, &slat, NULL); chk("decl jan 1",   slat, -23.06, 0.10);
+    }
+
     printf("local_sidereal_time (h):\n");
     /* GMST at J2000.0 = 18.697374558 h (IAU); Meeus ex. 12.b, 1987-04-10 19:21:00 UT
      * -> mean GMST 8h34m57.1s = 8.582525 h. LST = GMST + lon/15 checks shift + wrap. */
