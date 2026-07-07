@@ -181,6 +181,7 @@ enum {
   // date row keeps the civil date and a dedicated colon animation marks the mode.
   MODE_LST,
   MODE_SOLAR,
+  MODE_CUCKOO_SHOWCASE,
 
   NUM_DISPLAY_MODES
 };
@@ -261,6 +262,9 @@ void PPS_NoUpdate(void);
 void PPS_Countdown(void);
 void rxConfigString(char c);
 void monitor_vbus(void);
+void cuckoo_poll(void);
+void cuckoo_abort(void);
+const char* cuckoo_tour_name(void);
 
 #define latchSegments() \
   buffer_c[0].low = next7seg.c; \
