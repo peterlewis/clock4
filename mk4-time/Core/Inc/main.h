@@ -158,6 +158,7 @@ enum {
   MODE_VBAT,
   MODE_DISPLAYTEST,
   MODE_TTFF,
+  MODE_CUCKOO_SHOWCASE,
 #ifdef NONCOMPLIANT_DATE_MODES
   MODE_DDMMYYYY,
 #endif
@@ -242,6 +243,7 @@ void rxConfigString(char c);
 void monitor_vbus(void);
 void cuckoo_poll(void);
 void cuckoo_abort(void);
+const char* cuckoo_tour_name(void);
 
 #define latchSegments() \
   buffer_c[0].low = next7seg.c; \

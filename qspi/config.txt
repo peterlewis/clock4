@@ -100,3 +100,26 @@ mode_satview = 0
 
 # show coin cell voltage
 mode_vbat = 0
+
+## cuckoo animations
+# Short scheduled display flourishes on the time row (see CUCKOO_SPEC.md). The clock keeps
+# perfect time throughout: every animation only modulates brightness of the true digits and
+# ends on the plain face. Off by default; costs nothing when off.
+
+# which animation plays at quarter-hours:
+#   carry     - the rollover arithmetic poured leftward through the digits that change
+#   heartbeat - the digits breathe the colon waveform, radiating out from the colons
+#   pendulum  - six digits swing apart and are caught in unison exactly on the PPS edge
+#             - (skipped in holdover: no PPS, no proof)
+#   trust     - a relight wave showing how far down the display the clock is currently certain
+#   rain      - (reserved: satellites falling down their true azimuths - not yet implemented)
+cuckoo_animation = heartbeat
+
+# off | hour | quarter. hour plays the full programme at the top of each hour (carry at :00,
+# heartbeat :05, trust :25, pendulum catching :01:00); quarter adds the single animation above
+# at :15 / :30 / :45.
+cuckoo_interval = off
+
+# a display mode (buttons cycle to it) that tours all the animations continuously,
+# announcing each by name on the date row
+MODE_CUCKOO_SHOWCASE = disabled

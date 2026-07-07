@@ -394,6 +394,9 @@ void sendDate( _Bool now ){
       i=1;
     }
     break;
+  case MODE_CUCKOO_SHOWCASE:
+    i = sprintf((char*)&uart2_tx_buffer[1], "%s", cuckoo_tour_name());
+    break;
   case MODE_VBAT:
     if (vbat == 0.0) {
       i = sprintf((char*)&uart2_tx_buffer[1], "bat -");
@@ -938,10 +941,111 @@ static void ck_heartbeat_tick(void){
   if (ck_tick >= 900) cuckoo_abort();                                     // hard stop
 }
 
+// ---- pendulum (display label CAtCH): prove the discipline --------------------------------
+// Six big digits swing with a closed-form quadratic chirp: phase_i(t) = ((300-t)^2*(6+i))>>10
+// in 1/256-cycle units, so every phase is ZERO at exactly tick 300 — the catch is mathematics,
+// not accumulation, and cannot miss. Opens in unison (amplitude ramps in), decays into visible
+// disorder as the mismatched chirps separate, is reeled back as they slow together, and lands
+// with one unified breath ON the second edge the piece was aimed at. Requires a live PPS
+// (checked at start); in holdover the piece is skipped — converging onto an undisciplined edge
+// would forge the signature.
+static void ck_pendulum_tick(void){
+  uint16_t rem = (ck_tick < 300) ? (uint16_t)(300 - ck_tick) : 0;
+  uint32_t r2 = (uint32_t)rem * rem;
+  for (uint8_t d = 0; d < 6; d++){
+    uint8_t lv;
+    if (ck_tick >= 285){                        // THE CATCH: one unified breath into the edge
+      lv = (ck_tick < 300) ? (uint8_t)(10 + ((ck_tick - 285) * 6) / 15) : 16;
+    } else {
+      uint8_t A = (ck_tick < 50) ? (uint8_t)((ck_tick * 6) / 50) : 6;
+      uint8_t phi = (uint8_t)((r2 * (6u + d)) >> 10);          // wraps mod 256 = one cycle
+      uint8_t tri = (phi < 128) ? phi : (uint8_t)(255 - phi);  // triangle 0..127
+      lv = (uint8_t)(10 + ((int16_t)A * ((int16_t)tri - 64)) / 64);   // 10 ± A -> 4..16
+    }
+    for (uint8_t s = 0; s < 7; s++) ck_levels[d][s] = lv;
+  }
+  if (ck_tick >= 330) cuckoo_abort();           // brief plain-face hold past the edge, then out
+}
+
+// ---- trust: how much the instrument actually knows right now ------------------------------
+// X-ray dip, then a relight wave walks HH -> MM -> SS -> ds -> cs -> ms, each digit relighting
+// to the confidence the tolerance ladder holds for it. Locked: full wave + one unified pulse
+// (total confidence gets a signature). In holdover the wave dies at the honest position, holds
+// the picture, then the dead rows fade back up to the live face (whose dashes are the resting
+// form of the same claim).
+static uint8_t ck_conf_of(uint32_t age, uint32_t tol){
+  if (tol == 0 || age * 2u < tol) return 16;                  // comfortably inside the window
+  if (age >= tol) return 0;                                   // past it: the ladder dashes this digit
+  return (uint8_t)((32u * (tol - age)) / tol);                // linear roll-off across the top half
+}
+static uint8_t ck_conf(uint8_t row){
+  if (row <= 5) return (had_pps || rtc_good) ? 16 : 2;        // whole seconds: set, or barely
+  if (!had_pps && !rtc_good) return 0;                        // never locked: unanchored decimals
+  uint32_t age = (uint32_t)currentTime - last_pps_time;
+  uint32_t cal = (uint32_t)currentTime - rtc_last_calibration;
+  if (row == 8) return ck_conf_of(age, config.tolerance_1ms);
+  if (row == 7) return ck_conf_of(age, config.tolerance_10ms);
+  // deciseconds mirror the ladder exactly: shown under P3/P2 (fresh PPS) OR P1 (RTC-calibrated)
+  uint8_t a = ck_conf_of(age, config.tolerance_10ms);
+  uint8_t b = ck_conf_of(cal, config.tolerance_100ms);
+  return a > b ? a : b;
+}
+
+static void ck_trust_tick(void){
+  if (ck_tick < 30){ ck_set_all(2); return; }                 // the x-ray dip
+  for (uint8_t p = 0; p < CK_DIGITS; p++){                    // the relight wave, MSB first
+    uint8_t lv = (ck_tick >= (uint16_t)(30 + p * 8)) ? ck_conf(p) : 2;
+    for (uint8_t s = 0; s < 8; s++) ck_levels[p][s] = lv;
+  }
+  if (ck_tick < 112) return;                                  // wave still walking (+ a beat)
+  uint16_t t = (uint16_t)(ck_tick - 112);
+  _Bool all16 = 1;
+  for (uint8_t p = 0; p < CK_DIGITS; p++) if (ck_conf(p) < 16) all16 = 0;
+  if (all16){                                                 // locked: the unified pulse
+    uint8_t lv = 16;
+    if (t < 8)       lv = (uint8_t)(16 - t / 2);
+    else if (t < 16) lv = (uint8_t)(12 + (t - 8) / 2);
+    ck_set_all(lv);
+    if (t >= 40) cuckoo_abort();
+  } else {                                                    // honest picture, then dashes return
+    for (uint8_t p = 0; p < CK_DIGITS; p++){
+      uint8_t c = ck_conf(p);
+      uint8_t lv = c;
+      if (c < 16) lv = (t >= 60) ? 16 : (uint8_t)(c + ((16 - c) * t) / 60);
+      for (uint8_t s = 0; s < 8; s++) ck_levels[p][s] = lv;
+    }
+    if (t >= 80) cuckoo_abort();
+  }
+}
+
+static _Bool ck_pps_fresh(void){
+  return had_pps && ((uint32_t)currentTime - last_pps_time) < 3u;
+}
+
 static void ck_start(uint8_t anim){
   if (ck_anim != 0xFF) return;              // never preempt a running piece
   ck_anim = anim; ck_phase = 0; ck_tick = 0;
   ck_scan_begin();
+}
+
+// ---- the hour programme + the showcase tour ------------------------------------------------
+// At the top of the hour the full programme plays as a sequence with rests: carry owns the
+// :00:00 edge, heartbeat at :00:05, (rain's :00:15 slot is empty until it exists), trust at
+// :00:25, and pendulum closes by catching :01:00. MODE_CUCKOO_SHOWCASE tours the catalogue
+// continuously: name on the date row, the piece, two seconds of plain face, the next.
+static uint8_t ck_prog = 0;                  // hour programme stage (0 = not running)
+static uint8_t ck_tour = 0;                  // showcase stage: piece index * 4 + step
+static uint16_t ck_tour_wait = 0;
+static const char* const ck_names[CKA_COUNT] = { "CArry", "HEArtbEAt", "rAIn", "CAtCH", "trUSt" };
+static char ck_tour_text[12] = "";
+const char* cuckoo_tour_name(void){ return ck_tour_text; }
+
+static void ck_dispatch(uint8_t a){          // start an implemented piece (edge-aligned)
+  if      (a == CKA_CARRY)     ck_start(CKA_CARRY);
+  else if (a == CKA_HEARTBEAT) ck_start(CKA_HEARTBEAT);
+  else if (a == CKA_TRUST)     ck_start(CKA_TRUST);
+  else if (a == CKA_PENDULUM && ck_pps_fresh()) ck_start(CKA_PENDULUM);
+  // rain: specified, not yet built — nothing plays in its place
 }
 
 // Main-loop poll: the 10 ms tick (centisecond edge), the scheduler, the active animation.
@@ -950,33 +1054,91 @@ void cuckoo_poll(void){
   ck_last_cs = centisec;
 
   if (ck_anim == 0xFF){
+    // The closed / dark clock stays dark: in MODE_STANDBY the DAC has faded the panel out and
+    // displayOff() has parked the scan — starting a piece would restart the display DMAs on a
+    // clock that is deliberately off. (displayOff() also aborts any piece already running.)
+    if (displayMode == MODE_STANDBY){ ck_armed = 0; ck_prog = 0; return; }
+    uint8_t ss = (uint8_t)(nextBcd.tenSeconds * 10 + nextBcd.seconds);
+    uint8_t mm = (uint8_t)(nextBcd.tenMinutes * 10 + nextBcd.minutes);
+
+    // --- showcase tour (owns the engine while the mode is displayed) ---
+    if (displayMode == MODE_CUCKOO_SHOWCASE && countMode == COUNT_NORMAL){
+      uint8_t piece = ck_tour >> 2, step = ck_tour & 3;
+      if (piece >= CKA_COUNT){ ck_tour = 0; return; }
+      if (step == 0){                                        // announce
+        const char* nm = ck_names[piece];
+        uint8_t ok = (piece == CKA_CARRY || piece == CKA_HEARTBEAT || piece == CKA_TRUST
+                      || (piece == CKA_PENDULUM && ck_pps_fresh()));
+        uint8_t i2 = 0; while (nm[i2] && i2 < 10){ ck_tour_text[i2] = nm[i2]; i2++; } ck_tour_text[i2] = 0;
+        if (!ok){ ck_tour_text[0] = 'n'; ck_tour_text[1] = 'o'; ck_tour_text[2] = ' ';
+                  ck_tour_text[3] = (piece == CKA_PENDULUM) ? 'P' : 'F';
+                  ck_tour_text[4] = (piece == CKA_PENDULUM) ? 'P' : 'I';
+                  ck_tour_text[5] = (piece == CKA_PENDULUM) ? 'S' : 'H'; ck_tour_text[6] = 0; }
+        ck_tour_wait = ok ? 150 : 200;                       // 1.5 s of name / 2 s of reason
+        ck_tour = (uint8_t)((piece << 2) | (ok ? 1 : 3));
+      } else if (step == 1){                                 // wait, then play on a second edge
+        if (ck_tour_wait) ck_tour_wait--;
+        else if (decisec == 0 && centisec < 5){
+          ck_carry_n = 5;                                    // tour shows the full cascade
+          ck_dispatch(piece);
+          ck_tour = (uint8_t)((piece << 2) | 2);
+        }
+      } else if (step == 2){                                 // piece ended (we are idle again)
+        ck_tour_wait = 200;                                  // 2 s of plain face
+        ck_tour = (uint8_t)((piece << 2) | 3);
+      } else {                                               // rest, then next piece
+        if (ck_tour_wait) ck_tour_wait--;
+        else { ck_tour_text[0] = 0; ck_tour = (uint8_t)(((piece + 1) % CKA_COUNT) << 2); }
+      }
+      return;
+    }
+    if (ck_tour) { ck_tour = 0; ck_tour_text[0] = 0; }       // left the mode: reset the tour
+
+    // --- hour programme stages (armed by the hour trigger below) ---
+    if (ck_prog){
+      if (ck_prog == 1 && ss == 5  && decisec == 0){ ck_dispatch(CKA_HEARTBEAT); ck_prog = 2; return; }
+      if (ck_prog == 2 && ss == 25 && decisec == 0){ ck_dispatch(CKA_TRUST);     ck_prog = 3; return; }
+      if (ck_prog == 3 && ss == 56 && decisec == 5){ ck_prog = 4; return; }      // pendulum pre-arm
+      if (ck_prog == 4 && ss == 57 && decisec == 0){ ck_dispatch(CKA_PENDULUM);  ck_prog = 5; return; }
+      if ((ck_prog == 5 && ss > 1 && ss < 50) || mm % 15 > 1) ck_prog = 0;       // programme over
+    }
+
     if (cuckoo_interval == CK_OFF) { ck_armed = 0; return; }
     if (countMode != COUNT_NORMAL) { ck_armed = 0; return; }    // never over text/countdown
-    // Arm on the .500 of a :59 second whose NEXT minute is a quarter. nextBcd holds the
-    // displayed stamp until the .900 restage, so this reads the CURRENT display values.
-    if (!ck_armed && nextBcd.tenSeconds == 5 && nextBcd.seconds == 9
-        && decisec == 5 && currentTime != ck_last_arm){
-      uint8_t mm_now = (uint8_t)(nextBcd.tenMinutes * 10 + nextBcd.minutes);
-      uint8_t mm_next = (uint8_t)((mm_now + 1) % 60);
+
+    // --- quarter-hour pendulum needs an early arm (:56.5 -> start :57, catch :00) ---
+    uint8_t sel = (cuckoo_animation < CKA_COUNT) ? cuckoo_animation : CKA_HEARTBEAT;
+    if (sel == CKA_PENDULUM && !ck_prog && cuckoo_interval == CK_QUARTER
+        && ss == 56 && decisec == 5 && currentTime != ck_last_arm){
+      uint8_t mmn = (uint8_t)((mm + 1) % 60);
+      if (mmn % 15 == 0 && mmn != 0){ ck_last_arm = currentTime; ck_armed = 2; }
+    }
+    if (ck_armed == 2 && ss == 57 && decisec == 0){
+      ck_armed = 0;
+      if (ck_pps_fresh()) ck_start(CKA_PENDULUM);              // holdover: honestly skipped
+      return;
+    }
+
+    // --- the main arm: .500 of a :59 second whose NEXT minute is a quarter. nextBcd holds
+    // the displayed stamp until the .900 restage, so this reads the CURRENT display values.
+    if (!ck_armed && ss == 59 && decisec == 5 && currentTime != ck_last_arm){
+      uint8_t mm_next = (uint8_t)((mm + 1) % 60);
       _Bool hour = (mm_next == 0);
       _Bool quarter = (mm_next % 15 == 0) && !hour;
       if ((hour && cuckoo_interval >= CK_HOUR) || (quarter && cuckoo_interval == CK_QUARTER)){
         ck_last_arm = currentTime;
         // chain length from the arithmetic of the +1-minute edge
         ck_carry_n = 2;                                          // seconds units + tens
-        ck_carry_n += (uint8_t)((mm_now % 10 == 9) ? 2 : 1);     // minutes (+ tens on x9)
+        ck_carry_n += (uint8_t)((mm % 10 == 9) ? 2 : 1);         // minutes (+ tens on x9)
         if (hour) ck_carry_n = 5;                                // hh:59:59 -> hh+1:00:00
-        uint8_t a = (cuckoo_animation < CKA_COUNT) ? cuckoo_animation : CKA_HEARTBEAT;
-        if (a == CKA_CARRY) ck_start(CKA_CARRY);                 // the charge needs pre-arm
-        else ck_armed = 1;                                       // others start ON the edge
+        if (hour){ ck_prog = 1; ck_start(CKA_CARRY); }           // the programme opens with carry
+        else if (sel == CKA_CARRY) ck_start(CKA_CARRY);          // the charge needs the pre-arm
+        else if (sel != CKA_PENDULUM) ck_armed = 1;              // edge-start pieces
       }
     }
-    if (ck_armed && decisec == 0 && centisec < 5){
+    if (ck_armed == 1 && decisec == 0 && centisec < 5){
       ck_armed = 0;
-      uint8_t a = (cuckoo_animation < CKA_COUNT) ? cuckoo_animation : CKA_HEARTBEAT;
-      // v1 builds carry + heartbeat; rain / pendulum / trust are specified (CUCKOO_SPEC.md)
-      // and honestly do nothing until implemented — no substitute plays in their place.
-      if (a == CKA_HEARTBEAT) ck_start(CKA_HEARTBEAT);
+      ck_dispatch(sel);
     }
     return;
   }
@@ -984,6 +1146,8 @@ void cuckoo_poll(void){
   ck_tick++;
   if      (ck_anim == CKA_CARRY)     ck_carry_tick();
   else if (ck_anim == CKA_HEARTBEAT) ck_heartbeat_tick();
+  else if (ck_anim == CKA_PENDULUM)  ck_pendulum_tick();
+  else if (ck_anim == CKA_TRUST)     ck_trust_tick();
   else { cuckoo_abort(); return; }
   if (ck_scan) ck_render();
 }
@@ -1189,6 +1353,8 @@ void parseConfigString(char *key, char *value) {
       config.countdown_to = mktime(&t) -1;
 
     }
+  } else if (strcasecmp(key, "MODE_CUCKOO_SHOWCASE") == 0) {
+    set_mode_enabled(MODE_CUCKOO_SHOWCASE, value);
   } else if (strcasecmp(key, "MODE_ISO8601_STD") == 0) {
     set_mode_enabled(MODE_ISO8601_STD, value);
   } else if (strcasecmp(key, "MODE_ISO_ORDINAL") == 0) {
