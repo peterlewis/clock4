@@ -97,8 +97,7 @@ double equation_of_time(double unix_s) {
 
 
 /* Local Mean Sidereal Time, decimal hours [0,24). LMST = GMST + longitude/15
- * (east-positive). Recovered verbatim from the 2026-07-02 implementation,
- * anchors: GMST(J2000.0) = 18.697374558 h (IAU); Meeus ex. 12.b. */
+ * (east-positive). Anchors: GMST(J2000.0) = 18.697374558 h (IAU); Meeus ex. 12.b. */
 double local_sidereal_time(double unix_s, double lon) {
     double lst = fmod(gmst_hours(days_since_j2000(unix_s)) + lon / 15.0, 24.0);
     if (lst < 0.0) lst += 24.0;
