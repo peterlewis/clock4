@@ -260,9 +260,13 @@ volatile _Bool tc_learn = 0, tc_apply = 0, tc_rtc = 0;
 // its remaining significance instead of dashing, overriding the fixed Tolerance_time_* ladder.
 // digit_bright[] holds per-digit intensity 0..FADE_MAX for the [deciseconds, centiseconds,
 // milliseconds, decimal-point] positions (FADE_MAX = fully lit, i.e. certainly significant).
+// Default 0 = NOT significant: at power-on nothing is disciplined yet (had_pps=0, holdover age is
+// huge), so with significance_fade the sub-second digits must start DASHED and only light once the
+// first computeHoldoverFade() proves significance — else setPrecision() at boot reads a stale FADE_MAX
+// and flashes ticking numbers for ~1 s before the first per-second recompute dashes them.
 volatile _Bool significance_fade = 0;
 #define FADE_MAX 16
-uint8_t digit_bright[4] = { FADE_MAX, FADE_MAX, FADE_MAX, FADE_MAX };
+uint8_t digit_bright[4] = { 0, 0, 0, 0 };
 float holdover_u_us = 0.0f;                 // last computed 3σ time-interval-error bound U(τ), µs
 volatile int16_t  tc_t0 = 40;              // model centre temperature (°C)
 volatile uint16_t tc_engage_s = 2;         // seconds of PPS absence before steering engages (min 2)
