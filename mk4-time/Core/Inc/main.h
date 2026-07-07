@@ -240,6 +240,8 @@ void PPS_NoUpdate(void);
 void PPS_Countdown(void);
 void rxConfigString(char c);
 void monitor_vbus(void);
+void cuckoo_poll(void);
+void cuckoo_abort(void);
 
 #define latchSegments() \
   buffer_c[0].low = next7seg.c; \

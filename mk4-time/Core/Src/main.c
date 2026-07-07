@@ -768,7 +768,230 @@ void setDisplayPWM(uint32_t bright){
   HAL_DMA_Start(&hdma_tim7_up, (uint32_t)buffer_c, (uint32_t)&GPIOC->ODR, bright);
 }
 
+// ================= CUCKOO — scheduled display animations (CUCKOO_SPEC.md) =================
+// Short, scheduled flourishes played on the time board's own segments. Opt-in via config
+// (cuckoo_interval, default off); when idle the display path is byte-identical to stock.
+//
+// ENGINE. The matrix scan normally plays 5 DMA slots (one per digit category); the buffers
+// are sized [80] = 5 categories x 16. During an animation the DMA cycle is lengthened to the
+// full interleave [cat0..cat4] x 16, giving every segment 16 brightness levels by dwell:
+// segment s of a digit at level L is lit in repeat 0 (always) plus the first L-1 of repeats
+// 1..15 -> duty L/16. Repeat 0 stays the SAME live slot that latchSegments() and the SysTick
+// handlers already write, so no ISR or latch path changes at all; the engine re-derives
+// repeats 1..15 from repeat 0 on its 10 ms tick (main loop). Consequences, both accepted:
+// a segment at level 0 still glows at 1/16 (a ghost floor), and the sub-second digits' upper
+// repeats lag the live ISR digits by <10 ms. The slot rate is unchanged (TIM1/TIM7 period
+// 256 @ 80 MHz ~ 311 kHz), so the 80-slot cycle still refreshes every category at ~3.9 kHz:
+// no visible flicker change. Global brightness is the anode DAC — orthogonal to all of this.
+//
+// All animation timing derives from the live counters (millisec/centisec/decisec) and the
+// displayed stamp — never loop counts. Every envelope is a terminating integer countdown:
+// an animation cannot fail to end, and its final frame is the plain live face.
+
+enum { CK_OFF = 0, CK_HOUR, CK_QUARTER };
+enum { CKA_CARRY = 0, CKA_HEARTBEAT, CKA_RAIN, CKA_PENDULUM, CKA_TRUST, CKA_COUNT };
+uint8_t cuckoo_animation = CKA_HEARTBEAT;
+uint8_t cuckoo_interval  = CK_OFF;
+
+// element space: rows 0..4 = port-B categories (10h, h, 10m, m, 10s), 5 = seconds units,
+// 6..8 = ds/cs/ms (port C slots 1..3). Column 0..6 = segments a..g, 7 = the DP (C side only).
+#define CK_DIGITS 9
+static uint8_t ck_levels[CK_DIGITS][8];
+static _Bool   ck_scan = 0;          // 80-slot interleave running
+static uint8_t ck_anim = 0xFF;       // active animation, 0xFF = idle
+static uint8_t ck_phase = 0;         // per-animation state machine step
+static uint8_t ck_armed = 0;         // an edge-start is pending (non-carry pieces)
+static uint16_t ck_tick = 0;         // 10 ms ticks since animation start
+static uint8_t ck_last_cs = 0xFF;    // centisecond edge detector (main-loop tick)
+static uint8_t ck_carry_n = 1;       // carry: chain length (digits that change at the edge)
+static time_t  ck_last_arm = 0;      // trigger de-dupe (one start per armed second)
+
+#define CK_SEGB_MASK ((uint16_t)0x01FC)  // port-B segment bits (pattern << 2)
+
+static void ck_set_all(uint8_t level){
+  for (uint8_t d = 0; d < CK_DIGITS; d++)
+    for (uint8_t s = 0; s < 8; s++) ck_levels[d][s] = level;
+}
+
+// Rebuild repeats 1..15 of both scan buffers from the live repeat-0 slots + ck_levels.
+static void ck_render(void){
+  for (uint8_t r = 1; r < 16; r++){
+    for (uint8_t cat = 0; cat < 5; cat++){
+      uint16_t base = buffer_b[cat];
+      uint16_t keep = 0;
+      for (uint8_t s = 0; s < 7; s++)
+        if (ck_levels[cat][s] > r) keep |= (uint16_t)1 << (2 + s);
+      buffer_b[r * 5 + cat] = (base & ~CK_SEGB_MASK) | (base & keep);
+
+      // port C: slot 0 = seconds units (row 5), slots 1..3 = ds/cs/ms (rows 6..8);
+      // slot 4 replicates as-is. Non-segment control bits replicate untouched.
+      buffer_c_t cb = buffer_c[cat];
+      if (cat < 4){
+        uint8_t row = (uint8_t)(5 + cat);
+        uint8_t ckeep = 0;
+        for (uint8_t s = 0; s < 7; s++)
+          if (ck_levels[row][s] > r) ckeep |= (uint8_t)(1u << s);
+        cb.low &= (uint8_t)(ckeep | 0x80);
+        if (!(ck_levels[row][7] > r)) cb.high &= (uint8_t)~cSegDP;
+      }
+      buffer_c[r * 5 + cat] = cb;
+    }
+  }
+}
+
+static void ck_scan_begin(void){
+  if (ck_scan) return;
+  ck_set_all(16);
+  ck_render();
+  HAL_DMA_Abort(&hdma_tim1_up);
+  HAL_DMA_Abort(&hdma_tim7_up);
+  HAL_DMA_Start(&hdma_tim1_up, (uint32_t)buffer_b, (uint32_t)&GPIOB->ODR, 80);
+  HAL_DMA_Start(&hdma_tim7_up, (uint32_t)buffer_c, (uint32_t)&GPIOC->ODR, 80);
+  ck_scan = 1;
+}
+
+static void ck_scan_end(void){
+  if (!ck_scan) return;
+  HAL_DMA_Abort(&hdma_tim1_up);
+  HAL_DMA_Abort(&hdma_tim7_up);
+  HAL_DMA_Start(&hdma_tim1_up, (uint32_t)buffer_b, (uint32_t)&GPIOB->ODR, 5);
+  HAL_DMA_Start(&hdma_tim7_up, (uint32_t)buffer_c, (uint32_t)&GPIOC->ODR, 5);
+  ck_scan = 0;
+}
+
+void cuckoo_abort(void){
+  ck_anim = 0xFF;
+  ck_armed = 0;
+  ck_scan_end();
+}
+
+// The canonical heartbeat waveform (loadColonAnimation's COLON_MODE_HEARTBEAT table) as a
+// function, so the digits can breathe it regardless of the user's configured colon mode.
+static uint8_t ck_heart(uint8_t k){          // k 0..199 -> 0..200
+  if (k < 50)  return (uint8_t)(k * 4);
+  if (k < 150) return (uint8_t)(200 - (k - 50) * 2);
+  return 0;
+}
+
+// ---- carry: make the arithmetic of the rollover visible ----------------------------------
+// charge (T-500ms): the dying seconds digit swells; pour (T0+): light handed leftward one
+// digit per beat through exactly the digits that change; settle: countdown decay back to the
+// working level; exit ramps to full. A working level of 13/16 gives the flares headroom.
+#define CK_WORK 13
+static const uint8_t ck_chain_rows[6] = { 5, 4, 3, 2, 1, 0 };   // rightmost big digit first
+
+static void ck_carry_tick(void){
+  if (ck_phase == 0){                       // charge, entered at .500 of the :59 second
+    uint8_t sw = (uint8_t)(6 + (ck_tick * 10) / 50);            // 6 -> 16 over 500 ms
+    if (sw > 16) sw = 16;
+    ck_set_all(CK_WORK);
+    for (uint8_t s = 0; s < 7; s++) ck_levels[5][s] = sw;       // seconds units swells
+    if (decisec == 0 && ck_tick >= 40) { ck_phase = 1; ck_tick = 0; }   // the edge latched
+    if (ck_tick > 150) { cuckoo_abort(); }                       // safety: edge never came
+    return;
+  }
+  if (ck_phase == 1){                       // pour + settle, one pass
+    uint8_t beat = (ck_carry_n >= 5) ? 12 : 6;                  // 120 ms at the hour: countable
+    ck_set_all(CK_WORK);
+    for (uint8_t k = 0; k < ck_carry_n; k++){
+      uint16_t fire = (uint16_t)(k * beat);
+      if (ck_tick < fire) break;
+      uint16_t age = (uint16_t)(ck_tick - fire);
+      uint8_t row = ck_chain_rows[k];
+      uint8_t lv;
+      if      (age < 10) lv = 16;                               // flare 100 ms
+      else if (age < 40) lv = (uint8_t)(16 - ((age - 10) * (16 - CK_WORK)) / 30);
+      else               lv = CK_WORK;
+      for (uint8_t s = 0; s < 7; s++) ck_levels[row][s] = lv;
+      // the donor dips as its left neighbour takes the light
+      if (k + 1 < ck_carry_n){
+        uint16_t nfire = (uint16_t)((k + 1) * beat);
+        if (ck_tick >= nfire && ck_tick < nfire + 15)
+          for (uint8_t s = 0; s < 7; s++) if (ck_levels[row][s] > 6) ck_levels[row][s] = 6;
+      }
+    }
+    if (ck_tick >= (uint16_t)(ck_carry_n * beat + 40)) { ck_phase = 2; ck_tick = 0; }
+    return;
+  }
+  // exit: working level back to full over 300 ms, then the plain 5-slot scan returns
+  {
+    uint8_t lv = (uint8_t)(CK_WORK + (ck_tick * (16 - CK_WORK)) / 30);
+    if (lv >= 16) { cuckoo_abort(); return; }
+    ck_set_all(lv);
+  }
+}
+
+// ---- heartbeat: the machine shows its own pulse ------------------------------------------
+// Digits breathe the canonical colon waveform, radiating outward from the colons by physical
+// distance; four full 2 s cycles, floor 4/16 keeps the time readable, exit lands on a peak.
+static const uint8_t ck_hb_dist[CK_DIGITS] = { 2, 1, 1, 1, 1, 2, 3, 4, 5 };
+
+static void ck_heartbeat_tick(void){
+  // the same PPS-disciplined phase colonAnimationSync() aligns the real colon DMA to
+  uint8_t ph = (uint8_t)(((((uint32_t)currentTime & 1u) * 100u) + (uint32_t)decisec * 10u + centisec) % 200u);
+  for (uint8_t d = 0; d < CK_DIGITS; d++){
+    uint8_t k = (uint8_t)((ph + 200 - (12 * ck_hb_dist[d]) % 200) % 200);
+    uint8_t lv = (uint8_t)(4 + ((uint16_t)ck_heart(k) * 12) / 200);
+    for (uint8_t s = 0; s < 8; s++) ck_levels[d][s] = lv;
+  }
+  if (ck_tick >= 780 && ck_heart(ph) >= 190) { cuckoo_abort(); return; }  // land on a peak
+  if (ck_tick >= 900) cuckoo_abort();                                     // hard stop
+}
+
+static void ck_start(uint8_t anim){
+  if (ck_anim != 0xFF) return;              // never preempt a running piece
+  ck_anim = anim; ck_phase = 0; ck_tick = 0;
+  ck_scan_begin();
+}
+
+// Main-loop poll: the 10 ms tick (centisecond edge), the scheduler, the active animation.
+void cuckoo_poll(void){
+  if (centisec == ck_last_cs) return;
+  ck_last_cs = centisec;
+
+  if (ck_anim == 0xFF){
+    if (cuckoo_interval == CK_OFF) { ck_armed = 0; return; }
+    if (countMode != COUNT_NORMAL) { ck_armed = 0; return; }    // never over text/countdown
+    // Arm on the .500 of a :59 second whose NEXT minute is a quarter. nextBcd holds the
+    // displayed stamp until the .900 restage, so this reads the CURRENT display values.
+    if (!ck_armed && nextBcd.tenSeconds == 5 && nextBcd.seconds == 9
+        && decisec == 5 && currentTime != ck_last_arm){
+      uint8_t mm_now = (uint8_t)(nextBcd.tenMinutes * 10 + nextBcd.minutes);
+      uint8_t mm_next = (uint8_t)((mm_now + 1) % 60);
+      _Bool hour = (mm_next == 0);
+      _Bool quarter = (mm_next % 15 == 0) && !hour;
+      if ((hour && cuckoo_interval >= CK_HOUR) || (quarter && cuckoo_interval == CK_QUARTER)){
+        ck_last_arm = currentTime;
+        // chain length from the arithmetic of the +1-minute edge
+        ck_carry_n = 2;                                          // seconds units + tens
+        ck_carry_n += (uint8_t)((mm_now % 10 == 9) ? 2 : 1);     // minutes (+ tens on x9)
+        if (hour) ck_carry_n = 5;                                // hh:59:59 -> hh+1:00:00
+        uint8_t a = (cuckoo_animation < CKA_COUNT) ? cuckoo_animation : CKA_HEARTBEAT;
+        if (a == CKA_CARRY) ck_start(CKA_CARRY);                 // the charge needs pre-arm
+        else ck_armed = 1;                                       // others start ON the edge
+      }
+    }
+    if (ck_armed && decisec == 0 && centisec < 5){
+      ck_armed = 0;
+      uint8_t a = (cuckoo_animation < CKA_COUNT) ? cuckoo_animation : CKA_HEARTBEAT;
+      // v1 builds carry + heartbeat; rain / pendulum / trust are specified (CUCKOO_SPEC.md)
+      // and honestly do nothing until implemented — no substitute plays in their place.
+      if (a == CKA_HEARTBEAT) ck_start(CKA_HEARTBEAT);
+    }
+    return;
+  }
+
+  ck_tick++;
+  if      (ck_anim == CKA_CARRY)     ck_carry_tick();
+  else if (ck_anim == CKA_HEARTBEAT) ck_heartbeat_tick();
+  else { cuckoo_abort(); return; }
+  if (ck_scan) ck_render();
+}
+// =============== end CUCKOO ================================================================
+
 void displayOff(void){
+
+  cuckoo_abort();   // a dark display ends any cuckoo; restores the plain 5-slot scan state
 
   uart2_tx_buffer[0]=' '; //in case already waiting for latch
   uart2_tx_buffer[1]= CMD_LOAD_TEXT;
@@ -926,6 +1149,20 @@ void parseConfigString(char *key, char *value) {
   } else if (strcasecmp(key, "MATRIX_FREQUENCY") == 0) {
 
     setDisplayFreq(atoi(value));
+
+  } else if (strcasecmp(key, "cuckoo_animation") == 0) {
+
+    if      (strcasecmp(value, "carry") == 0)     cuckoo_animation = CKA_CARRY;
+    else if (strcasecmp(value, "heartbeat") == 0) cuckoo_animation = CKA_HEARTBEAT;
+    else if (strcasecmp(value, "rain") == 0)      cuckoo_animation = CKA_RAIN;
+    else if (strcasecmp(value, "pendulum") == 0)  cuckoo_animation = CKA_PENDULUM;
+    else if (strcasecmp(value, "trust") == 0)     cuckoo_animation = CKA_TRUST;
+
+  } else if (strcasecmp(key, "cuckoo_interval") == 0) {
+
+    if      (strcasecmp(value, "off") == 0)     { cuckoo_interval = CK_OFF; cuckoo_abort(); }
+    else if (strcasecmp(value, "hour") == 0)      cuckoo_interval = CK_HOUR;
+    else if (strcasecmp(value, "quarter") == 0)   cuckoo_interval = CK_QUARTER;
 
   } else if (strcasecmp(key, "zone_override") == 0) {
 
@@ -2123,6 +2360,8 @@ int main(void)
     if (delayedDisplayFreq) setDisplayFreq(delayedDisplayFreq);
 
     monitor_vbus();
+
+    cuckoo_poll();
 
     if (displayMode == MODE_VBAT)
       measure_vbat();
