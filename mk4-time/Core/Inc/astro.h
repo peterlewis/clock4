@@ -41,6 +41,10 @@ double equation_of_time(double unix_s);
 double local_sidereal_time(double unix_s, double lon); /* LMST, hours [0,24), lon E+ */
 double local_solar_time(double unix_s, double lon);    /* apparent solar, hours [0,24) */
 
+/* (d2) Subsolar point at the given UTC instant: latitude = solar declination,
+ *      longitude in [-180,180] (E+). Time-only — needs no observer position. */
+void   sun_subsolar(double unix_s, double *lat, double *lon);
+
 /* (e) 6-character Maidenhead locator for (lat, lon). out must hold >= 7 bytes.
  *     Writes "----\0" if either coordinate is non-finite. */
 void   maidenhead(double lat, double lon, char out[7]);

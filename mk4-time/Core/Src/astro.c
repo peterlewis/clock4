@@ -22,11 +22,11 @@ const char *const ASTRO_MOON_NAMES[8] = {
 
 static double days_since_j2000(double unix_s) { return (unix_s - J2000_UNIX) / 86400.0; }
 
-/* Greenwich Mean Sidereal Time in hours [0,24). Factored out so sun_az_el and
- * local_sidereal_time share one series and can never drift apart. The quadratic
- * term keeps truncation below ~1 ms for decades (the linear series alone drifts to
- * ~10 ms by 2033). Note the input is GPS-derived UTC, not UT1: true-sky sidereal
- * accuracy is floored by DUT1 (up to +/-0.9 s) by design. */
+/* Greenwich Mean Sidereal Time in hours [0,24). One series, shared by sun_az_el,
+ * sun_subsolar and local_sidereal_time so the three can never drift apart. The
+ * quadratic term keeps truncation below ~1 ms for decades (the linear series alone
+ * drifts to ~10 ms by 2033). Note the input is GPS-derived UTC, not UT1: true-sky
+ * sidereal accuracy is floored by DUT1 (up to ±0.9 s) by design. */
 static double gmst_hours(double n) {
     double T = n / 36525.0;
     double g = fmod(18.697374558 + 24.06570982441908 * n + 0.000026 * T * T, 24.0);
@@ -70,6 +70,21 @@ void sun_az_el(double lat, double lon, double unix_s, double *az, double *el) {
     if (az) *az = a;
 }
 
+void sun_subsolar(double unix_s, double *lat, double *lon) {
+    double n = days_since_j2000(unix_s);
+    double alpha, delta;
+    sun_ecliptic(n, NULL, NULL, NULL, NULL, &alpha, &delta);
+    /* Subsolar point: latitude = solar declination; longitude where the local hour
+     * angle is zero, i.e. lst == alpha  =>  lon = alpha - gmst*15  (same GMST series
+     * as sun_az_el). */
+    double gmst = gmst_hours(n);
+    double l = fmod(alpha - gmst * 15.0, 360.0);
+    if (l < -180.0) l += 360.0;
+    else if (l > 180.0) l -= 360.0;
+    if (lat) *lat = delta * RAD;
+    if (lon) *lon = l;
+}
+
 double equation_of_time(double unix_s) {
     double n = days_since_j2000(unix_s);
     double L, alpha;
@@ -79,6 +94,7 @@ double equation_of_time(double unix_s) {
     else if (diff <= -180.0) diff += 360.0;
     return 4.0 * diff; /* minutes */
 }
+
 
 /* Local Mean Sidereal Time, decimal hours [0,24). LMST = GMST + longitude/15
  * (east-positive). Anchors: GMST(J2000.0) = 18.697374558 h (IAU); Meeus ex. 12.b. */
@@ -97,7 +113,7 @@ double local_solar_time(double unix_s, double lon) {
     double utc_h = fmod(unix_s / 3600.0, 24.0);
     double t = fmod(utc_h + lon / 15.0 + equation_of_time(unix_s) / 60.0, 24.0);
     if (t < 0.0) t += 24.0;
-    if (t >= 24.0) t -= 24.0;
+    if (t >= 24.0) t -= 24.0;       /* fmod residue can round the wrap to exactly 24.0 */
     return t; /* hours [0,24) */
 }
 
