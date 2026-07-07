@@ -1751,6 +1751,8 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
       config.countdown_to = mktime(&t) -1;
 
     }
+  } else if (strcasecmp(key, "MODE_CUCKOO_SHOWCASE") == 0) {
+    set_mode_enabled(MODE_CUCKOO_SHOWCASE, value);
   } else if (strcasecmp(key, "MODE_ISO8601_STD") == 0) {
     set_mode_enabled(MODE_ISO8601_STD, value);
   } else if (strcasecmp(key, "MODE_ISO_ORDINAL") == 0) {
