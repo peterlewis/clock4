@@ -194,7 +194,16 @@ volatile struct {
   uint32_t sincecal;   // seconds since last successful RTC calibration (holdover age)
   int16_t  temp;       // die temperature (°C) — for host-side ppm-vs-temperature characterisation
   uint8_t  flags;      // bit0 data_valid, bit1 had_pps, bit2 rtc_good
+  uint32_t dwt_pps;    // DWT->CYCCNT (free-running 12.5ns) latched at the edge — SOF-correlation timebase
 } pps_cap;
+
+// --- SOF correlation (experimental: sub-ms USB timestamping without a hardware PPS wire) -----------
+// Latched by the USB SOF interrupt (PCD_SOFCallback, usbd_conf.c) every 1ms: the 11-bit USB frame
+// number and the DWT count at that Start-Of-Frame. Emitted in $PMTXTS so a host — which can read each
+// USB frame's own arrival time in hardware — can place the PPS edge on its clock via the frame, immune
+// to the ~6ms host-driven read jitter. Written in the SOF ISR, read at emit under __disable_irq.
+volatile uint32_t pps_sof_dwt   = 0;   // DWT->CYCCNT at the most recent SOF
+volatile uint16_t pps_sof_frame = 0;   // USB 11-bit frame number at that SOF (matches host frame mod 2048)
 
 #define CHECK_CONFIG_MTIME
 
@@ -1274,6 +1283,7 @@ void EXTI9_5_IRQHandler(void){__HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_7);}
 // reloaded and before millisec/centisec/decisec are zeroed, so it captures the phase error
 // between the firmware's modelled second and the true GPS edge.
 #define capturePPS() do { \
+    pps_cap.dwt_pps  = DWT->CYCCNT; \
     pps_cap.systick  = SysTick->VAL; \
     pps_cap.subms    = (uint16_t)decisec*100 + (uint16_t)centisec*10 + millisec; \
     pps_cap.epoch    = (uint32_t)currentTime; \
@@ -1382,10 +1392,14 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 // Runs in the main loop (snprintf is fine here, never in the ISR). Clears pps_record_pending
 // on a successful send and for any undeliverable record (no host, formatting failure) — a
 // fresh record arrives on the next edge, so only USBD_BUSY is worth retrying.
-// Sentence: $PMTXTS,<seq>,<epoch>,<subms>,<systick>,<load>,<calerr>,<sincecal>,<temp>,<flags>*CC
+// Sentence: $PMTXTS,<seq>,<epoch>,<subms>,<systick>,<load>,<calerr>,<sincecal>,<temp>,<flags>,<dwt_pps>,<sof_frame>,<dwt_sof>*CC
 //   subms+(load-systick)/(load+1) = modelled sub-second position at the edge (phase error);
 //   ppm = calerr * 1e6 / (32768 * CAL_PERIOD)  [CAL_PERIOD=63];  temp = die °C;
 //   flags: b0 valid, b1 pps, b2 rtc.
+//   SOF-correlation tail (experimental): dwt_pps = DWT cycle count at the PPS edge; sof_frame = USB
+//   11-bit frame number of the most recent SOF; dwt_sof = DWT at that SOF. A host that knows each USB
+//   frame's own arrival time places the edge as hostTime(sof_frame) + (dwt_pps-dwt_sof)/f_dwt, immune
+//   to USB read jitter. dwt_pps deltas (~80e6/s) self-calibrate f_dwt, so no core-clock assumption.
 static uint8_t emitPPSTimestamp(void){
   // With no enumerated host (e.g. charger-only power) CDC can never accept the sentence;
   // drop the record before doing any formatting work, otherwise the pending flag would
@@ -1404,15 +1418,19 @@ static uint8_t emitPPSTimestamp(void){
   uint32_t sincecal = pps_cap.sincecal;
   int16_t  temp     = pps_cap.temp;
   uint8_t  flags    = pps_cap.flags;
+  uint32_t dwt_pps  = pps_cap.dwt_pps;   // DWT at the PPS edge (SOF-correlation timebase)
+  uint32_t sof_dwt  = pps_sof_dwt;       // DWT at the most recent SOF ...
+  uint16_t sof_fr   = pps_sof_frame;     // ... and that SOF's 11-bit USB frame number
   __enable_irq();
 
   uint32_t load = SysTick->LOAD;         // constant; sent so the host needn't assume core clock
 
-  char body[96];                         // everything between '$' and '*'
-  int n = snprintf(body, sizeof body, "PMTXTS,%lu,%lu,%u,%lu,%lu,%ld,%lu,%d,%X",
+  char body[128];                        // everything between '$' and '*'
+  int n = snprintf(body, sizeof body, "PMTXTS,%lu,%lu,%u,%lu,%lu,%ld,%lu,%d,%X,%lu,%u,%lu",
                    (unsigned long)snap_seq, (unsigned long)epoch, (unsigned)subms,
                    (unsigned long)st, (unsigned long)load, (long)calerr,
-                   (unsigned long)sincecal, (int)temp, (unsigned)flags);
+                   (unsigned long)sincecal, (int)temp, (unsigned)flags,
+                   (unsigned long)dwt_pps, (unsigned)sof_fr, (unsigned long)sof_dwt);
   if (n < 0 || n >= (int)sizeof body) { pps_record_pending = 0; return USBD_FAIL; }
 
   uint8_t cks = 0;                       // standard NMEA XOR checksum
@@ -2016,6 +2034,12 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
+
+  // Enable the DWT cycle counter (free-running at the 80 MHz core clock, 12.5 ns/tick, wraps ~53.7 s):
+  // the monotonic timebase the PPS edge and each USB SOF are both latched against for host correlation.
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0;
+  DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
 
   buffer_c[0].high=0b11001110;
   buffer_c[1].high=0b11001101;
