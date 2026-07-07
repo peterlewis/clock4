@@ -772,8 +772,9 @@ void setDisplayPWM(uint32_t bright){
 }
 
 // ================= CUCKOO — scheduled display animations (CUCKOO_SPEC.md) =================
-// Short, scheduled flourishes played on the time board's own segments. Opt-in via config
-// (cuckoo_interval, default off); when idle the display path is byte-identical to stock.
+// Short, scheduled flourishes played on the time board's own segments. cuckoo_interval is
+// minutes between manifests, anchored to the hour (default 60: on the hour it manifests);
+// "cuckoo_interval = off" disables. When idle the display path is byte-identical to stock.
 //
 // ENGINE. The matrix scan normally plays 5 DMA slots (one per digit category); the buffers
 // are sized [80] = 5 categories x 16. During an animation the DMA cycle is lengthened to the
@@ -791,10 +792,10 @@ void setDisplayPWM(uint32_t bright){
 // displayed stamp — never loop counts. Every envelope is a terminating integer countdown:
 // an animation cannot fail to end, and its final frame is the plain live face.
 
-enum { CK_OFF = 0, CK_HOUR, CK_QUARTER };
 enum { CKA_CARRY = 0, CKA_HEARTBEAT, CKA_RAIN, CKA_PENDULUM, CKA_TRUST, CKA_COUNT };
 uint8_t cuckoo_animation = CKA_HEARTBEAT;
-uint8_t cuckoo_interval  = CK_OFF;
+uint8_t cuckoo_interval  = 60;   // minutes between manifests, anchored to the hour (mm %% X == 0,
+                                 // so it always plays ON the hour); 0 = off; default hourly
 
 // element space: rows 0..4 = port-B categories (10h, h, 10m, m, 10s), 5 = seconds units,
 // 6..8 = ds/cs/ms (port C slots 1..3). Column 0..6 = segments a..g, 7 = the DP (C side only).
@@ -1033,7 +1034,6 @@ static void ck_start(uint8_t anim){
 // :00:00 edge, heartbeat at :00:05, (rain's :00:15 slot is empty until it exists), trust at
 // :00:25, and pendulum closes by catching :01:00. MODE_CUCKOO_SHOWCASE tours the catalogue
 // continuously: name on the date row, the piece, two seconds of plain face, the next.
-static uint8_t ck_prog = 0;                  // hour programme stage (0 = not running)
 static uint8_t ck_tour = 0;                  // showcase stage: piece index * 4 + step
 static uint16_t ck_tour_wait = 0;
 static const char* const ck_names[CKA_COUNT] = { "CArry", "HEArtbEAt", "rAIn", "CAtCH", "trUSt" };
@@ -1057,7 +1057,7 @@ void cuckoo_poll(void){
     // The closed / dark clock stays dark: in MODE_STANDBY the DAC has faded the panel out and
     // displayOff() has parked the scan — starting a piece would restart the display DMAs on a
     // clock that is deliberately off. (displayOff() also aborts any piece already running.)
-    if (displayMode == MODE_STANDBY){ ck_armed = 0; ck_prog = 0; return; }
+    if (displayMode == MODE_STANDBY){ ck_armed = 0; return; }
     uint8_t ss = (uint8_t)(nextBcd.tenSeconds * 10 + nextBcd.seconds);
     uint8_t mm = (uint8_t)(nextBcd.tenMinutes * 10 + nextBcd.minutes);
 
@@ -1094,47 +1094,38 @@ void cuckoo_poll(void){
     }
     if (ck_tour) { ck_tour = 0; ck_tour_text[0] = 0; }       // left the mode: reset the tour
 
-    // --- hour programme stages (armed by the hour trigger below) ---
-    if (ck_prog){
-      if (ck_prog == 1 && ss == 5  && decisec == 0){ ck_dispatch(CKA_HEARTBEAT); ck_prog = 2; return; }
-      if (ck_prog == 2 && ss == 25 && decisec == 0){ ck_dispatch(CKA_TRUST);     ck_prog = 3; return; }
-      if (ck_prog == 3 && ss == 56 && decisec == 5){ ck_prog = 4; return; }      // pendulum pre-arm
-      if (ck_prog == 4 && ss == 57 && decisec == 0){ ck_dispatch(CKA_PENDULUM);  ck_prog = 5; return; }
-      if ((ck_prog == 5 && ss > 1 && ss < 50) || mm % 15 > 1) ck_prog = 0;       // programme over
-    }
-
-    if (cuckoo_interval == CK_OFF) { ck_armed = 0; return; }
+    if (cuckoo_interval == 0) { ck_armed = 0; return; }
     if (countMode != COUNT_NORMAL) { ck_armed = 0; return; }    // never over text/countdown
 
-    // --- quarter-hour pendulum needs an early arm (:56.5 -> start :57, catch :00) ---
+    // The schedule: the piece manifests whenever the arriving minute is a multiple of
+    // cuckoo_interval, anchored to the hour — so :00 always plays, and e.g. 15 adds
+    // :15/:30/:45. One rule, no special cases.
     uint8_t sel = (cuckoo_animation < CKA_COUNT) ? cuckoo_animation : CKA_HEARTBEAT;
-    if (sel == CKA_PENDULUM && !ck_prog && cuckoo_interval == CK_QUARTER
-        && ss == 56 && decisec == 5 && currentTime != ck_last_arm){
-      uint8_t mmn = (uint8_t)((mm + 1) % 60);
-      if (mmn % 15 == 0 && mmn != 0){ ck_last_arm = currentTime; ck_armed = 2; }
-    }
-    if (ck_armed == 2 && ss == 57 && decisec == 0){
-      ck_armed = 0;
-      if (ck_pps_fresh()) ck_start(CKA_PENDULUM);              // holdover: honestly skipped
+    uint8_t mm_next = (uint8_t)((mm + 1) % 60);
+    _Bool due = (mm_next % cuckoo_interval) == 0;
+
+    // pendulum needs an early arm (:56.5 -> start :57, catch the :00 edge of the due minute)
+    if (sel == CKA_PENDULUM){
+      if (due && ss == 56 && decisec == 5 && currentTime != ck_last_arm){
+        ck_last_arm = currentTime; ck_armed = 2;
+      }
+      if (ck_armed == 2 && ss == 57 && decisec == 0){
+        ck_armed = 0;
+        if (ck_pps_fresh()) ck_start(CKA_PENDULUM);            // holdover: honestly skipped
+      }
       return;
     }
 
-    // --- the main arm: .500 of a :59 second whose NEXT minute is a quarter. nextBcd holds
+    // everything else arms at .500 of the :59 second before the due minute. nextBcd holds
     // the displayed stamp until the .900 restage, so this reads the CURRENT display values.
-    if (!ck_armed && ss == 59 && decisec == 5 && currentTime != ck_last_arm){
-      uint8_t mm_next = (uint8_t)((mm + 1) % 60);
-      _Bool hour = (mm_next == 0);
-      _Bool quarter = (mm_next % 15 == 0) && !hour;
-      if ((hour && cuckoo_interval >= CK_HOUR) || (quarter && cuckoo_interval == CK_QUARTER)){
-        ck_last_arm = currentTime;
-        // chain length from the arithmetic of the +1-minute edge
-        ck_carry_n = 2;                                          // seconds units + tens
-        ck_carry_n += (uint8_t)((mm % 10 == 9) ? 2 : 1);         // minutes (+ tens on x9)
-        if (hour) ck_carry_n = 5;                                // hh:59:59 -> hh+1:00:00
-        if (hour){ ck_prog = 1; ck_start(CKA_CARRY); }           // the programme opens with carry
-        else if (sel == CKA_CARRY) ck_start(CKA_CARRY);          // the charge needs the pre-arm
-        else if (sel != CKA_PENDULUM) ck_armed = 1;              // edge-start pieces
-      }
+    if (!ck_armed && due && ss == 59 && decisec == 5 && currentTime != ck_last_arm){
+      ck_last_arm = currentTime;
+      // carry chain length from the arithmetic of the +1-minute edge
+      ck_carry_n = 2;                                            // seconds units + tens
+      ck_carry_n += (uint8_t)((mm % 10 == 9) ? 2 : 1);           // minutes (+ tens on x9)
+      if (mm == 59) ck_carry_n = 5;                              // hh:59:59 -> hh+1:00:00
+      if (sel == CKA_CARRY) ck_start(CKA_CARRY);                 // the charge needs the pre-arm
+      else ck_armed = 1;                                         // edge-start pieces
     }
     if (ck_armed == 1 && decisec == 0 && centisec < 5){
       ck_armed = 0;
@@ -1324,9 +1315,13 @@ void parseConfigString(char *key, char *value) {
 
   } else if (strcasecmp(key, "cuckoo_interval") == 0) {
 
-    if      (strcasecmp(value, "off") == 0)     { cuckoo_interval = CK_OFF; cuckoo_abort(); }
-    else if (strcasecmp(value, "hour") == 0)      cuckoo_interval = CK_HOUR;
-    else if (strcasecmp(value, "quarter") == 0)   cuckoo_interval = CK_QUARTER;
+    if (strcasecmp(value, "off") == 0) { cuckoo_interval = 0; cuckoo_abort(); }
+    else if (strcasecmp(value, "hourly") == 0) cuckoo_interval = 60;
+    else {
+      int v = atoi(value);
+      if (v <= 0) { cuckoo_interval = 0; cuckoo_abort(); }
+      else cuckoo_interval = (uint8_t)(v > 60 ? 60 : v);
+    }
 
   } else if (strcasecmp(key, "zone_override") == 0) {
 

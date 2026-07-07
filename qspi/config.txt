@@ -115,10 +115,9 @@ mode_vbat = 0
 #   rain      - (reserved: satellites falling down their true azimuths - not yet implemented)
 cuckoo_animation = heartbeat
 
-# off | hour | quarter. hour plays the full programme at the top of each hour (carry at :00,
-# heartbeat :05, trust :25, pendulum catching :01:00); quarter adds the single animation above
-# at :15 / :30 / :45.
-cuckoo_interval = off
+# minutes between manifests, anchored to the hour — so it always plays ON the hour, and
+# e.g. 15 adds :15 / :30 / :45. Default 60 (hourly). "off" (or 0) disables.
+cuckoo_interval = 60
 
 # a display mode (buttons cycle to it) that tours all the animations continuously,
 # announcing each by name on the date row

@@ -14,22 +14,20 @@ web-side animation engine.
 ## Config vocabulary
 
 ```
-# which animation plays at quarter-hours (any one of the five)
+# which animation manifests (one of the five)
 cuckoo_animation = heartbeat
 
-# off | hour | quarter
-#   hour    -> the full programme at the top of each hour
-#   quarter -> the programme at :00, plus cuckoo_animation alone at :15 / :30 / :45
-cuckoo_interval = off
+# minutes between manifests, anchored to the hour: the piece ALWAYS plays on the hour,
+# and e.g. 15 adds :15/:30/:45. Default 60 (hourly). off / 0 disables.
+cuckoo_interval = 60
 
 # a button-cycled display mode that tours the whole catalogue continuously,
 # each piece announced by name on the date row
 MODE_CUCKOO_SHOWCASE = disabled
 ```
 
-The hourly programme is a sequence with rests, not a montage: `carry` owns the :00:00 edge
-(its longest cascade), plain face, `heartbeat` at :00:05, `rain` at :00:15 (v2, see below),
-`trust` at :00:25, plain face, and `pendulum` closes by catching the :01:00 edge.
+One rule, no special cases: the arriving minute is due when `minute % interval == 0`. The
+schedule plays exactly one chosen piece; the showcase MODE is how you see the whole catalogue.
 
 ## The display, as it actually is
 
@@ -85,7 +83,7 @@ collides with one is skipped, not queued.
 
 ### 1. `carry` — make the arithmetic of the rollover visible (1.8 s; 2.4 s at the hour)
 
-Trigger: minute rollover at the scheduled quarter (hour rollover in the programme).
+Trigger: the rollover into a due minute (minute % interval == 0).
 Data: the `.900`-staged expiring/next values — nothing else. Plays in holdover unchanged
 (rollovers are true regardless of GPS).
 
@@ -102,7 +100,7 @@ onto the plain face; no final blend exists to get wrong.
 
 ### 2. `heartbeat` — the machine shows its own pulse (8 s)
 
-Trigger: quarter-hour second edge. Data: the live colon DMA table + its live read index
+Trigger: the due-minute second edge. Data: the live colon DMA table + its live read index
 (sampled from the DMA counter in the main loop, never an ISR).
 
 The six big digits + three small digits breathe to the actual colon waveform, radiating
@@ -135,7 +133,7 @@ No fix → skipped silently. No fake rain, ever.
 
 ### 4. `pendulum` — prove the discipline (3 s, display label `CAtCH`)
 
-Trigger: the PPS edge at :57 of the pre-quarter minute, resolving on the quarter's :00 edge.
+Trigger: the PPS edge at :57 before a due minute, resolving on its :00 edge.
 Data: PPS edges, ms counter, measured drift/jitter (seeds the spread — a well-behaved
 oscillator genuinely starts calmer).
 
@@ -151,7 +149,7 @@ signature; no PPS, no performance.
 
 ### 5. `trust` — how much the instrument actually knows right now (3 s)
 
-Trigger: quarter-hour top-of-second. Data: lock/holdover state; the significance machinery's
+Trigger: the due-minute top-of-second. Data: lock/holdover state; the significance machinery's
 U(τ) where present (tempcomp/PR #9 stacking), the stock `Tolerance_time_*` ladder otherwise.
 
 The time row dips to a 2/16 x-ray (300 ms), then a relight wave walks HH → MM → SS → ds →
