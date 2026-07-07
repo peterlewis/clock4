@@ -935,7 +935,13 @@ static void ck_heartbeat_tick(void){
   uint8_t ph = (uint8_t)(((((uint32_t)currentTime & 1u) * 100u) + (uint32_t)decisec * 10u + centisec) % 200u);
   for (uint8_t d = 0; d < CK_DIGITS; d++){
     uint8_t k = (uint8_t)((ph + 200 - (12 * ck_hb_dist[d]) % 200) % 200);
-    uint8_t lv = (uint8_t)(4 + ((uint16_t)ck_heart(k) * 12) / 200);
+    // Big digits breathe the full 4..16. The SUB-SECOND digits breathe a compressed 8..16:
+    // they are counting at 100/1000 Hz, and letting them dip toward dark both shreds their
+    // legibility (dim + changing every frame reads as flicker, not breathing) and mimics the
+    // significance fade — a meaning this animation must never borrow.
+    uint8_t lv;
+    if (d >= 6) lv = (uint8_t)(8 + ((uint16_t)ck_heart(k) * 8) / 200);
+    else        lv = (uint8_t)(4 + ((uint16_t)ck_heart(k) * 12) / 200);
     for (uint8_t s = 0; s < 8; s++) ck_levels[d][s] = lv;
   }
   if (ck_tick >= 780 && ck_heart(ph) >= 190) { cuckoo_abort(); return; }  // land on a peak
