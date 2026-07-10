@@ -1211,14 +1211,14 @@ void displayOn(void){
 // digit's 16/16. Tune live over serial against the actual display.
 // Off (0, the default) leaves the stock 5-slot scan and all timing untouched.
 //
-// The bloom is rail-dependent (strong near the LED knee at low brightness, mild at full rail),
-// so a single strength over-dims sparse digits at full brightness while under-correcting at 5%.
-// seg_balance_bright, when set, anchors the FULL-brightness strength; the effective strength is
-// interpolated between the two anchors by the live rail level (dac_target — 4095 = dimmest).
-// Unset (0xFFFF, the default) the strength is constant = seg_balance, as before. Tune each end
-// at its own operating point over serial. seg_balance = 0 keeps the whole feature off.
-volatile uint16_t seg_balance = 0;     // 0 = off (stock) · 1..100 = linear blend % · 101..300 = power law, gamma = value/100
-volatile uint16_t seg_balance_bright = 0xFFFF;   // strength at FULL brightness · 0xFFFF = follow seg_balance
+// The bloom is rail-dependent, and NOT monotonically: hardware calibration (eyeball-matched at
+// four rail levels) found a valley — strong compensation needed at the dim end (the LED knee,
+// where current is exponential in voltage), moderate again at full rail (maximum-current IR drop
+// in the shared return), mild in between. "seg_balance = on" applies that measured curve,
+// interpolated by the live rail (dac_target, 4095 = dimmest); it is the whole intended interface.
+// A numeric value (2..300) instead applies a fixed manual strength for experiments.
+// seg_balance = 0/off (the default) keeps the stock scan and stock timing untouched.
+volatile uint16_t seg_balance = 0;     // 0 = off (stock) · 1/on = AUTO (calibrated curve) · 2..300 = fixed manual strength
 
 #define SEGBAL_BSEG_MASK 0x01FCu       // GPIOB word: bits 2..8 are segments; everything else
                                        // (bCat column selects etc.) passes through unmasked
@@ -1234,14 +1234,25 @@ static uint32_t segbal_duty(uint32_t n, uint32_t eff){
   return si < 1u ? 1u : (si > 16u ? 16u : si);
 }
 
-// Effective strength for THIS refill: constant, or interpolated between the dim anchor
-// (seg_balance) and the full-brightness anchor (seg_balance_bright) by the live rail level.
+// Effective strength for THIS refill. AUTO (seg_balance = 1/on) follows the baked hardware
+// calibration — strength vs rail, measured by matching digits by eye at four brightness levels
+// on a production Mk IV (2026-07-10). Piecewise linear between the calibration points; the
+// valley shape is measured, not modelled (knee at the dim end, max-current IR at the bright end).
+static const uint16_t SEGBAL_AUTO_DAC[4] = {  0,  614, 2048, 4095 };   // dac_target breakpoints
+static const uint16_t SEGBAL_AUTO_K[4]   = { 50,   35,   30,  100 };   // strength at each
+
 static uint32_t segbal_strength(void){
-  if (seg_balance_bright == 0xFFFF) return seg_balance;
-  float b = 1.0f - dac_target * (1.0f / 4095.0f);          // 0 = dimmest rail, 1 = brightest
-  if (b < 0.0f) b = 0.0f; else if (b > 1.0f) b = 1.0f;
-  float e = (float)seg_balance + ((float)seg_balance_bright - (float)seg_balance) * b;
-  return (uint32_t)(e + 0.5f);
+  if (seg_balance != 1) return seg_balance;                // manual fixed strength, or 0 = off
+  int32_t d = (int32_t)dac_target;
+  if (d <= SEGBAL_AUTO_DAC[0]) return SEGBAL_AUTO_K[0];
+  for (uint32_t i = 1; i < 4; i++) {
+    if (d <= (int32_t)SEGBAL_AUTO_DAC[i]) {
+      int32_t d0 = SEGBAL_AUTO_DAC[i-1], d1 = SEGBAL_AUTO_DAC[i];
+      int32_t k0 = SEGBAL_AUTO_K[i-1],   k1 = SEGBAL_AUTO_K[i];
+      return (uint32_t)(k0 + (k1 - k0) * (d - d0) / (d1 - d0));
+    }
+  }
+  return SEGBAL_AUTO_K[3];
 }
 
 // Dither depth (cycles per column) for the CURRENT scan rate. display_frequency is a user config
@@ -1604,15 +1615,11 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
   } else if (strcasecmp(key, "significance_fade") == 0) {
     significance_fade = truthy(value);      // fade sub-second digits by significance in holdover, not dash
   } else if (strcasecmp(key, "seg_balance") == 0) {
-    // Equalise per-segment brightness by duty (see segbal_poll): on = 100 (linear full),
-    // 0..100 = linear blend percent, 101..300 = power-law overdrive (gamma = value/100).
-    int v = truthy(value) ? 100 : atoi(value);
+    // Equalise per-segment brightness by duty (see segbal_poll). "on" (or 1) = AUTO, the
+    // calibrated strength-vs-rail curve — the intended setting. A numeric 2..300 applies a
+    // fixed manual strength (<=100 linear blend, >100 power-law) for tuning experiments.
+    int v = truthy(value) ? 1 : atoi(value);
     seg_balance = (uint16_t)(v < 0 ? 0 : (v > 300 ? 300 : v));
-  } else if (strcasecmp(key, "seg_balance_bright") == 0) {
-    // Strength anchor at FULL brightness (same 0..300 scale); the effective strength tracks the
-    // live rail between this and seg_balance. -1 (or any negative) unsets it: constant strength.
-    int v = truthy(value) ? 100 : atoi(value);
-    seg_balance_bright = (uint16_t)(v < 0 ? 0xFFFF : (v > 300 ? 300 : v));
   } else if (strcasecmp(key, "tc_rtc") == 0) {
     tc_rtc = truthy(value);           // additionally trim RTC->CALR while GPS is absent
   } else if (strcasecmp(key, "tc_t0") == 0) {
