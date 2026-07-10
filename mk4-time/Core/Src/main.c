@@ -1303,23 +1303,56 @@ static uint32_t segbal_strength(void){
   return (uint32_t)(e + 0.5f);
 }
 
+// Dither depth (cycles per column) for the CURRENT scan rate. display_frequency is a user config
+// (1..100 kHz) that retunes TIM1, and a fixed 16-cycle dither at a slow scan would visibly strobe:
+// the dither repeats at step/(5*D) Hz, so pick the deepest D of {16,8,4} that stays >= ~200 Hz,
+// and return 0 (balancing unavailable) below ~4 kHz steps. Stock rate (~62 kHz steps) gives D=16.
+static uint32_t segbal_depth(void){
+  uint32_t step = 16000000u / (TIM1->ARR + 1u);            // TIM1 clock 16 MHz (see setDisplayFreq)
+  if (step >= 16000u) return 16u;
+  if (step >=  8000u) return 8u;
+  if (step >=  4000u) return 4u;
+  return 0u;
+}
+
+// Forward the duty table (ALWAYS on the 0..16 scale — the date board rescales to its own depth)
+// to the DATE BOARD over the shared UART, so both rows equalise together from the one config key.
+// Sent from the main loop only when the UART is idle and the date board is not inside its latch
+// window (its RX is disabled there — bytes would be lost). The date board commits the 9 bytes
+// atomically, so an interrupted frame is harmless; a periodic re-send makes delivery eventual.
+#define CMD_SET_SEG_BALANCE 0x94
+static void segbal_forward(uint32_t eff){
+  static uint32_t eff_sent = 0xFFFFFFFFu;
+  static uint16_t resend = 0;
+  static uint8_t  tx[10];
+  if (eff == eff_sent && ++resend < 2048u) return;         // re-assert every ~2 s (lost-frame heal)
+  if (waitingForLatch || huart2.gState != HAL_UART_STATE_READY) return;   // retry a later poll
+  tx[0] = CMD_SET_SEG_BALANCE;
+  for (uint32_t n = 0; n <= 8u; n++) tx[1 + n] = (uint8_t)segbal_duty(n, eff);
+  if (HAL_UART_Transmit_DMA(&huart2, tx, 10) == HAL_OK) { eff_sent = eff; resend = 0; }
+}
+
 void segbal_poll(void){
   static uint16_t last_ms = 0xFFFF;
 
   if (displayMode == MODE_STANDBY) return;          // display is off — never (re)start its DMA here
 
-  if (!seg_balance) {
-    if (display_scan_len == 80) setDisplayPWM(5);   // live-disable: back to the stock scan
+  uint32_t D = segbal_depth();
+  uint32_t eff = (seg_balance && D) ? segbal_strength() : 0;
+  segbal_forward(eff);                              // keep the date row in step (0 = identity/off)
+
+  if (!eff) {
+    if (display_scan_len != 5) setDisplayPWM(5);    // live-disable: back to the stock scan
     return;
   }
 
   // Refill at most once per ms: the masters change at most that fast (the sub-second digits
   // exactly that fast), and the mirror may lag a main-loop pass behind them harmlessly.
   uint16_t ms = (uint16_t)decisec*100 + (uint16_t)centisec*10 + millisec;
-  if (ms == last_ms && display_scan_len == 80) return;
+  uint16_t want_len = (uint16_t)(5u * D);
+  if (ms == last_ms && display_scan_len == want_len) return;
   last_ms = ms;
 
-  uint32_t eff = segbal_strength();
   for (uint32_t col = 0; col < 5; col++) {
     uint16_t mb = buffer_b[col];
     uint8_t  ml = buffer_c[col].low, mh = buffer_c[col].high;
@@ -1328,19 +1361,20 @@ void segbal_poll(void){
     // .high is that bank's one-cold column select + enables (set once in SysInit) — addressing,
     // not LEDs — and must survive in every mirror slot, exactly like GPIOB's bCat bits.
     uint32_t nc = (uint32_t)__builtin_popcount(ml) + ((mh >> 4) & 1u);
-    uint32_t sb = segbal_duty(nb, eff);
-    uint32_t sc = segbal_duty(nc, eff);
+    // duty on the 0..16 scale, rescaled to this depth (D=16 is exact; lit digits keep >= 1 cycle)
+    uint32_t sb = (segbal_duty(nb, eff) * D + 8u) / 16u;  if (nb && !sb) sb = 1u;
+    uint32_t sc = (segbal_duty(nc, eff) * D + 8u) / 16u;  if (nc && !sc) sc = 1u;
     uint16_t cat = mb & (uint16_t)~SEGBAL_BSEG_MASK;
     uint8_t  csel = mh & (uint8_t)~cSegDP;                 // GPIOC column select + enables
-    for (uint32_t k = 1; k < 16; k++) {
+    for (uint32_t k = 1; k < D; k++) {
       uint32_t i = col + 5u*k;
-      uint32_t litc = ((k*sc) % 16u < sc);
-      buffer_b[i]      = ((k*sb) % 16u < sb) ? mb : cat;   // column select stays in every slot
+      uint32_t litc = ((k*sc) % D < sc);
+      buffer_b[i]      = ((k*sb) % D < sb) ? mb : cat;     // column select stays in every slot
       buffer_c[i].low  = litc ? ml : 0;                    // the DP rides the SAME cycles as its
       buffer_c[i].high = csel | (litc ? (mh & cSegDP) : 0);// digit — it is one of its segments
     }
   }
-  if (display_scan_len != 80) setDisplayPWM(80);    // slots are filled — extend to the 16-cycle scan
+  if (display_scan_len != want_len) setDisplayPWM(want_len);   // extend to the D-cycle scan
 }
 
 void setDisplayFreq(uint32_t freq){
