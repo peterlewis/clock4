@@ -251,6 +251,7 @@ const uint8_t lut_7seg_inv[] = {
 #define CMD_SET_FREQUENCY      0x91
 #define CMD_RELOAD_TEXT        0x92
 #define CMD_SET_SCROLL_SPEED   0x93
+#define CMD_SET_SEG_BALANCE    0x94   // + 9 data bytes: duty (of 16) for 0..8 lit segments
 
 #define CMD_SHOW_CRC           0x9D
 #define CMD_REPORT_CRC         0x9E
@@ -295,6 +296,50 @@ const uint16_t cathodes_b[5]={
     0b1011100000000000,
     0b0111100000000000
 };
+
+// --- Per-segment brightness balance (received from the time board) ---------------------------
+// The shared LED rail makes digits with FEWER lit segments glow brighter (per-digit return-path
+// drop). The time board computes the compensation and forwards a 9-entry duty table over the
+// UART (CMD_SET_SEG_BALANCE + 9 data bytes: lit cycles of 16 for a digit with 0..8 lit segments);
+// this board just applies it: the scan ISR runs a D-cycle dither where each digit is lit in its
+// table share of cycles. D adapts to the commanded scan rate so the dither never strobes
+// (>= ~200 Hz), and the identity table (all 16, the default) is bit-identical to stock.
+// Segment bits per port (cathode selects and all else pass through unmasked, verbatim):
+//   port A: segments bits 4..10 + DP bit 14 (cathodes_a use bits 15,12,11,1,0)
+//   port B: segments bits 4..10 + DP bit 0  (cathodes_b use bits 15..11)
+#define SEGBAL_MASK_A  0x47F0u
+#define SEGBAL_MASK_B  0x07F1u
+uint8_t segbal_table[9] = {16,16,16,16,16,16,16,16,16};
+uint8_t segbal_stage[9];                 // RX staging — committed atomically on the 9th byte
+uint8_t segbal_stage_idx = 0;
+uint8_t segbal_duty_a[5] = {16,16,16,16,16};   // lit cycles (of 16) per column, per port
+uint8_t segbal_duty_b[5] = {16,16,16,16,16};
+uint8_t segbal_cycle = 0;                // advances once per 5-column sweep, wraps at the depth
+
+static uint8_t segbal_pop(uint16_t v){
+  uint8_t n = 0;
+  while (v) { n += v & 1u; v >>= 1; }
+  return n;
+}
+// Recompute the per-column duties from the CURRENT buffer words. Called wherever the buffers
+// change (latch, direct writes, wipe) — cheap, and the ISR itself never does the counting.
+static void segbalRecompute(void){
+  for (uint8_t i = 0; i < 5; i++) {
+    uint8_t na = segbal_pop(buffer_a[i] & SEGBAL_MASK_A);
+    uint8_t nb = segbal_pop(buffer_b[i] & SEGBAL_MASK_B);
+    segbal_duty_a[i] = segbal_table[na > 8 ? 8 : na];
+    segbal_duty_b[i] = segbal_table[nb > 8 ? 8 : nb];
+  }
+}
+// Dither depth for the commanded scan rate (TIM2 clock 6.4 MHz; setFrequency retunes ARR from
+// 1..100 kHz): deepest of {16,8,4} keeping the dither >= ~200 Hz, else 1 = balancing off.
+static uint8_t segbal_depth(void){
+  uint32_t step = 6400000u / ((uint32_t)TIM2->ARR + 1u);
+  if (step >= 16000u) return 16u;
+  if (step >=  8000u) return 8u;
+  if (step >=  4000u) return 4u;
+  return 1u;
+}
 
 uint8_t inverted=0;
 uint8_t b1_held =0;
@@ -374,6 +419,7 @@ void setDigitPre(uint8_t digit, uint8_t val){
 }
 void setDigitDirect(uint8_t digit, uint8_t val){
   if (val<32 || val>127) val=32;
+  // (duties refreshed at the end — this writes the live buffers directly)
 
   if (inverted == 1) {
     if (digit>=5) {
@@ -388,18 +434,33 @@ void setDigitDirect(uint8_t digit, uint8_t val){
       buffer_b[digit] = (lut_7seg[val-32]<<4) | cathodes_b[digit];
     }
   }
+  segbalRecompute();
 }
 
-// Main display matrix routine
+// Main display matrix routine. seg-balance: each digit is lit in duty/16 of the dither cycles —
+// rescaled to the depth D for this scan rate — with its cathode-select bits present in EVERY
+// cycle. The identity table gives duty 16 = always lit = bit-identical to the stock scan.
 void TIM2_IRQHandler(void)
 {
   if (TIM2->SR & TIM_SR_UIF){
 
-    GPIOA->ODR = buffer_a[buffer_idx];
-    GPIOB->ODR = buffer_b[buffer_idx];
+    uint16_t wa = buffer_a[buffer_idx];
+    uint16_t wb = buffer_b[buffer_idx];
+    uint8_t  D  = segbal_depth();
+    // duty on the 0..16 scale -> lit cycles of D (D=16 exact; lit digits keep >= 1 cycle)
+    uint8_t sa = (uint8_t)(((uint16_t)segbal_duty_a[buffer_idx] * D + 8u) >> 4);
+    uint8_t sb = (uint8_t)(((uint16_t)segbal_duty_b[buffer_idx] * D + 8u) >> 4);
+    if (segbal_duty_a[buffer_idx] && !sa) sa = 1;
+    if (segbal_duty_b[buffer_idx] && !sb) sb = 1;
+    uint8_t c = segbal_cycle % D;
+    if ((uint8_t)((c * sa) % D) >= sa) wa &= (uint16_t)~SEGBAL_MASK_A;
+    if ((uint8_t)((c * sb) % D) >= sb) wb &= (uint16_t)~SEGBAL_MASK_B;
+
+    GPIOA->ODR = wa;
+    GPIOB->ODR = wb;
 
     buffer_idx ++;
-    if (buffer_idx>=5) buffer_idx=0;
+    if (buffer_idx>=5) { buffer_idx=0; segbal_cycle = (uint8_t)((segbal_cycle + 1) & 15); }
 
     TIM2->SR = ~TIM_DIER_UIE;
     return;
@@ -459,6 +520,7 @@ void TIM21_IRQHandler(void){
           buffer_a[2] = 0;
           buffer_a[3] = 0;
           buffer_a[4] = 0;
+          segbalRecompute();
         }
         b1_held = b2_held = btn_delay+1;
       }
@@ -510,6 +572,8 @@ static inline void latchDisplay(void){
     }
   }
 }
+// NOTE: every path that changes buffer_a/buffer_b refreshes the balance duties — the DP OR above
+// included, which is why the recompute lives in the callers right after latchDisplay()/writes.
 static inline uint8_t waitForByte(void){
   while( !( USART2->ISR & USART_ISR_RXNE ) ) {};
   return USART2->RDR;
@@ -529,6 +593,7 @@ static inline void waitForLatch(void){
   while (GPIOA->IDR & LL_GPIO_PIN_3) {}
 
   latchDisplay();
+  segbalRecompute();
 
   // The latch byte is 0xFE with even parity, so as soon as the line returns high we can re-enable uart
   while (!(GPIOA->IDR & LL_GPIO_PIN_3)) {}
@@ -562,6 +627,10 @@ static inline void parseByte(uint8_t x){
         break;
       case CMD_RELOAD_TEXT:
         latchDisplay();
+  segbalRecompute();
+        break;
+      case CMD_SET_SEG_BALANCE:
+        segbal_stage_idx = 0;
         break;
       case CMD_SET_SCROLL_SPEED:
         break;
@@ -614,6 +683,17 @@ static inline void parseByte(uint8_t x){
     return;
 
   case CMD_SET_SCROLL_SPEED:
+    return;
+
+  case CMD_SET_SEG_BALANCE:
+    // 9 duty bytes (0..16, for 0..8 lit segments), committed atomically on the last one — an
+    // interrupted frame (any command byte resets `status`) leaves the previous table intact.
+    if (segbal_stage_idx < 9) segbal_stage[segbal_stage_idx++] = (x > 16) ? 16 : x;
+    if (segbal_stage_idx == 9) {
+      for (uint8_t i = 0; i < 9; i++) segbal_table[i] = segbal_stage[i];
+      segbalRecompute();
+      status = 0;
+    }
     return;
 
   case CMD_SET_FREQUENCY:
