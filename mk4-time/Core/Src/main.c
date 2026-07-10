@@ -1261,11 +1261,29 @@ void displayOn(void){
 // digits dim DOWN to its level, dense digits are untouched). The cycle mask ((k*s) % 16 < s)
 // spreads the s lit cycles evenly (worst refresh ~7.8 kHz — far above flicker) and always lights
 // cycle 0 — the master slot — so masters are never rewritten and count toward the duty exactly.
+//
+// Above 100 the map turns into a power law, s = 16*(N/8)^(strength/100) — continuous at 100
+// (gamma 1 = the linear map). Near the LED forward-voltage knee (low rail) segment current is
+// exponential in voltage, so the real bloom ratio between a '-' and an '8.' can exceed what any
+// LINEAR duty map can counter; hardware A/B showed 100 under-correcting at low brightness. The
+// exponent steepens the curve: at 200, a 1-segment digit runs 1/16 duty against the 8-segment
+// digit's 16/16. Tune live over serial against the actual display.
 // Off (0, the default) leaves the stock 5-slot scan and all timing untouched.
-volatile uint8_t seg_balance = 0;      // 0 = off (stock) · 1..100 = equalisation strength, percent
+volatile uint16_t seg_balance = 0;     // 0 = off (stock) · 1..100 = linear blend % · 101..300 = power law, gamma = value/100
 
 #define SEGBAL_BSEG_MASK 0x01FCu       // GPIOB word: bits 2..8 are segments; everything else
                                        // (bCat column selects etc.) passes through unmasked
+
+// Lit cycles (of 16) for a digit with n lit segments at the current seg_balance strength.
+// n <= 8 always (7 segments + DP). Returns 16 (always lit) .. 1 (floor for any lit digit).
+static uint32_t segbal_duty(uint32_t n){
+  if (n == 0) return 0;
+  if (seg_balance <= 100)                                  // linear blend: 100 -> s = 2n exactly
+    return 16u - (uint32_t)seg_balance * (16u - 2u*n) / 100u;
+  float s = 16.0f * powf((float)n / 8.0f, (float)seg_balance / 100.0f);   // power law, gamma > 1
+  uint32_t si = (uint32_t)(s + 0.5f);
+  return si < 1u ? 1u : (si > 16u ? 16u : si);
+}
 
 void segbal_poll(void){
   static uint16_t last_ms = 0xFFFF;
@@ -1291,8 +1309,8 @@ void segbal_poll(void){
     // .high is that bank's one-cold column select + enables (set once in SysInit) — addressing,
     // not LEDs — and must survive in every mirror slot, exactly like GPIOB's bCat bits.
     uint32_t nc = (uint32_t)__builtin_popcount(ml) + ((mh >> 4) & 1u);
-    uint32_t sb = 16u - (uint32_t)seg_balance * (16u - 2u*nb) / 100u;
-    uint32_t sc = 16u - (uint32_t)seg_balance * (16u - 2u*nc) / 100u;
+    uint32_t sb = segbal_duty(nb);
+    uint32_t sc = segbal_duty(nc);
     uint16_t cat = mb & (uint16_t)~SEGBAL_BSEG_MASK;
     uint8_t  csel = mh & (uint8_t)~cSegDP;                 // GPIOC column select + enables
     for (uint32_t k = 1; k < 16; k++) {
@@ -1594,9 +1612,10 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
   } else if (strcasecmp(key, "significance_fade") == 0) {
     significance_fade = truthy(value);      // fade sub-second digits by significance in holdover, not dash
   } else if (strcasecmp(key, "seg_balance") == 0) {
-    // Equalise per-segment brightness by duty (see segbal_poll): on = full, or 0..100 percent.
+    // Equalise per-segment brightness by duty (see segbal_poll): on = 100 (linear full),
+    // 0..100 = linear blend percent, 101..300 = power-law overdrive (gamma = value/100).
     int v = truthy(value) ? 100 : atoi(value);
-    seg_balance = (uint8_t)(v < 0 ? 0 : (v > 100 ? 100 : v));
+    seg_balance = (uint16_t)(v < 0 ? 0 : (v > 300 ? 300 : v));
   } else if (strcasecmp(key, "tc_rtc") == 0) {
     tc_rtc = truthy(value);           // additionally trim RTC->CALR while GPS is absent
   } else if (strcasecmp(key, "tc_t0") == 0) {
