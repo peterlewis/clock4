@@ -1210,20 +1210,38 @@ void displayOn(void){
 // exponent steepens the curve: at 200, a 1-segment digit runs 1/16 duty against the 8-segment
 // digit's 16/16. Tune live over serial against the actual display.
 // Off (0, the default) leaves the stock 5-slot scan and all timing untouched.
+//
+// The bloom is rail-dependent (strong near the LED knee at low brightness, mild at full rail),
+// so a single strength over-dims sparse digits at full brightness while under-correcting at 5%.
+// seg_balance_bright, when set, anchors the FULL-brightness strength; the effective strength is
+// interpolated between the two anchors by the live rail level (dac_target — 4095 = dimmest).
+// Unset (0xFFFF, the default) the strength is constant = seg_balance, as before. Tune each end
+// at its own operating point over serial. seg_balance = 0 keeps the whole feature off.
 volatile uint16_t seg_balance = 0;     // 0 = off (stock) · 1..100 = linear blend % · 101..300 = power law, gamma = value/100
+volatile uint16_t seg_balance_bright = 0xFFFF;   // strength at FULL brightness · 0xFFFF = follow seg_balance
 
 #define SEGBAL_BSEG_MASK 0x01FCu       // GPIOB word: bits 2..8 are segments; everything else
                                        // (bCat column selects etc.) passes through unmasked
 
-// Lit cycles (of 16) for a digit with n lit segments at the current seg_balance strength.
+// Lit cycles (of 16) for a digit with n lit segments at effective strength `eff` (0..300).
 // n <= 8 always (7 segments + DP). Returns 16 (always lit) .. 1 (floor for any lit digit).
-static uint32_t segbal_duty(uint32_t n){
+static uint32_t segbal_duty(uint32_t n, uint32_t eff){
   if (n == 0) return 0;
-  if (seg_balance <= 100)                                  // linear blend: 100 -> s = 2n exactly
-    return 16u - (uint32_t)seg_balance * (16u - 2u*n) / 100u;
-  float s = 16.0f * powf((float)n / 8.0f, (float)seg_balance / 100.0f);   // power law, gamma > 1
+  if (eff <= 100)                                          // linear blend: 100 -> s = 2n exactly
+    return 16u - eff * (16u - 2u*n) / 100u;
+  float s = 16.0f * powf((float)n / 8.0f, (float)eff / 100.0f);   // power law, gamma > 1
   uint32_t si = (uint32_t)(s + 0.5f);
   return si < 1u ? 1u : (si > 16u ? 16u : si);
+}
+
+// Effective strength for THIS refill: constant, or interpolated between the dim anchor
+// (seg_balance) and the full-brightness anchor (seg_balance_bright) by the live rail level.
+static uint32_t segbal_strength(void){
+  if (seg_balance_bright == 0xFFFF) return seg_balance;
+  float b = 1.0f - dac_target * (1.0f / 4095.0f);          // 0 = dimmest rail, 1 = brightest
+  if (b < 0.0f) b = 0.0f; else if (b > 1.0f) b = 1.0f;
+  float e = (float)seg_balance + ((float)seg_balance_bright - (float)seg_balance) * b;
+  return (uint32_t)(e + 0.5f);
 }
 
 void segbal_poll(void){
@@ -1242,6 +1260,7 @@ void segbal_poll(void){
   if (ms == last_ms && display_scan_len == 80) return;
   last_ms = ms;
 
+  uint32_t eff = segbal_strength();
   for (uint32_t col = 0; col < 5; col++) {
     uint16_t mb = buffer_b[col];
     uint8_t  ml = buffer_c[col].low, mh = buffer_c[col].high;
@@ -1250,8 +1269,8 @@ void segbal_poll(void){
     // .high is that bank's one-cold column select + enables (set once in SysInit) — addressing,
     // not LEDs — and must survive in every mirror slot, exactly like GPIOB's bCat bits.
     uint32_t nc = (uint32_t)__builtin_popcount(ml) + ((mh >> 4) & 1u);
-    uint32_t sb = segbal_duty(nb);
-    uint32_t sc = segbal_duty(nc);
+    uint32_t sb = segbal_duty(nb, eff);
+    uint32_t sc = segbal_duty(nc, eff);
     uint16_t cat = mb & (uint16_t)~SEGBAL_BSEG_MASK;
     uint8_t  csel = mh & (uint8_t)~cSegDP;                 // GPIOC column select + enables
     for (uint32_t k = 1; k < 16; k++) {
@@ -1555,6 +1574,11 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     // 0..100 = linear blend percent, 101..300 = power-law overdrive (gamma = value/100).
     int v = truthy(value) ? 100 : atoi(value);
     seg_balance = (uint16_t)(v < 0 ? 0 : (v > 300 ? 300 : v));
+  } else if (strcasecmp(key, "seg_balance_bright") == 0) {
+    // Strength anchor at FULL brightness (same 0..300 scale); the effective strength tracks the
+    // live rail between this and seg_balance. -1 (or any negative) unsets it: constant strength.
+    int v = truthy(value) ? 100 : atoi(value);
+    seg_balance_bright = (uint16_t)(v < 0 ? 0xFFFF : (v > 300 ? 300 : v));
   } else if (strcasecmp(key, "tc_rtc") == 0) {
     tc_rtc = truthy(value);           // additionally trim RTC->CALR while GPS is absent
   } else if (strcasecmp(key, "tc_t0") == 0) {
