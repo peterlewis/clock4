@@ -3009,27 +3009,28 @@ void setPrecision(void){
   if (significance_fade && countMode == COUNT_NORMAL) {
     // Holdover fade replaces the FIXED Tolerance_time_* dash ladder with a SIGNIFICANCE-driven one:
     // computeHoldoverFade() sets each sub-second digit's intensity in digit_bright[] from the live
-    // time-interval-error bound, and a digit is DASHED the instant its significance reaches zero —
-    // honest on the real display. Digits still significant keep ticking (P3/P2/P1), so the emulator
-    // (and a future per-digit HW dimmer) can render the PARTIAL fade of the one on its way out. At
-    // lock all are FADE_MAX, so this reduces to a plain P3. digit_bright = [ds, cs, ms, dp];
+    // time-interval-error bound, and a digit goes BLACK once its significance reaches zero — it
+    // FADES OUT rather than dashing: digits still significant keep ticking (P3/P2/P1) while the
+    // seg-balance duty mirror scales each one's lit cycles by its digit_bright, so the display
+    // renders the partial fade of the digit on its way out (the emulator reads the same levels).
+    // At lock all are FADE_MAX, so this reduces to a plain P3. digit_bright = [ds, cs, ms, dp];
     // buffer_c[3]/[2]/[1] = ms/cs/ds; the decimal point dies with the 0.1 s digit.
     if (digit_bright[2]) {                                 // ms still significant
       buffer_c[0].high = 0b11001110 | cSegDP;
       SetSysTick( &SysTick_CountUp_P3 );
-    } else if (digit_bright[1]) {                          // ms dark, cs significant
-      buffer_c[3].low = 0b01000000;
+    } else if (digit_bright[1]) {                          // ms faded out, cs significant
+      buffer_c[3].low = 0;
       buffer_c[0].high = 0b11001110 | cSegDP;
       SetSysTick( &SysTick_CountUp_P2 );
     } else if (digit_bright[0]) {                          // ds only
-      buffer_c[3].low = 0b01000000;
-      buffer_c[2].low = 0b01000000;
+      buffer_c[3].low = 0;
+      buffer_c[2].low = 0;
       buffer_c[0].high = 0b11001110 | cSegDP;
       SetSysTick( &SysTick_CountUp_P1 );
     } else {                                               // whole seconds
-      buffer_c[3].low = 0b01000000;
-      buffer_c[2].low = 0b01000000;
-      buffer_c[1].low = 0b01000000;
+      buffer_c[3].low = 0;
+      buffer_c[2].low = 0;
+      buffer_c[1].low = 0;
       buffer_c[0].high = 0b11001110;
       SetSysTick( &SysTick_CountUp_P0 );
     }
