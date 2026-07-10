@@ -1214,7 +1214,10 @@ void decodeGSV(uint8_t rec){
   }
 }
 
+uint16_t display_scan_len = 5;   // last DMA transfer count set here — segbal_poll steers 5 <-> 80
+
 void setDisplayPWM(uint32_t bright){
+  display_scan_len = (uint16_t)bright;
   HAL_DMA_Abort(&hdma_tim1_up);
   HAL_DMA_Abort(&hdma_tim7_up);
   HAL_DMA_Start(&hdma_tim1_up, (uint32_t)buffer_b, (uint32_t)&GPIOB->ODR, bright);
@@ -1241,6 +1244,66 @@ void displayOn(void){
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
   setDisplayPWM(5);
+}
+
+// --- Per-segment brightness balance (seg_balance) --------------------------------------------
+// The display is voltage-driven (buffer chips + 10R per segment; the DAC sets the rail), so all
+// lit segments of a digit share the drop across that digit's common return path: FEWER lit
+// segments leaves more voltage per LED, so '-', '1' and '7' glow visibly brighter than '8' —
+// worst at low brightness where the rail sits just above the LED forward voltage. There is no
+// per-digit analog knob, but there is headroom in the scan: buffer_b/buffer_c are sized [80] and
+// the DMA is circular, so the 5-step scan can be replayed as 16 cycles of 5 slots. Slots 0..4
+// stay the live "master" slots every existing writer already targets; segbal_poll() (main loop,
+// at most 1 kHz) mirrors them into slots 5..79 with each digit lit in s of its 16 cycles,
+//     s = 16 - strength * (16 - 2 * popcount(segments)) / 100
+// so at full strength s = 2N and every lit segment averages the same duty-per-segment product:
+// (1/N) * (2N/16) = 1/8, uniform across the display (an 8-segment '8.' keeps 16/16 — sparse
+// digits dim DOWN to its level, dense digits are untouched). The cycle mask ((k*s) % 16 < s)
+// spreads the s lit cycles evenly (worst refresh ~7.8 kHz — far above flicker) and always lights
+// cycle 0 — the master slot — so masters are never rewritten and count toward the duty exactly.
+// Off (0, the default) leaves the stock 5-slot scan and all timing untouched.
+volatile uint8_t seg_balance = 0;      // 0 = off (stock) · 1..100 = equalisation strength, percent
+
+#define SEGBAL_BSEG_MASK 0x01FCu       // GPIOB word: bits 2..8 are segments; everything else
+                                       // (bCat column selects etc.) passes through unmasked
+
+void segbal_poll(void){
+  static uint16_t last_ms = 0xFFFF;
+
+  if (displayMode == MODE_STANDBY) return;          // display is off — never (re)start its DMA here
+
+  if (!seg_balance) {
+    if (display_scan_len == 80) setDisplayPWM(5);   // live-disable: back to the stock scan
+    return;
+  }
+
+  // Refill at most once per ms: the masters change at most that fast (the sub-second digits
+  // exactly that fast), and the mirror may lag a main-loop pass behind them harmlessly.
+  uint16_t ms = (uint16_t)decisec*100 + (uint16_t)centisec*10 + millisec;
+  if (ms == last_ms && display_scan_len == 80) return;
+  last_ms = ms;
+
+  for (uint32_t col = 0; col < 5; col++) {
+    uint16_t mb = buffer_b[col];
+    uint8_t  ml = buffer_c[col].low, mh = buffer_c[col].high;
+    uint32_t nb = (uint32_t)__builtin_popcount(mb & SEGBAL_BSEG_MASK);
+    // The GPIOC digit is 7 segments in .low plus its decimal point in .high (cSegDP). The REST of
+    // .high is that bank's one-cold column select + enables (set once in SysInit) — addressing,
+    // not LEDs — and must survive in every mirror slot, exactly like GPIOB's bCat bits.
+    uint32_t nc = (uint32_t)__builtin_popcount(ml) + ((mh >> 4) & 1u);
+    uint32_t sb = 16u - (uint32_t)seg_balance * (16u - 2u*nb) / 100u;
+    uint32_t sc = 16u - (uint32_t)seg_balance * (16u - 2u*nc) / 100u;
+    uint16_t cat = mb & (uint16_t)~SEGBAL_BSEG_MASK;
+    uint8_t  csel = mh & (uint8_t)~cSegDP;                 // GPIOC column select + enables
+    for (uint32_t k = 1; k < 16; k++) {
+      uint32_t i = col + 5u*k;
+      uint32_t litc = ((k*sc) % 16u < sc);
+      buffer_b[i]      = ((k*sb) % 16u < sb) ? mb : cat;   // column select stays in every slot
+      buffer_c[i].low  = litc ? ml : 0;                    // the DP rides the SAME cycles as its
+      buffer_c[i].high = csel | (litc ? (mh & cSegDP) : 0);// digit — it is one of its segments
+    }
+  }
+  if (display_scan_len != 80) setDisplayPWM(80);    // slots are filled — extend to the 16-cycle scan
 }
 
 void setDisplayFreq(uint32_t freq){
@@ -1530,6 +1593,10 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     tc_apply = truthy(value);         // steer the SysTick timebase during GPS-loss holdover
   } else if (strcasecmp(key, "significance_fade") == 0) {
     significance_fade = truthy(value);      // fade sub-second digits by significance in holdover, not dash
+  } else if (strcasecmp(key, "seg_balance") == 0) {
+    // Equalise per-segment brightness by duty (see segbal_poll): on = full, or 0..100 percent.
+    int v = truthy(value) ? 100 : atoi(value);
+    seg_balance = (uint8_t)(v < 0 ? 0 : (v > 100 ? 100 : v));
   } else if (strcasecmp(key, "tc_rtc") == 0) {
     tc_rtc = truthy(value);           // additionally trim RTC->CALR while GPS is absent
   } else if (strcasecmp(key, "tc_t0") == 0) {
@@ -3526,6 +3593,8 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    segbal_poll();   // per-segment brightness balance (seg_balance) — refills the mirror slots, ≤1 kHz
+
     // Distance gate: skip the ~300 ms FATFS/ZoneDetect lookup unless the fix has actually moved far
     // enough to plausibly change zone. 0.005° ≈ 0.5 km — ~100× the metre-scale jitter of a stationary
     // clock, yet far finer than any timezone boundary, so a moving clock still re-detects its zone
