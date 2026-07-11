@@ -168,6 +168,8 @@ enum { KID_BRIGHTNESS=1, KID_COLON=2, KID_ALT_COLON=3, KID_PAGE_MS=4,
 
 void menu_isr_event(uint8_t evt);   // called from the USART2 ISR — enqueue only, no work
 void menu_poll(void);               // main-loop FSM tick
+void ee_load(void);                 // boot: derive the EEPROM base, scan flash -> RAM override store
+void menu_apply_overrides(void);    // merge the override store into live config (config.txt precedence)
 
 //#define NONCOMPLIANT_DATE_MODES
 
