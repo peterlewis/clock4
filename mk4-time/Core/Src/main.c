@@ -1234,25 +1234,32 @@ static uint32_t segbal_duty(uint32_t n, uint32_t eff){
   return si < 1u ? 1u : (si > 16u ? 16u : si);
 }
 
-// Effective strength for THIS refill. AUTO (seg_balance = 1/on) follows the baked hardware
-// calibration — strength vs rail, measured by matching digits by eye at four brightness levels
-// on a production Mk IV (2026-07-10). Piecewise linear between the calibration points; the
-// valley shape is measured, not modelled (knee at the dim end, max-current IR at the bright end).
-static const uint16_t SEGBAL_AUTO_DAC[4] = {  0,  614, 2048, 4095 };   // dac_target breakpoints
-static const uint16_t SEGBAL_AUTO_K[4]   = { 50,   35,   30,  100 };   // strength at each
+// Effective strength for THIS refill. AUTO (seg_balance = 1/on) follows the hardware calibration:
+// a full eyeballed sweep across the whole rail on a production Mk IV (2026-07-11) landed the even
+// point on a clean EXPONENTIAL — the round-number rails fell on a x3-per-half-brightness geometric
+// progression (rail brightest -> 10, mid -> 30, dimmest -> 90), i.e. K = 10 * 9^(dac/4096). That is
+// exactly the LED knee: near the bottom of the rail, segment current is exponential in forward
+// voltage, so a sparse digit pulls away exponentially fast and needs exponentially more duty haircut.
+// 4096 (= 2^12, the count of 12-bit DAC codes) is the full-scale, so the breakpoints below land on
+// clean powers of two and K evaluates to the measured anchors exactly. Sampled to a 9-point LUT
+// (cheaper than a per-refill powf, and exponentials interpolate linearly to well under 1 K).
+// A numeric value (2..300) instead applies a fixed manual strength for experiments.
+// seg_balance = 0/off (the default) keeps the stock scan and stock timing untouched.
+static const uint16_t SEGBAL_AUTO_DAC[9] = { 0, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4096 };
+static const uint16_t SEGBAL_AUTO_K[9]   = { 10,  13,   17,   23,   30,   39,   52,   68,   90 };  // 10*9^(dac/4096)
 
 static uint32_t segbal_strength(void){
   if (seg_balance != 1) return seg_balance;                // manual fixed strength, or 0 = off
   int32_t d = (int32_t)dac_target;
   if (d <= SEGBAL_AUTO_DAC[0]) return SEGBAL_AUTO_K[0];
-  for (uint32_t i = 1; i < 4; i++) {
+  for (uint32_t i = 1; i < 9; i++) {
     if (d <= (int32_t)SEGBAL_AUTO_DAC[i]) {
       int32_t d0 = SEGBAL_AUTO_DAC[i-1], d1 = SEGBAL_AUTO_DAC[i];
       int32_t k0 = SEGBAL_AUTO_K[i-1],   k1 = SEGBAL_AUTO_K[i];
       return (uint32_t)(k0 + (k1 - k0) * (d - d0) / (d1 - d0));
     }
   }
-  return SEGBAL_AUTO_K[3];
+  return SEGBAL_AUTO_K[8];
 }
 
 // Dither depth (cycles per column) for the CURRENT scan rate. display_frequency is a user config
@@ -1390,6 +1397,18 @@ void setDisplayFreq(uint32_t freq){
   colonAnimationStop() \
   colonAnimationStart()
 
+// Colon brightness tracking. The colons are TIM2 PWM (buffer_colons_L/R), NOT part of the segment
+// scan and NOT coupled to dac_target — so out of the box they hold their animation brightness while
+// the digits dim around them, blazing at low rail. colon_balance ties the colon PWM to the rail:
+//   0/off (default) = stock (colons at full animation brightness)
+//   1/on            = AUTO: scale the colon PWM by the calibrated rail curve (see colon_scale_for)
+//   2..256          = fixed manual scale (of 256) for eyeball calibration across the rail
+// The scale is folded into the animation buffer by loadColonAnimation and re-applied by
+// colon_balance_poll() from the main loop when the rail moves — never from the DMA/scan ISR.
+volatile uint16_t colon_balance = 0;
+static   uint16_t colonScale    = 256;   // applied fixed-point scale, 256 = full animation brightness
+static volatile uint8_t colonForce = 0;  // config set colon_balance — apply once even if within the AUTO hysteresis
+
 void loadColonAnimation(void){
 
 
@@ -1449,6 +1468,13 @@ void loadColonAnimation(void){
       break;
   }
 
+  // Track the rail: fold the current colon brightness into the freshly-loaded animation (256 = full,
+  // so colon_balance = off is exact identity). The DMA reads this buffer live — refilling it in place
+  // re-brightens the colons without a restart or a phase jump.
+  for (int k = 0; k < 200; k++) {
+    buffer_colons_L[k] = (uint16_t)(((uint32_t)buffer_colons_L[k] * colonScale) >> 8);
+    buffer_colons_R[k] = (uint16_t)(((uint32_t)buffer_colons_R[k] * colonScale) >> 8);
+  }
 }
 
 // Select the colon animation for the current display mode (idempotent, thread context).
@@ -1459,6 +1485,42 @@ void applyColonForMode(void){
   if (want != colonMode) {
     colonMode = want;
     loadColonAnimation();
+  }
+}
+
+// AUTO colon scale vs rail (dac_target 0 = brightest .. 4095 = dimmest): full at the bright end,
+// tapering to a dim floor so the separators stay present but recessed. Sampled 0..4096 like
+// seg_balance; a physically-reasonable STARTING curve — refine by eye with a colon_balance sweep.
+static const uint16_t COLON_AUTO_DAC[9]   = {   0, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4096 };
+static const uint16_t COLON_AUTO_SCALE[9] = { 256, 233,  209,  184,  158,  129,   97,   60,   20 };
+static uint16_t colon_scale_for(int32_t d){
+  if (d <= COLON_AUTO_DAC[0]) return COLON_AUTO_SCALE[0];
+  for (uint32_t i = 1; i < 9; i++) {
+    if (d <= (int32_t)COLON_AUTO_DAC[i]) {
+      int32_t d0 = COLON_AUTO_DAC[i-1], d1 = COLON_AUTO_DAC[i];
+      int32_t s0 = COLON_AUTO_SCALE[i-1], s1 = COLON_AUTO_SCALE[i];
+      return (uint16_t)(s0 + (s1 - s0) * (d - d0) / (d1 - d0));
+    }
+  }
+  return COLON_AUTO_SCALE[8];
+}
+// Re-mirror the colon scale into the animation buffer when the live rail (or the config) moves it.
+// Main-loop only (loadColonAnimation touches 400 samples); throttled so it reloads on real change.
+void colon_balance_poll(void){
+  if (displayMode == MODE_STANDBY) return;   // colons off (displayOff stops TIM2) — match segbal_poll's guard
+  uint16_t want = (colon_balance == 0) ? 256
+                : (colon_balance == 1) ? colon_scale_for((int32_t)dac_target)
+                : (colon_balance > 256) ? 256 : colon_balance;
+  int diff = (int)want - (int)colonScale; if (diff < 0) diff = -diff;
+  if (diff >= 4 || colonForce) {             // hysteresis throttles AUTO drift; colonForce lands an explicit set
+    colonForce = 0;
+    colonScale = want;
+    // loadColonAnimation() also runs in the USART2 ISR (button -> nextMode -> applyColonForMode); mask
+    // JUST that IRQ so a button press can't re-enter mid-refill and tear buffer_colons. A few us, only
+    // on a real brightness step, and PPS (EXTI9_5) + GPS (USART1) are untouched.
+    NVIC_DisableIRQ(USART2_IRQn);
+    loadColonAnimation();          // refills buffer_colons at the new scale; DMA picks it up, no restart
+    NVIC_EnableIRQ(USART2_IRQn);
   }
 }
 
@@ -1645,6 +1707,12 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     // fixed manual strength (<=100 linear blend, >100 power-law) for tuning experiments.
     int v = truthy(value) ? 1 : atoi(value);
     seg_balance = (uint16_t)(v < 0 ? 0 : (v > 300 ? 300 : v));
+  } else if (strcasecmp(key, "colon_balance") == 0) {
+    // Dim the colons with the rail (see colon_balance_poll). "on"/1 = AUTO curve; a numeric 2..256
+    // pins a fixed scale (of 256) for eyeball calibration. The main-loop poll re-applies it.
+    int v = truthy(value) ? 1 : (falsey(value) ? 0 : atoi(value));
+    colon_balance = (uint16_t)(v < 0 ? 0 : (v > 256 ? 256 : v));
+    colonForce = 1;                   // land an explicit sweep step even if within the hysteresis band
   } else if (strcasecmp(key, "tc_rtc") == 0) {
     tc_rtc = truthy(value);           // additionally trim RTC->CALR while GPS is absent
   } else if (strcasecmp(key, "tc_t0") == 0) {
@@ -3637,6 +3705,7 @@ int main(void)
   while (1)
   {
     segbal_poll();   // per-segment brightness balance (seg_balance) — refills the mirror slots, ≤1 kHz
+    colon_balance_poll();   // dim the colons with the rail (colon_balance) — reloads the anim buffer on change
 
     if (new_position && !qspi_write_time && !config.zone_override
         && (data_valid || (config.fake_long && config.fake_lat))
