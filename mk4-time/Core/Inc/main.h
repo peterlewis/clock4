@@ -152,6 +152,9 @@ extern _Bool resendDate;
 #define MENU_IDLE_MS    15000u
 
 typedef enum { MIT_TOGGLE, MIT_ENUM, MIT_STEP } MItemType;
+// v2 sections: the setup ring is grouped; physical table order is UNCHANGED (menu_idx stays absolute,
+// persistence keys off key_id) — the FSM just walks rows whose .section matches the entered section.
+enum { SEC_CAL=0, SEC_ASTRO, SEC_DISP, SEC_DIAG, SEC_SYS, NSEC };
 typedef struct MItem {
   uint8_t     key_id;          // STABLE persistence id (KID_*), never renumbered
   MItemType   type;
@@ -160,6 +163,7 @@ typedef struct MItem {
   const char *const *enums;    // ENUM label array [0..hi], else NULL
   int32_t   (*get)(const struct MItem *m);
   void      (*set)(const struct MItem *m, int32_t v);   // write global + apply live effect
+  uint8_t     section;         // SEC_* — which setup section this row lives in
 } MItem;
 // Stable key ids (append-only; mode rows use KID_MODE_BASE + MODE_* ordinal).
 enum { KID_BRIGHTNESS=1, KID_COLON=2, KID_COLON_ALT=3, KID_PAGE_MS=4,
