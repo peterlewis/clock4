@@ -253,6 +253,7 @@ static struct {
   int16_t  brightness; uint8_t colon, alt_colon; uint16_t page_ms;
   uint8_t  sig_fade, pps, nmea;
   uint32_t matrix_freq;                // KID_MATRIX_FREQ (u32: 100000 > u16)
+  uint8_t  tc;                         // KID_TEMPCOMP: 1 = learn+apply armed
   uint32_t modes_mask, modes_val;      // bit per MODE_* ordinal
 } ovr;
 static uint16_t cfg_simple_defined;    // bit per KID 1..9 set by config.txt this load
@@ -2143,8 +2144,10 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     set_mode_enabled(MODE_STAR, value);
   } else if (strcasecmp(key, "tc_learn") == 0) {
     tc_learn = truthy(value);         // accumulate (die temp, ppm) samples while GPS-locked
+    if (!from_serial) cfg_simple_defined |= (1u<<KID_TEMPCOMP);   // menu TEMPCOMP toggle bundles learn+apply
   } else if (strcasecmp(key, "tc_apply") == 0) {
     tc_apply = truthy(value);         // steer the SysTick timebase during GPS-loss holdover
+    if (!from_serial) cfg_simple_defined |= (1u<<KID_TEMPCOMP);
   } else if (strcasecmp(key, "significance_fade") == 0) {
     significance_fade = truthy(value);      // fade sub-second digits by significance in holdover, not dash
     if (!from_serial) cfg_simple_defined |= (1u<<KID_SIG_FADE);
@@ -4254,9 +4257,9 @@ static uint16_t ee_crc16(const uint8_t*p, uint32_t n){   // CRC-16-CCITT (poly 0
 }
 // Record byte layout: 0 magic u32 | 4 gen u32 | 8 schema u16 | 10 fdate u16 | 12 ftime u16 |
 // 14 simple_mask u16 | 16 modes_mask u32 | 20 modes_val u32 | 24 brightness i16 | 26 colon u8 |
-// 27 alt_colon u8 | 28 page_ms u16 | 30 sig_fade u8 | 31 pps u8 | 32 nmea u8 | 33 matrix_freq u32 | 37..61 rsvd | 62 crc16.
-// (bytes 15 and 33..36 were zeroed padding in every prior record, so widening simple_mask u8->u16 and
-//  adding matrix_freq u32 round-trip old records with those fields clear; EE_SCHEMA stays 1.)
+// 27 alt_colon u8 | 28 page_ms u16 | 30 sig_fade u8 | 31 pps u8 | 32 nmea u8 | 33 matrix_freq u32 | 37 tc u8 | 38..61 rsvd | 62 crc16.
+// (bytes 15, 33..36 and 37 were zeroed padding in every prior record, so widening simple_mask u8->u16
+//  and adding matrix_freq u32 + tc u8 round-trip old records with those fields clear; EE_SCHEMA stays 1.)
 static void ee_pack(uint8_t*r, uint32_t gen){
   memset(r,0,EE_REC_SZ);
   uint32_t mg=EE_MAGIC; memcpy(r+0,&mg,4); memcpy(r+4,&gen,4);
@@ -4266,7 +4269,7 @@ static void ee_pack(uint8_t*r, uint32_t gen){
   memcpy(r+16,&ovr.modes_mask,4); memcpy(r+20,&ovr.modes_val,4);
   memcpy(r+24,&ovr.brightness,2); r[26]=ovr.colon; r[27]=ovr.alt_colon;
   memcpy(r+28,&ovr.page_ms,2); r[30]=ovr.sig_fade; r[31]=ovr.pps; r[32]=ovr.nmea;
-  memcpy(r+33,&ovr.matrix_freq,4);
+  memcpy(r+33,&ovr.matrix_freq,4); r[37]=ovr.tc;
   uint16_t crc=ee_crc16(r,62); memcpy(r+62,&crc,2);
 }
 static void ee_unpack(const uint8_t*r){
@@ -4275,7 +4278,7 @@ static void ee_unpack(const uint8_t*r){
   memcpy(&ovr.modes_mask,r+16,4); memcpy(&ovr.modes_val,r+20,4);
   memcpy(&ovr.brightness,r+24,2); ovr.colon=r[26]; ovr.alt_colon=r[27];
   memcpy(&ovr.page_ms,r+28,2); ovr.sig_fade=r[30]; ovr.pps=r[31]; ovr.nmea=r[32];
-  memcpy(&ovr.matrix_freq,r+33,4);
+  memcpy(&ovr.matrix_freq,r+33,4); ovr.tc=r[37];
   ovr.valid=1;
 }
 static void ee_init_base(void){
@@ -4560,6 +4563,7 @@ void menu_apply_overrides(void){
   OVR_S(KID_PPS,        pps_ts_enabled=ovr.pps)
   OVR_S(KID_NMEA,       nmea_cdc_level=ovr.nmea)
   OVR_S(KID_MATRIX_FREQ,setDisplayFreq(ovr.matrix_freq))   // clamping setter (never ARR-direct) -> a bad stored value can't brick
+  OVR_S(KID_TEMPCOMP,   tc_learn=tc_apply=ovr.tc?1:0)
   #undef OVR_S
   for (uint8_t m=0;m<NUM_DISPLAY_MODES;m++)
     if ((ovr.modes_mask&(1u<<m)) && (!(cfg_modes_defined&(1u<<m))||stamp_ok))
@@ -4588,6 +4592,7 @@ static void menu_record_key(uint8_t key_id, int32_t v){
     case KID_PPS:        ovr.pps=(uint8_t)v; break;
     case KID_NMEA:       ovr.nmea=(uint8_t)v; break;
     case KID_MATRIX_FREQ:ovr.matrix_freq=(uint32_t)v; break;
+    case KID_TEMPCOMP:   ovr.tc=(uint8_t)(v?1:0); break;
   }
 }
 
@@ -4670,6 +4675,11 @@ static void    s_matrix(const MItem*m,int32_t v){   // §4 live-preview: ARR eve
   if ((uint32_t)(uwTick-last_tx) >= 100u){ setDisplayFreq((uint32_t)v); last_tx=uwTick; }  // <=10 Hz UART to the date board
   else { uint32_t a=(uint32_t)(16000000.0/(double)v)-1u; TIM1->ARR=a; TIM7->ARR=a; matrix_freq_hz=(uint32_t)v; }  // instant local ARR
 }
+// TEMPCOMP: one on-device toggle arms the whole self-learning compensator — learn (sample ppm-vs-die-
+// temp while GPS-locked) AND apply (steer SysTick from the model during GPS-loss holdover). config.txt
+// still exposes tc_learn / tc_apply separately for asymmetric setups; the menu treats them as a pair.
+static int32_t g_tc    (const MItem*m){ (void)m; return (tc_learn && tc_apply) ? 1 : 0; }
+static void    s_tc    (const MItem*m,int32_t v){ (void)m; tc_learn = tc_apply = v?1:0; }
 static int32_t g_mode  (const MItem*m){ return config.modes_enabled[m->lo]; }
 static void    s_mode  (const MItem*m,int32_t v){ menuSetMode((uint8_t)m->lo, v?1:0); }
 static void    s_fwcrc (const MItem*m,int32_t v){ (void)m; menuSetMode(MODE_FIRMWARE_CRC_T,v?1:0); config.modes_enabled[MODE_FIRMWARE_CRC_D]=v?1:0; }
@@ -4688,6 +4698,7 @@ static const MItem menu_items[] = {
   { KID_PPS,        MIT_TOGGLE,"PPS OUT",  0,1,1,      NULL,     g_pps,    s_pps,    SEC_SYS  },
   { KID_NMEA,       MIT_ENUM,  "NMEA",     0,2,1,      en_nmea,  g_nmea,   s_nmea,   SEC_SYS  },
   { KID_MATRIX_FREQ,MIT_STEP,  "MATRIX",   8000,100000,1000,NULL,g_matrix, s_matrix, SEC_SYS  },   // menu floor 8000 (flicker); config MATRIX_FREQUENCY reaches the 1000 hw floor
+  { KID_TEMPCOMP,   MIT_TOGGLE,"TEMPCOMP", 0,1,1,      NULL,     g_tc,     s_tc,     SEC_DIAG },   // arms learn+apply; the TC VIEW mode below just displays the model
   MODE_ROW(MODE_ISO8601_STD,SEC_CAL,"ISO 8601"), MODE_ROW(MODE_ISO_ORDINAL,SEC_CAL,"ISO ORD"),
   MODE_ROW(MODE_ISO_WEEK,SEC_CAL,"ISO WEEK"),     MODE_ROW(MODE_UNIX,SEC_CAL,"UNIX"),
   MODE_ROW(MODE_JULIAN_DATE,SEC_CAL,"JULIAN"),    MODE_ROW(MODE_MODIFIED_JD,SEC_CAL,"MOD JD"),
@@ -4699,7 +4710,7 @@ static const MItem menu_items[] = {
   MODE_ROW(MODE_GRID,SEC_ASTRO,"GRID"),           MODE_ROW(MODE_LATLON,SEC_ASTRO,"LAT LON"),
   MODE_ROW(MODE_LST,SEC_ASTRO,"LST"),             MODE_ROW(MODE_SOLAR,SEC_ASTRO,"SOLAR"),
   MODE_ROW(MODE_ADEV,SEC_DIAG,"ADEV"),            MODE_ROW(MODE_STAR,SEC_ASTRO,"STAR"),
-  MODE_ROW(MODE_TEMPCOMP,SEC_DIAG,"TEMPCOMP"),
+  MODE_ROW(MODE_TEMPCOMP,SEC_DIAG,"TC VIEW"),
   { KID_MODE_BASE+MODE_FIRMWARE_CRC_T, MIT_TOGGLE, "FW CRC", MODE_FIRMWARE_CRC_T,1,1, NULL, g_mode, s_fwcrc, SEC_DIAG },
 };
 static const char *const sect_name[NSEC] = { "CAL", "ASTRO", "DISP", "DIAG", "SYS" };
