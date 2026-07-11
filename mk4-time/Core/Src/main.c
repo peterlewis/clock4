@@ -200,7 +200,7 @@ uint8_t displayMode = 0, countMode = 0, colonMode = 0;
 // MODE_LST/MODE_SOLAR can never masquerade as civil time.
 uint8_t colonModeCivil = 0;
 uint8_t colonModeAlt = COLON_MODE_ALT_SAWTOOTH;
-_Bool colonAltExplicit = 0;    // user explicitly set alt_colon_mode
+_Bool colonAltExplicit = 0;    // user explicitly set colon_alt_mode
 // §3.5 colon context-preview: while a colon-animation item is being EDITED, force the value under the
 // cursor onto the real colons regardless of the display context (so ALTCOLON is visible even from a
 // civil face). 0xFF = no preview -> applyColonForMode() uses the normal context choice.
@@ -1899,9 +1899,9 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     colonModeCivil = parseColonName(value);
     if (!from_serial) cfg_simple_defined |= (1u<<KID_COLON);
 
-  } else if (strcasecmp(key, "alt_colon_mode") == 0) {
+  } else if (strcasecmp(key, "colon_alt_mode") == 0) {
 
-    colonModeAlt = parseColonName(value);   // shared by MODE_LST and MODE_SOLAR
+    colonModeAlt = parseColonName(value);   // shared by MODE_LST and MODE_SOLAR ("COLONALT" in the menu)
     colonAltExplicit = 1;
     if (!from_serial) cfg_simple_defined |= (1u<<KID_COLON_ALT);
 
@@ -4361,7 +4361,7 @@ static const MItem menu_items[] = {
   { KID_BRIGHTNESS, MIT_STEP,  "BRIGHT",  -1,4095,256, NULL,     g_bright, s_bright, SEC_DISP },
   { KID_BALANCE,    MIT_TOGGLE,"BALANCE",  0,1,1,       NULL,     g_bal,    s_bal,    SEC_DISP },   // per-segment + colon brightness uniformity (baked AUTO curves)
   { KID_COLON,      MIT_ENUM,  "COLON",    0,5,1,      en_colon, g_colon,  s_colon,  SEC_DISP },
-  { KID_COLON_ALT,  MIT_ENUM,  "ALTCOLON", 0,5,1,      en_colon, g_acolon, s_acolon, SEC_DISP },
+  { KID_COLON_ALT,  MIT_ENUM,  "COLONALT", 0,5,1,      en_colon, g_acolon, s_acolon, SEC_DISP },
   { KID_PAGE_MS,    MIT_STEP,  "PAGE MS",  250,60000,250,NULL,   g_page,   s_page,   SEC_DISP },
   { KID_SIG_FADE,   MIT_TOGGLE,"SIG FADE", 0,1,1,      NULL,     g_sig,    s_sig,    SEC_DISP },
   { KID_PPS,        MIT_TOGGLE,"PPS OUT",  0,1,1,      NULL,     g_pps,    s_pps,    SEC_SYS  },
