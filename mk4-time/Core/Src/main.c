@@ -271,6 +271,7 @@ float tc_cfg_lse[3] = {NAN, NAN, NAN};     // absolute: ppm, ppm/°C, ppm/°C²
 volatile _Bool tc_dump_pending = 0;        // set by the serial parser, serviced in the main loop
 volatile _Bool tc_reset_pending = 0;
 volatile _Bool adev_dump_pending = 0;      // "adev_dump = on" over serial -> emit one $PMADEV sentence
+volatile _Bool star_dump_pending = 0;      // "star_dump = on" over serial -> emit one $PMSTAR sentence
 
 // Validated coefficient parse: garbage/'----'/empty leaves the value untouched (a pasted-back
 // commented dump line must not freeze 0.0); an explicit "nan" parses and UNFREEZES the slot.
@@ -418,6 +419,94 @@ static void astro_update(void){
   }
   __disable_irq();
   astro = c;
+  __enable_irq();
+}
+
+// ---- Bright-star meridian-transit predictor (MODE_STAR) ----------------------------------------
+// A star crosses the local meridian (upper culmination — its highest point in the sky) exactly when
+// the Local Sidereal Time equals the star's right ascension. From the GPS fix + local_sidereal_time
+// we compute, for each catalogue star, the seconds until its next transit and the altitude it will
+// reach (90 - |latitude - declination|), then cache the soonest few for a paged "<name> <h:mm>"
+// countdown on the date row. J2000 catalogue positions are precessed to date (first-order IAU) so
+// the timing stays good to the shown minute for decades. Compute is main-loop only (double trig).
+//
+// NOTE: the catalogue coordinates below are hand-entered J2000 (RA hours, Dec degrees) for the
+// bright, recognisable stars; they want a pass against an authoritative source (SIMBAD/Hipparcos)
+// before this ships upstream. The transit *maths* is verified in the emulator independently.
+static const struct { char nm[4]; float ra; float dec; } star_cat[] = {
+  {"SIR",  6.7525f, -16.7161f},  // Sirius        alpha CMa
+  {"CAN",  6.3992f, -52.6957f},  // Canopus       alpha Car
+  {"ARC", 14.2610f,  19.1824f},  // Arcturus      alpha Boo
+  {"VEG", 18.6156f,  38.7837f},  // Vega          alpha Lyr
+  {"CAP",  5.2782f,  45.9980f},  // Capella       alpha Aur
+  {"RIG",  5.2423f,  -8.2016f},  // Rigel         beta  Ori
+  {"PRO",  7.6550f,   5.2250f},  // Procyon       alpha CMi
+  {"BTL",  5.9195f,   7.4070f},  // Betelgeuse    alpha Ori
+  {"ACH",  1.6286f, -57.2367f},  // Achernar      alpha Eri
+  {"ALD",  4.5987f,  16.5093f},  // Aldebaran     alpha Tau
+  {"ANT", 16.4901f, -26.4319f},  // Antares       alpha Sco
+  {"SPI", 13.4199f, -11.1613f},  // Spica         alpha Vir
+  {"PLX",  7.7553f,  28.0262f},  // Pollux        beta  Gem
+  {"FOM", 22.9608f, -29.6222f},  // Fomalhaut     alpha PsA
+  {"DEN", 20.6905f,  45.2803f},  // Deneb         alpha Cyg
+  {"REG", 10.1395f,  11.9672f},  // Regulus       alpha Leo
+  {"ALT", 19.8464f,   8.8683f},  // Altair        alpha Aql
+  {"CTR",  7.5766f,  31.8883f},  // Castor        alpha Gem
+  {"POL",  2.5303f,  89.2641f},  // Polaris       alpha UMi
+  {"BEL",  5.4188f,   6.3497f},  // Bellatrix     gamma Ori
+  {"ELN",  5.4382f,  28.6075f},  // Elnath        beta  Tau
+  {"ALN",  5.6036f,  -1.2020f},  // Alnilam       eps   Ori
+  {"DUB", 11.0621f,  61.7510f},  // Dubhe         alpha UMa
+  {"ALK", 13.7923f,  49.3133f},  // Alkaid        eta   UMa
+  {"AHD",  9.4597f,  -8.6586f},  // Alphard       alpha Hya
+  {"DNB", 11.8177f,  14.5720f},  // Denebola      beta  Leo
+  {"MIR",  3.4054f,  49.8612f},  // Mirfak        alpha Per
+  {"HAM",  2.1195f,  23.4624f},  // Hamal         alpha Ari
+  {"ALC", 15.5781f,  26.7147f},  // Alphecca      alpha CrB
+  {"RAS", 17.5822f,  12.5600f},  // Rasalhague    alpha Oph
+};
+#define STAR_N     (sizeof star_cat / sizeof star_cat[0])
+#define STAR_SHOW  8u              // cache the soonest 8 upcoming transits
+#define STAR_SIDSEC_PER_HR 3590.1704   // solar seconds the meridian takes to sweep one hour of RA
+typedef struct { char nm[4]; uint32_t epoch; int8_t alt; } star_entry_t;
+static star_entry_t star_cache[STAR_SHOW];
+static volatile uint8_t star_ncache;
+
+static void star_update(void){
+  float lat = latitude, lon = longitude;                       // one snapshot of the fix
+  if (!astro_pos_ok(lat, lon)) { star_ncache = 0; return; }
+  const double D2R = 0.017453292519943295;
+  double lst = local_sidereal_time((double)currentTime, (double)lon);      // hours [0,24)
+  double yrs = ((double)currentTime - 946728000.0) / 31557600.0;           // years since J2000.0
+
+  float dth[STAR_N]; int8_t altd[STAR_N]; uint8_t vis[STAR_N];             // per-star scratch
+  for (uint8_t s = 0; s < STAR_N; s++) {
+    double a = star_cat[s].ra, d = star_cat[s].dec;
+    double ar = a * 15.0 * D2R, dr = d * D2R;
+    double dra  = (3.07496 + 1.33621 * sin(ar) * tan(dr)) * yrs;           // precession, sec of time
+    double ddec = (20.0431 * cos(ar) * yrs) / 3600.0;                      // precession, degrees
+    double a_now = a + dra / 3600.0;                                       // RA to date, hours
+    double d_now = d + ddec;                                               // Dec to date, degrees
+    double alt = 90.0 - fabs((double)lat - d_now);                         // upper-transit altitude
+    if (alt <= 0.0) { vis[s] = 0; continue; }                             // never clears the horizon
+    double dt = fmod(a_now - lst, 24.0); if (dt < 0.0) dt += 24.0;         // sidereal hours to transit
+    dth[s] = (float)dt; altd[s] = (int8_t)(alt + 0.5); vis[s] = 1;
+  }
+  // Selection-pick the soonest STAR_SHOW visible stars (STAR_N is small; O(SHOW*N)).
+  star_entry_t tmp[STAR_SHOW];
+  uint8_t n = 0;
+  for (; n < STAR_SHOW; n++) {
+    int best = -1; float bestdt = 1e30f;
+    for (uint8_t s = 0; s < STAR_N; s++) if (vis[s] == 1 && dth[s] < bestdt) { bestdt = dth[s]; best = s; }
+    if (best < 0) break;                                                   // no more visible stars
+    vis[best] = 2;
+    memcpy(tmp[n].nm, star_cat[best].nm, 4);
+    tmp[n].epoch = (uint32_t)currentTime + (uint32_t)((double)dth[best] * STAR_SIDSEC_PER_HR + 0.5);
+    tmp[n].alt = altd[best];
+  }
+  __disable_irq();
+  for (uint8_t i = 0; i < n; i++) star_cache[i] = tmp[i];
+  star_ncache = n;
   __enable_irq();
 }
 
@@ -624,6 +713,18 @@ void sendDate( _Bool now ){
       i = sprintf((char*)&uart2_tx_buffer[1], "%lus%s%s",
                   (unsigned long)tau, (tau < 100) ? " " : "", sig);
     }
+    break;
+  }
+  case MODE_STAR: {
+    // Soonest bright-star meridian transits, paged one per page_ms dwell: "<name> <h:mm>" counting
+    // down to culmination. The countdown ticks every second (recomputed here from the cached transit
+    // epoch); star_update() re-sorts the list in the main loop. "STAr ----" with no GPS fix.
+    if (star_ncache == 0) { i = sprintf((char*)&uart2_tx_buffer[1], "STAr ----"); break; }
+    uint32_t p = (uwTick / page_ms()) % star_ncache;
+    long rem = (long)star_cache[p].epoch - (long)currentTime;   // seconds to transit
+    if (rem < 0) rem = 0;
+    i = sprintf((char*)&uart2_tx_buffer[1], "%-3.3s %2ld:%02ld",
+                star_cache[p].nm, rem / 3600, (rem / 60) % 60);
     break;
   }
   case MODE_STANDBY:
@@ -1719,6 +1820,8 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     set_mode_enabled(MODE_SOLAR, value);
   } else if (strcasecmp(key, "MODE_ADEV") == 0) {
     set_mode_enabled(MODE_ADEV, value);
+  } else if (strcasecmp(key, "MODE_STAR") == 0) {
+    set_mode_enabled(MODE_STAR, value);
   } else if (strcasecmp(key, "tc_learn") == 0) {
     tc_learn = truthy(value);         // accumulate (die temp, ppm) samples while GPS-locked
   } else if (strcasecmp(key, "tc_apply") == 0) {
@@ -1765,6 +1868,8 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     if (from_serial && truthy(value)) tc_dump_pending = 1;
   } else if (strcasecmp(key, "adev_dump") == 0) {
     if (from_serial && truthy(value)) adev_dump_pending = 1;  // serial-only: emit one $PMADEV sentence
+  } else if (strcasecmp(key, "star_dump") == 0) {
+    if (from_serial && truthy(value)) star_dump_pending = 1;  // serial-only: emit one $PMSTAR sentence
   } else if (strcasecmp(key, "tc_reset") == 0) {
     if (from_serial && truthy(value)) tc_reset_pending = 1;   // serial-only, same guard
 
@@ -2816,6 +2921,43 @@ static void adev_dump_step(void){
     return;
   }
   dn = -1; adev_dump_pending = 0;
+}
+
+// "star_dump = on" over serial: the current soonest-transit list as ONE checksummed sentence —
+// $PMSTAR,<n>,<name>,<sec_to_transit>,<transit_alt_deg>,..*CC. Fresh list computed here so it works
+// in any display mode. Same CDC/BUSY-retry contract as adev_dump_step/emitPPSTimestamp.
+static void star_dump_step(void){
+  static int      dn = -1;
+  static uint16_t busy_ct = 0;
+  static char     dline[NMEA_BUF_SIZE];
+  if (!star_dump_pending) return;
+  if (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED) { star_dump_pending = 0; dn = -1; return; }
+
+  if (dn < 0) {
+    star_update();                             // fresh transit list (never in an ISR)
+    uint8_t n = star_ncache;
+    char body[120];
+    int nb = snprintf(body, sizeof body, "PMSTAR,%u", (unsigned)n);
+    if (nb < 0 || nb >= (int)sizeof body) { star_dump_pending = 0; return; }
+    for (uint8_t k = 0; k < n; k++) {
+      long rem = (long)star_cache[k].epoch - (long)currentTime; if (rem < 0) rem = 0;
+      int t = snprintf(body + nb, sizeof body - nb, ",%.3s,%ld,%d",
+                       star_cache[k].nm, rem, (int)star_cache[k].alt);
+      if (t < 0 || t >= (int)(sizeof body - nb)) { star_dump_pending = 0; return; }
+      nb += t;
+    }
+    uint8_t cks = 0;
+    for (int i = 0; i < nb; i++) cks ^= (uint8_t)body[i];
+    int nn = snprintf(dline, sizeof dline, "$%s*%02X\r\n", body, (unsigned)cks);
+    if (nn <= 0 || nn >= (int)sizeof dline) { star_dump_pending = 0; return; }
+    dn = nn; busy_ct = 0;
+  }
+
+  __disable_irq();
+  uint8_t r = CDC_Copy_Transmit((uint8_t*)dline, (uint16_t)dn);
+  __enable_irq();
+  if (r == USBD_BUSY) { if (++busy_ct > 5000) { star_dump_pending = 0; dn = -1; } return; }
+  dn = -1; star_dump_pending = 0;
 }
 
 // Main-loop entry point, called every pass. With every tc key at its default this reduces to
@@ -3928,6 +4070,7 @@ int main(void)
 
     tc_housekeeping();   // temp-comp learn/steer/dump; four flag checks when everything is off
     adev_dump_step();    // one-shot $PMADEV emit when adev_dump was set over serial (else 1 flag check)
+    star_dump_step();    // one-shot $PMSTAR emit when star_dump was set over serial (else 1 flag check)
 
     if (displayMode == MODE_VBAT)
       measure_vbat();
@@ -3962,6 +4105,15 @@ int main(void)
       static uint32_t adev_last_pg = 0xFFFFFFFFu;
       uint32_t pg = uwTick / page_ms();
       if (pg != adev_last_pg && decisec != 9) { adev_last_pg = pg; adev_reduce(); sendDate(1); }
+    }
+
+    // MODE_STAR: recompute the soonest-transit list once a second (the countdown ticks off the cached
+    // epoch every 1 Hz sendDate; re-sorting keeps the order fresh as stars culminate), repaint on flip.
+    if (displayMode == MODE_STAR) {
+      static uint32_t star_last_sec = 0xFFFFFFFFu, star_last_pg = 0xFFFFFFFFu;
+      if ((uint32_t)currentTime != star_last_sec) { star_last_sec = (uint32_t)currentTime; star_update(); }
+      uint32_t pg = uwTick / page_ms();
+      if (pg != star_last_pg && decisec != 9) { star_last_pg = pg; sendDate(1); }
     }
 
     // MODE_LST / MODE_SOLAR: stage the next civil boundary's alternate reading
