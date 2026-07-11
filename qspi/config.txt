@@ -172,6 +172,12 @@ MODE_GRID = disabled
 # Latitude / longitude in decimal degrees. Pages LAT -> LON (see page_ms).
 MODE_LATLON = disabled
 
+# Bright-star meridian-transit predictor. Paged countdowns to the soonest bright stars crossing
+# your local meridian (culminating), e.g. "SIR  0:45" = Sirius transits in 45 min. Needs a position
+# (GPS fix or fake_longitude); shows "STAr ----" without one. J2000 catalogue precessed to date.
+# (Companion serial command: "star_dump = on" prints the whole list as $PMSTAR.)
+MODE_STAR = disabled
+
 # Local Sidereal Time as a LIVE TICKING CLOCK on the time row (big digits). The date row
 # keeps the civil date, and the colons animate differently (alt_colon_mode below) so
 # it can never be mistaken for civil time. Sidereal runs 1.00273791x faster than civil, so
@@ -183,6 +189,13 @@ MODE_LST = disabled
 # longitude plus the equation of time. Reads exactly 12:00:00 at local solar noon.
 MODE_SOLAR = disabled
 
+# Live Allan deviation of the FREE-RUNNING crystal (its true stability, undisciplined). Pages
+# sigma_y(tau) across octave averaging times on the date row: "1s 3.2e-11", "64s 3e-11", ... up to
+# tau=1024 s, while the time row keeps live GPS time. Shows "Adev ----" until it has a few contiguous
+# locked seconds. The honest crystal signal (DWT phase, not the disciplined output).
+# (Companion serial command: "adev_dump = on" prints the whole curve as $PMADEV.)
+MODE_ADEV = disabled
+
 # Colon animation while an alternate-timebase mode (MODE_LST / MODE_SOLAR) is shown, so
 # it can never be mistaken for civil time at a glance — solar especially, which can sit
 # within minutes of civil. Same names as colon_mode; automatically kept different from
@@ -191,12 +204,24 @@ MODE_SOLAR = disabled
 # One of: slowfade, heartbeat, sawtooth, alt_sawtooth, toggle, solid
 #alt_colon_mode = alt_sawtooth
 
-# Dwell per sub-screen for the paged modes (MODE_SUN, MODE_LATLON, MODE_TEMPCOMP), in ms.
-# Default 5500 (a subjectively-tuned cadence, found by feel); floored at 250.
+# Dwell per sub-screen for the paged modes (MODE_SUN, MODE_LATLON, MODE_TEMPCOMP, MODE_ADEV,
+# MODE_STAR), in ms. Default 5500 (a subjectively-tuned cadence, found by feel); floored at 250.
 page_ms = 5500
 
 # Fixed position for the astro modes when there is no GPS fix (decimal degrees, N+/E+).
 # Note: setting these also pins the clock's position (GPS position updates are ignored).
 #fake_latitude  = 51.48
 #fake_longitude = -0.01
+
+
+## display balance
+
+# Equalise per-segment brightness by duty, so a "1" isn't brighter than an "8" (current sharing).
+# "on"/1 = the calibrated auto curve (recommended). A number 2..300 pins a fixed manual strength.
+seg_balance = on
+
+# Dim the colons in step with the main display brightness (they are on their own PWM rail and
+# otherwise stay bright as the digits dim down). "on"/1 = the auto curve; a number 2..256 pins a
+# fixed scale of 256. Leave off until the digit brightness levels are dialled in, then switch on.
+#colon_balance = on
 
