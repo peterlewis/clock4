@@ -361,6 +361,8 @@ static uint8_t segbal_depth(void){
 uint8_t inverted=0;
 uint8_t b1_held =0;
 uint8_t b2_held =0;
+uint16_t both_held =0;   // monotonic ticks both buttons have been down (chord timer)
+uint8_t  both_stage=0;   // 0 = no chord, else the last stage (1/2/3) emitted this hold
 
 /* USER CODE END PV */
 
@@ -520,27 +522,30 @@ void TIM21_IRQHandler(void){
       }
     } else b2_held=0;
 
-    if (b1_held > btn_delay-btn_repeat && b2_held > btn_delay-btn_repeat){
-      if ( (USART2->ISR & USART_ISR_TXE)) {
-        // If triggering a reset the bootloader expects the line to be empty
-        // Don't resend the command until buttons are released
-        if (b1_held<btn_delay) {
-          USART2->TDR = 0x93;
-          // Wipe our display too
-          buffer_b[0] = 0;
-          buffer_b[1] = 0;
-          buffer_b[2] = 0;
-          buffer_b[3] = 0;
-          buffer_b[4] = 0;
-          buffer_a[0] = 0;
-          buffer_a[1] = 0;
-          buffer_a[2] = 0;
-          buffer_a[3] = 0;
-          buffer_a[4] = 0;
-          segbalRecompute();
+    // Both buttons held: a rolling self-labeled chord for the time board's on-device menu. Cross a
+    // stage every chord_step ticks after chord_s1, cycling 1/2/3, emitting 0x94/0x95/0x96 (the stage
+    // crossings the time board renders as SETUP/RESET/... on the date row). On release after reaching
+    // at least stage 1, emit 0x93 to fire the shown stage. A press too brief to reach stage 1 emits
+    // NOTHING — so the time board never sees a bare 0x93 here (it treats that as a legacy reset for
+    // pre-menu date boards), and reset now lives at the deepest labeled stage instead of any both-hold.
+#define chord_s1   42        // ticks of both-held before stage 1 lights up (~matches the single-hold feel)
+#define chord_step 35        // ticks per subsequent stage; long enough to read the label and release
+    if ( ((LL_GPIO_ReadInputPort(GPIOB) & LL_GPIO_PIN_3)==0) &&
+         ((LL_GPIO_ReadInputPort(GPIOC) & LL_GPIO_PIN_13)==0) ) {
+      if (both_held < 0xFFFF) both_held++;
+      if (both_held >= chord_s1) {
+        uint8_t stage = 1 + (uint8_t)(((both_held - chord_s1) / chord_step) % 3);   // 1,2,3,1,2,3,...
+        if (stage != both_stage) {
+          both_stage = stage;
+          if (USART2->ISR & USART_ISR_TXE) USART2->TDR = (uint8_t)(0x93 + stage);   // 0x94/0x95/0x96
         }
-        b1_held = b2_held = btn_delay+1;
       }
+    } else {
+      if (both_stage) {                                       // released after a chord: fire the stage
+        if (USART2->ISR & USART_ISR_TXE) USART2->TDR = 0x93;
+        both_stage = 0;
+      }
+      both_held = 0;
     }
   }
 }
