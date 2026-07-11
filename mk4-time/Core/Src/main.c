@@ -202,6 +202,27 @@ uint8_t colonModeCivil = 0;
 uint8_t colonModeAlt = COLON_MODE_ALT_SAWTOOTH;
 _Bool colonAltExplicit = 0;    // user explicitly set alt_colon_mode
 uint8_t requestMode = 255;
+
+// ---- On-device menu FSM state (all thread-context except the ISR event ring) -------------------
+typedef enum { L0_CLOCK=0, L1_RING, L2_EDIT } MenuLayer;
+static MenuLayer menu_layer   = L0_CLOCK;
+static uint8_t   menu_idx     = 0;      // L1 cursor into menu_items[]
+static int32_t   menu_val     = 0;      // L2 working value (already live via set-hook)
+static uint8_t   menu_chord   = 0;      // a chord gesture is in progress (>=1 stage seen)
+static uint8_t   menu_stage   = 0;      // 0..3 self-labeled chord stage currently shown
+static uint32_t  menu_last_ms = 0;      // uwTick of the last event (drives 15 s idle)
+static char      menu_text[11]= {0};    // non-empty => the menu OWNS the date row (see sendDate)
+static _Bool     menu_repaint = 0;      // a repaint was deferred out of the SysTick sendDate window
+// ISR -> main-loop event ring (single-producer USART2 ISR, single-consumer menu_poll)
+#define MENU_EVQ 16
+static volatile uint8_t menu_evq[MENU_EVQ];
+static volatile uint8_t menu_ev_h = 0, menu_ev_t = 0;
+// Called from the USART2 ISR: O(1) enqueue only, so nextMode()/reset never run at ISR priority.
+void menu_isr_event(uint8_t evt){
+  uint8_t nh = (uint8_t)((menu_ev_h + 1u) & (MENU_EVQ - 1));
+  if (nh != menu_ev_t) { menu_evq[menu_ev_h] = evt; menu_ev_h = nh; }   // drop if full
+}
+
 uint8_t nmea_cdc_level=0;
 int debug_rtc_val = 0;
 
@@ -525,6 +546,14 @@ void sendDate( _Bool now ){
   uint8_t i = 10;
   HAL_UART_AbortTransmit(&huart2);
   uart2_tx_buffer[0] = CMD_LOAD_TEXT;
+
+  if (menu_text[0]) {                     // the on-device menu owns the date row (TIME row untouched)
+    uint8_t n = 0;
+    while (n < 10 && menu_text[n]) { uart2_tx_buffer[1+n] = (uint8_t)menu_text[n]; n++; }
+    while (n < 10) uart2_tx_buffer[1 + n++] = ' ';   // pad so no stale digits linger
+    i = 10;
+    goto menu_send_term;
+  }
 
   switch (displayMode) {
   default:
@@ -874,6 +903,7 @@ void sendDate( _Bool now ){
     }
     break;
   }
+menu_send_term:
   if (now) {
     uart2_tx_buffer[++i]= CMD_RELOAD_TEXT;
   } else {
@@ -3723,6 +3753,178 @@ void buttonsBothHeld(void){
   NVIC_SystemReset();
 }
 
+// ================= On-device 2-button menu (receiving FSM) ======================================
+// Runs entirely in the MAIN LOOP (menu_poll), fed button events from the USART2 ISR via menu_evq.
+// The 9-digit TIME row never leaves live GPS time; all menu chrome lives on the 10-char DATE row via
+// menu_text (see sendDate). Settings edit LIVE (set-hooks mutate the running globals). Persistence to
+// flash is a separate layer; here edits last until reboot. Buttons live on the DATE board, which must
+// emit the 0x94/95/96 chord protocol for the menu to be reachable — until then this stays dormant and
+// a bare 0x93 keeps its legacy reset. See EVT_* in main.h.
+static int32_t menu_orig = 0;   // value captured on entering L2, for CANCEL
+
+// ---- date-row ownership + rendering ----
+static void menu_show(const char *s){
+  uint8_t n=0; while (n<10 && s[n]){ menu_text[n]=s[n]; n++; } menu_text[n]=0;
+  if (decisec!=9) sendDate(1); else menu_repaint=1;   // keep menu paints out of the SysTick window
+}
+static void menu_flash(const char *s){ menu_show(s); }   // transient; cleared by the next render
+static void menu_to_L0(void){
+  menu_layer=L0_CLOCK; menu_chord=0; menu_stage=0; menu_text[0]=0;
+  if (decisec!=9) sendDate(1); else menu_repaint=1;      // restore the normal date row
+}
+
+// ---- mode toggle with the empty-ring guard (LASt) ----
+static void menuSetMode(uint8_t m, _Bool on){
+  if (!on){
+    uint8_t j=0;
+    for (uint8_t i=0;i<NUM_DISPLAY_MODES;i++)
+      if (i!=MODE_STANDBY && config.modes_enabled[i]) j++;
+    if (config.modes_enabled[m] && m!=MODE_STANDBY && j<=1){ menu_flash("LASt"); return; }  // refuse
+  }
+  config.modes_enabled[m]=on;
+  if (!config.modes_enabled[displayMode]) nextMode(0);   // we disabled the current view -> advance
+}
+
+// ---- get/set hooks (edit the live globals; set-hooks apply the effect immediately) ----
+static int32_t g_bright(const MItem*m){ (void)m; return (int32_t)config.brightness_override; }
+static void    s_bright(const MItem*m,int32_t v){ (void)m; config.brightness_override=(float)v; }
+static int32_t g_colon (const MItem*m){ (void)m; return colonModeCivil; }
+static void    s_colon (const MItem*m,int32_t v){ (void)m; colonModeCivil=(uint8_t)v; applyColonForMode(); }
+static int32_t g_acolon(const MItem*m){ (void)m; return colonModeAlt; }
+static void    s_acolon(const MItem*m,int32_t v){ (void)m; colonModeAlt=(uint8_t)v; colonAltExplicit=1; applyColonForMode(); }
+static int32_t g_page  (const MItem*m){ (void)m; return config.page_ms; }
+static void    s_page  (const MItem*m,int32_t v){ (void)m; config.page_ms=(uint16_t)v; }
+static int32_t g_sig   (const MItem*m){ (void)m; return significance_fade; }
+static void    s_sig   (const MItem*m,int32_t v){ (void)m; significance_fade=v?1:0; }
+static int32_t g_pps   (const MItem*m){ (void)m; return pps_ts_enabled; }
+static void    s_pps   (const MItem*m,int32_t v){ (void)m; pps_ts_enabled=v?1:0; }
+static int32_t g_nmea  (const MItem*m){ (void)m; return nmea_cdc_level; }
+static void    s_nmea  (const MItem*m,int32_t v){ (void)m; nmea_cdc_level=(uint8_t)v; }
+static int32_t g_mode  (const MItem*m){ return config.modes_enabled[m->lo]; }
+static void    s_mode  (const MItem*m,int32_t v){ menuSetMode((uint8_t)m->lo, v?1:0); }
+static void    s_fwcrc (const MItem*m,int32_t v){ (void)m; menuSetMode(MODE_FIRMWARE_CRC_T,v?1:0); config.modes_enabled[MODE_FIRMWARE_CRC_D]=v?1:0; }
+
+static const char *const en_colon[] = {"SLOWFADE","HEARTBt","1PPS SAW","ALT SAW","TOGGLE","SOLID"};
+static const char *const en_nmea[]  = {"ALL","RMC","NONE"};
+
+#define MODE_ROW(mo,lab) { KID_MODE_BASE+(mo), MIT_TOGGLE, lab, (mo),1,1, NULL, g_mode, s_mode }
+static const MItem menu_items[] = {
+  { KID_BRIGHTNESS, MIT_STEP,  "BRIGHT",  -1,4095,256, NULL,     g_bright, s_bright },
+  { KID_COLON,      MIT_ENUM,  "COLON",    0,5,1,      en_colon, g_colon,  s_colon  },
+  { KID_ALT_COLON,  MIT_ENUM,  "ALTCOLON", 0,5,1,      en_colon, g_acolon, s_acolon },
+  { KID_PAGE_MS,    MIT_STEP,  "PAGE MS",  0,60000,250,NULL,     g_page,   s_page   },
+  { KID_SIG_FADE,   MIT_TOGGLE,"SIG FADE", 0,1,1,      NULL,     g_sig,    s_sig    },
+  { KID_PPS,        MIT_TOGGLE,"PPS OUT",  0,1,1,      NULL,     g_pps,    s_pps    },
+  { KID_NMEA,       MIT_ENUM,  "NMEA",     0,2,1,      en_nmea,  g_nmea,   s_nmea   },
+  MODE_ROW(MODE_ISO8601_STD,"ISO 8601"), MODE_ROW(MODE_ISO_ORDINAL,"ISO ORD"),
+  MODE_ROW(MODE_ISO_WEEK,"ISO WEEK"),     MODE_ROW(MODE_UNIX,"UNIX"),
+  MODE_ROW(MODE_JULIAN_DATE,"JULIAN"),    MODE_ROW(MODE_MODIFIED_JD,"MOD JD"),
+  MODE_ROW(MODE_SHOW_OFFSET,"UTC OFFS"),  MODE_ROW(MODE_SHOW_TZ_NAME,"TZ NAME"),
+  MODE_ROW(MODE_WEEKDAY,"WEEKDAY"),       MODE_ROW(MODE_WEEKDA_DD,"WKDAY DD"),
+  MODE_ROW(MODE_WDY_MM_DD,"WDY MMDD"),    MODE_ROW(MODE_STANDBY,"STANDBY"),
+  MODE_ROW(MODE_SATVIEW,"SATVIEW"),       MODE_ROW(MODE_SUN,"SUN"),
+  MODE_ROW(MODE_SUN_AZEL,"SUN AZEL"),     MODE_ROW(MODE_MOON,"MOON"),
+  MODE_ROW(MODE_GRID,"GRID"),             MODE_ROW(MODE_LATLON,"LAT LON"),
+  MODE_ROW(MODE_LST,"LST"),               MODE_ROW(MODE_SOLAR,"SOLAR"),
+  MODE_ROW(MODE_ADEV,"ADEV"),             MODE_ROW(MODE_STAR,"STAR"),
+  MODE_ROW(MODE_TEMPCOMP,"TEMPCOMP"),
+  { KID_MODE_BASE+MODE_FIRMWARE_CRC_T, MIT_TOGGLE, "FW CRC", MODE_FIRMWARE_CRC_T,1,1, NULL, g_mode, s_fwcrc },
+};
+#define MENU_N ((uint8_t)(sizeof(menu_items)/sizeof(menu_items[0])))
+
+static void menu_fmt_val(const MItem*m, int32_t v, char*out){   // out must hold >=10
+  if (m->key_id==KID_BRIGHTNESS && v<0) { strcpy(out,"AUTO"); return; }
+  if (m->type==MIT_ENUM && m->enums && v>=0 && v<=m->hi) { uint8_t n=0; const char*e=m->enums[v]; while(n<9&&e[n]){out[n]=e[n];n++;} out[n]=0; return; }
+  if (m->type==MIT_TOGGLE) { strcpy(out, v?"ON":"OFF"); return; }
+  snprintf(out,10,"%ld",(long)v);
+}
+static void menu_render_item(void){
+  const MItem *m=&menu_items[menu_idx];
+  char buf[20];
+  if (menu_layer==L1_RING){
+    char val[10]; menu_fmt_val(m, m->get(m), val);
+    if (snprintf(buf,sizeof buf,"%s %s",m->label,val) > 10) snprintf(buf,sizeof buf,"%s",m->label);
+  } else {                       // L2_EDIT: show the value being scrubbed
+    menu_fmt_val(m, menu_val, buf);
+  }
+  menu_show(buf);
+}
+
+// ---- L2 value editor (live-preview on the real digits) ----
+static void menu_enter_edit(void){
+  const MItem *m=&menu_items[menu_idx];
+  menu_orig = m->get(m); menu_val = menu_orig; menu_layer=L2_EDIT; menu_render_item();
+}
+static void menu_edit_step(int dir){
+  const MItem *m=&menu_items[menu_idx];
+  int32_t want;
+  if (m->type==MIT_ENUM){ want=menu_val+dir; if(want>m->hi)want=0; if(want<0)want=m->hi; }
+  else if (m->type==MIT_TOGGLE){ want=!menu_val; }
+  else { want=menu_val+(int32_t)dir*m->step; if(want>m->hi)want=m->hi; if(want<m->lo)want=m->lo; }
+  m->set(m, want);
+  int32_t now = m->get(m);
+  if (now!=want && m->type==MIT_TOGGLE){ menu_val=now; menu_flash("LASt"); return; }  // refused (LASt)
+  menu_val=now; menu_render_item();
+}
+static void menu_cancel_edit(void){
+  const MItem *m=&menu_items[menu_idx];
+  m->set(m, menu_orig); menu_layer=L1_RING; menu_render_item();     // restore pre-edit value
+}
+
+// ---- rolling self-labeled chord stages (read the label, release on the one you want) ----
+static const char *const chord_L0[4] = { "", "SETUP",  "",       "RESET"  };
+static const char *const chord_L1[4] = { "", "EDIT",   "BACK",   ""       };
+static const char *const chord_L2[4] = { "", "SAVE",   "CANCEL", ""       };
+static void menu_show_stage(void){
+  const char *const *t = (menu_layer==L0_CLOCK)?chord_L0:(menu_layer==L1_RING)?chord_L1:chord_L2;
+  const char *s = (menu_stage<=3)? t[menu_stage] : "";
+  menu_show(s[0]? s : "----");
+}
+static void menu_fire_stage(void){
+  if (!menu_chord) return;
+  if (menu_layer==L0_CLOCK){
+    if (menu_stage==1){ menu_layer=L1_RING; menu_idx=0; menu_render_item(); }
+    else if (menu_stage>=3){ buttonsBothHeld(); }        // deepest labeled hold = reset
+  } else if (menu_layer==L1_RING){
+    if (menu_stage==1) menu_enter_edit();
+    else if (menu_stage==2) menu_to_L0();                // BACK
+  } else { /* L2 */
+    if (menu_stage==1){ menu_layer=L1_RING; menu_render_item(); }   // SAVE (value already live)
+    else if (menu_stage==2) menu_cancel_edit();          // CANCEL (restore)
+  }
+  menu_chord=0; menu_stage=0;
+}
+static void menu_dispatch(uint8_t e){
+  if (e>=EVT_CHORD_S1 && e<=EVT_CHORD_S3){ menu_chord=1; menu_stage=(uint8_t)(e-EVT_CHORD_S1+1); menu_show_stage(); return; }
+  if (e==EVT_CHORD_REL){
+    if (menu_chord) menu_fire_stage();
+    else if (menu_layer==L0_CLOCK) buttonsBothHeld();    // BACKWARD COMPAT: stock date board 0x93 = reset
+    return;
+  }
+  if (menu_layer==L0_CLOCK){
+    if (e==EVT_BTN1) button1pressed(); else if (e==EVT_BTN2) button2pressed();
+  } else if (menu_layer==L1_RING){
+    if (e==EVT_BTN1) menu_idx=(uint8_t)((menu_idx+1)%MENU_N);
+    else if (e==EVT_BTN2) menu_idx=(uint8_t)((menu_idx+MENU_N-1)%MENU_N);
+    menu_render_item();
+  } else { /* L2 */
+    if (e==EVT_BTN1) menu_edit_step(+1); else if (e==EVT_BTN2) menu_edit_step(-1);
+  }
+}
+// Main-loop tick: flush a deferred repaint, enforce 15 s idle, then drain the event ring. The
+// decisec!=9 gate keeps EVERY menu-originated sendDate (incl. the L0 nextMode path) out of the 1 ms
+// window where the SysTick ISR runs its own non-reentrant sendDate(0).
+void menu_poll(void){
+  if (menu_repaint && decisec!=9){ menu_repaint=0; sendDate(1); }
+  if (menu_layer!=L0_CLOCK && (uint32_t)(uwTick-menu_last_ms) >= MENU_IDLE_MS) menu_to_L0();
+  if (decisec==9) return;
+  while (menu_ev_t != menu_ev_h){
+    uint8_t e = menu_evq[menu_ev_t]; menu_ev_t=(uint8_t)((menu_ev_t+1)&(MENU_EVQ-1));
+    menu_last_ms = uwTick;
+    menu_dispatch(e);
+  }
+}
+
 void generateDACbuffer(uint16_t * buf) {
 
   static float dac_last=4095;
@@ -3993,6 +4195,7 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    menu_poll();     // on-device 2-button menu FSM (drains the ISR event ring; idle-auto-exits)
     segbal_poll();   // per-segment brightness balance (seg_balance) — refills the mirror slots, ≤1 kHz
     colon_balance_poll();   // dim the colons with the rail (colon_balance) — reloads the anim buffer on change
 

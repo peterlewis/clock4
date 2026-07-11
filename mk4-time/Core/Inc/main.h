@@ -135,6 +135,39 @@ extern _Bool resendDate;
 #define CMD_RELOAD_TEXT        0x92
 #define CMD_SHOW_CRC           0x9D
 
+// ---- On-device 2-button menu ------------------------------------------------------------------
+// Inbound date-board button events (date board -> this MCU over USART2). 0x91/0x92 are today's
+// tap/hold-autorepeat, UNCHANGED. 0x93 was "both held -> reset"; it is re-tasked to "chord release"
+// (fire the shown stage). 0x94/95/96 are NEW rolling chord-stage crossings. Note the same byte
+// values are OUTBOUND display opcodes in the other direction (0x92 CMD_RELOAD_TEXT etc.) — no
+// conflict, opposite wire direction. BACKWARD COMPAT: a stock date board emits only 0x91/0x92/0x93,
+// so with menu_chord==0 a bare 0x93 at L0 still triggers the legacy reset and the menu stays dormant
+// until a companion mk4-date firmware emits the 0x94/95/96 chord protocol.
+#define EVT_BTN1        0x91
+#define EVT_BTN2        0x92
+#define EVT_CHORD_REL   0x93
+#define EVT_CHORD_S1    0x94
+#define EVT_CHORD_S2    0x95
+#define EVT_CHORD_S3    0x96
+#define MENU_IDLE_MS    15000u
+
+typedef enum { MIT_TOGGLE, MIT_ENUM, MIT_STEP } MItemType;
+typedef struct MItem {
+  uint8_t     key_id;          // STABLE persistence id (KID_*), never renumbered
+  MItemType   type;
+  const char *label;           // <=10 chars, shown on the date row
+  int16_t     lo, hi, step;    // STEP bounds+increment; ENUM uses 0..hi (step ignored)
+  const char *const *enums;    // ENUM label array [0..hi], else NULL
+  int32_t   (*get)(const struct MItem *m);
+  void      (*set)(const struct MItem *m, int32_t v);   // write global + apply live effect
+} MItem;
+// Stable key ids (append-only; mode rows use KID_MODE_BASE + MODE_* ordinal).
+enum { KID_BRIGHTNESS=1, KID_COLON=2, KID_ALT_COLON=3, KID_PAGE_MS=4,
+       KID_SIG_FADE=5, KID_PPS=6, KID_NMEA=7, KID_MODE_BASE=64 };
+
+void menu_isr_event(uint8_t evt);   // called from the USART2 ISR — enqueue only, no work
+void menu_poll(void);               // main-loop FSM tick
+
 //#define NONCOMPLIANT_DATE_MODES
 
 enum {
