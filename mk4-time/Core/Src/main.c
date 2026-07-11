@@ -4652,29 +4652,31 @@ static void    s_fwcrc (const MItem*m,int32_t v){ (void)m; menuSetMode(MODE_FIRM
 static const char *const en_colon[] = {"SLOWFADE","HEARTBt","1PPS SAW","ALT SAW","TOGGLE","SOLID"};
 static const char *const en_nmea[]  = {"ALL","RMC","NONE"};
 
-#define MODE_ROW(mo,lab) { KID_MODE_BASE+(mo), MIT_TOGGLE, lab, (mo),1,1, NULL, g_mode, s_mode }
+#define MODE_ROW(mo,sec,lab) { KID_MODE_BASE+(mo), MIT_TOGGLE, lab, (mo),1,1, NULL, g_mode, s_mode, (sec) }
+// Physical order UNCHANGED (menu_idx absolute, persistence keys off key_id); .section groups the ring.
 static const MItem menu_items[] = {
-  { KID_BRIGHTNESS, MIT_STEP,  "BRIGHT",  -1,4095,256, NULL,     g_bright, s_bright },
-  { KID_COLON,      MIT_ENUM,  "COLON",    0,5,1,      en_colon, g_colon,  s_colon  },
-  { KID_COLON_ALT,  MIT_ENUM,  "ALTCOLON", 0,5,1,      en_colon, g_acolon, s_acolon },
-  { KID_PAGE_MS,    MIT_STEP,  "PAGE MS",  250,60000,250,NULL,   g_page,   s_page   },
-  { KID_SIG_FADE,   MIT_TOGGLE,"SIG FADE", 0,1,1,      NULL,     g_sig,    s_sig    },
-  { KID_PPS,        MIT_TOGGLE,"PPS OUT",  0,1,1,      NULL,     g_pps,    s_pps    },
-  { KID_NMEA,       MIT_ENUM,  "NMEA",     0,2,1,      en_nmea,  g_nmea,   s_nmea   },
-  MODE_ROW(MODE_ISO8601_STD,"ISO 8601"), MODE_ROW(MODE_ISO_ORDINAL,"ISO ORD"),
-  MODE_ROW(MODE_ISO_WEEK,"ISO WEEK"),     MODE_ROW(MODE_UNIX,"UNIX"),
-  MODE_ROW(MODE_JULIAN_DATE,"JULIAN"),    MODE_ROW(MODE_MODIFIED_JD,"MOD JD"),
-  MODE_ROW(MODE_SHOW_OFFSET,"UTC OFFS"),  MODE_ROW(MODE_SHOW_TZ_NAME,"TZ NAME"),
-  MODE_ROW(MODE_WEEKDAY,"WEEKDAY"),       MODE_ROW(MODE_WEEKDA_DD,"WKDAY DD"),
-  MODE_ROW(MODE_WDY_MM_DD,"WDY MMDD"),    MODE_ROW(MODE_STANDBY,"STANDBY"),
-  MODE_ROW(MODE_SATVIEW,"SATVIEW"),       MODE_ROW(MODE_SUN,"SUN"),
-  MODE_ROW(MODE_SUN_AZEL,"SUN AZEL"),     MODE_ROW(MODE_MOON,"MOON"),
-  MODE_ROW(MODE_GRID,"GRID"),             MODE_ROW(MODE_LATLON,"LAT LON"),
-  MODE_ROW(MODE_LST,"LST"),               MODE_ROW(MODE_SOLAR,"SOLAR"),
-  MODE_ROW(MODE_ADEV,"ADEV"),             MODE_ROW(MODE_STAR,"STAR"),
-  MODE_ROW(MODE_TEMPCOMP,"TEMPCOMP"),
-  { KID_MODE_BASE+MODE_FIRMWARE_CRC_T, MIT_TOGGLE, "FW CRC", MODE_FIRMWARE_CRC_T,1,1, NULL, g_mode, s_fwcrc },
+  { KID_BRIGHTNESS, MIT_STEP,  "BRIGHT",  -1,4095,256, NULL,     g_bright, s_bright, SEC_DISP },
+  { KID_COLON,      MIT_ENUM,  "COLON",    0,5,1,      en_colon, g_colon,  s_colon,  SEC_DISP },
+  { KID_COLON_ALT,  MIT_ENUM,  "ALTCOLON", 0,5,1,      en_colon, g_acolon, s_acolon, SEC_DISP },
+  { KID_PAGE_MS,    MIT_STEP,  "PAGE MS",  250,60000,250,NULL,   g_page,   s_page,   SEC_DISP },
+  { KID_SIG_FADE,   MIT_TOGGLE,"SIG FADE", 0,1,1,      NULL,     g_sig,    s_sig,    SEC_DISP },
+  { KID_PPS,        MIT_TOGGLE,"PPS OUT",  0,1,1,      NULL,     g_pps,    s_pps,    SEC_SYS  },
+  { KID_NMEA,       MIT_ENUM,  "NMEA",     0,2,1,      en_nmea,  g_nmea,   s_nmea,   SEC_SYS  },
+  MODE_ROW(MODE_ISO8601_STD,SEC_CAL,"ISO 8601"), MODE_ROW(MODE_ISO_ORDINAL,SEC_CAL,"ISO ORD"),
+  MODE_ROW(MODE_ISO_WEEK,SEC_CAL,"ISO WEEK"),     MODE_ROW(MODE_UNIX,SEC_CAL,"UNIX"),
+  MODE_ROW(MODE_JULIAN_DATE,SEC_CAL,"JULIAN"),    MODE_ROW(MODE_MODIFIED_JD,SEC_CAL,"MOD JD"),
+  MODE_ROW(MODE_SHOW_OFFSET,SEC_CAL,"UTC OFFS"),  MODE_ROW(MODE_SHOW_TZ_NAME,SEC_CAL,"TZ NAME"),
+  MODE_ROW(MODE_WEEKDAY,SEC_CAL,"WEEKDAY"),       MODE_ROW(MODE_WEEKDA_DD,SEC_CAL,"WKDAY DD"),
+  MODE_ROW(MODE_WDY_MM_DD,SEC_CAL,"WDY MMDD"),    MODE_ROW(MODE_STANDBY,SEC_DISP,"STANDBY"),
+  MODE_ROW(MODE_SATVIEW,SEC_DIAG,"SATVIEW"),      MODE_ROW(MODE_SUN,SEC_ASTRO,"SUN"),
+  MODE_ROW(MODE_SUN_AZEL,SEC_ASTRO,"SUN AZEL"),   MODE_ROW(MODE_MOON,SEC_ASTRO,"MOON"),
+  MODE_ROW(MODE_GRID,SEC_ASTRO,"GRID"),           MODE_ROW(MODE_LATLON,SEC_ASTRO,"LAT LON"),
+  MODE_ROW(MODE_LST,SEC_ASTRO,"LST"),             MODE_ROW(MODE_SOLAR,SEC_ASTRO,"SOLAR"),
+  MODE_ROW(MODE_ADEV,SEC_DIAG,"ADEV"),            MODE_ROW(MODE_STAR,SEC_ASTRO,"STAR"),
+  MODE_ROW(MODE_TEMPCOMP,SEC_DIAG,"TEMPCOMP"),
+  { KID_MODE_BASE+MODE_FIRMWARE_CRC_T, MIT_TOGGLE, "FW CRC", MODE_FIRMWARE_CRC_T,1,1, NULL, g_mode, s_fwcrc, SEC_DIAG },
 };
+static const char *const sect_name[NSEC] = { "CAL", "ASTRO", "DISP", "DIAG", "SYS" };
 #define MENU_N ((uint8_t)(sizeof(menu_items)/sizeof(menu_items[0])))
 
 static void menu_fmt_val(const MItem*m, int32_t v, char*out){   // out must hold >=10
