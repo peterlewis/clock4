@@ -308,6 +308,7 @@ float tc_cfg_lse[3] = {NAN, NAN, NAN};     // absolute: ppm, ppm/°C, ppm/°C²
 volatile _Bool tc_dump_pending = 0;        // set by the serial parser, serviced in the main loop
 volatile _Bool tc_reset_pending = 0;
 volatile _Bool adev_dump_pending = 0;      // "adev_dump = on" over serial -> emit one $PMADEV sentence
+volatile _Bool menu_reset_pending = 0;     // "menu_reset = on" over serial -> factory-reset the menu store
 volatile _Bool star_dump_pending = 0;      // "star_dump = on" over serial -> emit one $PMSTAR sentence
 
 // Validated coefficient parse: garbage/'----'/empty leaves the value untouched (a pasted-back
@@ -1924,6 +1925,8 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     if (from_serial && truthy(value)) adev_dump_pending = 1;  // serial-only: emit one $PMADEV sentence
   } else if (strcasecmp(key, "star_dump") == 0) {
     if (from_serial && truthy(value)) star_dump_pending = 1;  // serial-only: emit one $PMSTAR sentence
+  } else if (strcasecmp(key, "menu_reset") == 0) {
+    if (from_serial && truthy(value)) menu_reset_pending = 1; // serial-only: wipe stored menu overrides
   } else if (strcasecmp(key, "tc_reset") == 0) {
     if (from_serial && truthy(value)) tc_reset_pending = 1;   // serial-only, same guard
 
@@ -3946,6 +3949,30 @@ static void menu_record_key(uint8_t key_id, int32_t v){
   }
 }
 
+// "menu_reset = on" over serial: factory-reset the on-device menu. Erase both emulated-EEPROM pages,
+// forget the RAM override store, then re-read config.txt so the clock returns to a config.txt-only
+// state immediately (no reboot). Serial-only + origin-guarded, like tc_reset. Serviced from the main
+// loop (flash erase stalls the CPU, and the config re-read touches the FAT + non-reentrant sendDate).
+static void menu_reset_step(void){
+  if (!menu_reset_pending) return;
+  menu_reset_pending = 0;
+  memset(&ovr, 0, sizeof ovr);          // drop the RAM override store (also handles the RC no-flash case)
+  menu_dirty = 0;
+  if (ee_avail){
+#ifndef __EMSCRIPTEN__
+    HAL_FLASH_Unlock();
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
+#endif
+    ee_erase(ee_page_a);
+    ee_erase(ee_page_b);
+#ifndef __EMSCRIPTEN__
+    HAL_FLASH_Lock();
+#endif
+    ee_active = ee_page_a; ee_next = 0; ee_gen = 0;
+  }
+  delayedReadConfigFile = 1;             // re-apply config.txt with no overrides -> back to factory
+}
+
 // ================= On-device 2-button menu (receiving FSM) ======================================
 // Runs entirely in the MAIN LOOP (menu_poll), fed button events from the USART2 ISR via menu_evq.
 // The 9-digit TIME row never leaves live GPS time; all menu chrome lives on the 10-char DATE row via
@@ -4479,6 +4506,7 @@ int main(void)
     tc_housekeeping();   // temp-comp learn/steer/dump; four flag checks when everything is off
     adev_dump_step();    // one-shot $PMADEV emit when adev_dump was set over serial (else 1 flag check)
     star_dump_step();    // one-shot $PMSTAR emit when star_dump was set over serial (else 1 flag check)
+    menu_reset_step();   // one-shot menu factory-reset when menu_reset was set over serial
 
     if (displayMode == MODE_VBAT)
       measure_vbat();

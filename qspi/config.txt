@@ -225,3 +225,7 @@ seg_balance = on
 # fixed scale of 256. Leave off until the digit brightness levels are dialled in, then switch on.
 #colon_balance = on
 
+# Factory-reset the ON-DEVICE MENU: send "menu_reset = on" over USB serial (ignored in this file) to
+# erase every setting you changed with the two-button menu, returning the clock to exactly this
+# config.txt. Note the on-device RESET chord only REBOOTS — it keeps your menu settings.
+
