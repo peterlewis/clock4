@@ -813,8 +813,13 @@ void sendDate( _Bool now ){
     uint32_t p = (uwTick / page_ms()) % star_ncache;
     long rem = (long)star_cache[p].epoch - (long)currentTime;   // seconds to transit
     if (rem < 0) rem = 0;
-    i = sprintf((char*)&uart2_tx_buffer[1], "%-3.3s %2ld:%02ld",
-                star_cache[p].nm, rem / 3600, (rem / 60) % 60);
+    // §6: countdown as bare space-separated values (no dash). Under an hour it reads minutes seconds
+    // ("<name>  1 35"); an hour or more switches to hours-'h'-minutes ("<name>  2h15") so a far
+    // transit can't masquerade as 2 min 15 s and the field still fits the row.
+    if (rem < 3600)
+      i = sprintf((char*)&uart2_tx_buffer[1], "%-3.3s %2ld %02ld", star_cache[p].nm, rem / 60, rem % 60);
+    else
+      i = sprintf((char*)&uart2_tx_buffer[1], "%-3.3s %2ldh%02ld", star_cache[p].nm, rem / 3600, (rem / 60) % 60);
     break;
   }
   case MODE_STANDBY:
