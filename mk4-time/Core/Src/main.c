@@ -1977,6 +1977,81 @@ void EXTI9_5_IRQHandler(void){__HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_7);}
 // Snapshot the timing state at the instant of the PPS edge. MUST run before SysTick->VAL is
 // reloaded and before millisec/centisec/decisec are zeroed, so it captures the phase error
 // between the firmware's modelled second and the true GPS edge.
+
+// ---- Live Allan deviation of the FREE-RUNNING HSE (MODE_ADEV) ----------------------------------
+// The honest oscillator-stability signal is the free-running DWT phase, NOT the SysTick residual:
+// capturePPS() re-pins SysTick every second (an infinite-gain phase reset), so the residual's ADEV
+// rolls off artificially past tau=1 s and measures the discipline loop, not the crystal. DWT->CYCCNT
+// is never re-pinned; its per-second delta minus the 80 MHz core count is the bare fractional-
+// frequency error. We integrate that to cumulative phase (int32 ticks, 12.5 ns) in a RAM2 ring and
+// compute the overlapping Allan deviation (IEEE-1139) on demand. A host can reconstruct the
+// disciplined-output curve from $PMTXTS. Verified vs a double-precision reference in the emulator.
+#define ADEV_N     4096u          // 1 Hz phase samples (16 KB of RAM2); tau to 1024 s @ N-2m=2048 overlaps
+#define ADEV_OCT   11u            // octave taus 1,2,4,...,1024 s
+#define ADEV_FCPU  80000000       // core ticks per true GPS second
+#ifdef __EMSCRIPTEN__
+static int32_t adev_x[ADEV_N];                                     // emu: plain static (no RAM2 section)
+#else
+__attribute__((section(".ram2"))) static int32_t adev_x[ADEV_N];   // RAM2 @ 0x10000000, off the CRC path
+#endif
+static uint32_t adev_prev_dwt, adev_prev_epoch;
+static int32_t  adev_phase;       // running cumulative phase, ticks
+static uint16_t adev_widx, adev_valid;
+static uint8_t  adev_have_prev;
+static float    adev_sigma_cache[ADEV_OCT];
+static volatile uint8_t adev_noct;
+
+static void adev_reset(void){
+  memset((void*)adev_x, 0, sizeof adev_x);   // RAM2 is NOT zeroed at boot — clear explicitly
+  adev_phase=0; adev_widx=0; adev_valid=0; adev_have_prev=0; adev_noct=0;
+  for (uint32_t i=0;i<ADEV_OCT;i++) adev_sigma_cache[i]=0.0f;
+}
+// Append a phase sample directly (emu/test path — bypasses the DWT delta).
+static void adev_push_x(int32_t x){
+  adev_x[adev_widx]=x;
+  adev_widx=(uint16_t)((adev_widx+1u)%ADEV_N);
+  if (adev_valid<ADEV_N) adev_valid++;
+}
+// One phase sample per locked second from the PPS edge (ISR context). A gap (missed PPS / holdover)
+// breaks the contiguous 1 s series, so restart the chain — overlapping ADEV needs contiguous samples.
+static void adev_push_dwt(uint32_t dwt, uint32_t epoch){
+  if (adev_have_prev && (uint32_t)(epoch-adev_prev_epoch)==1u){
+    adev_phase += (int32_t)(dwt-adev_prev_dwt) - ADEV_FCPU;   // exact across one 53.7 s DWT wrap
+    adev_push_x(adev_phase);
+  } else {                                                     // first sample or gap -> restart at 0
+    adev_phase=0; adev_x[0]=0; adev_widx=1; adev_valid=1;
+  }
+  adev_prev_dwt=dwt; adev_prev_epoch=epoch; adev_have_prev=1;
+}
+// Overlapping Allan deviation for averaging factor m (tau = m s), read time-ordered across the ring.
+static float adev_sigma_for_m(uint32_t m){
+  uint32_t N=adev_valid;
+  if (N < 2u*m+1u) return 0.0f;
+  uint16_t base=(adev_valid<ADEV_N)?0u:adev_widx;            // oldest sample
+  uint32_t cnt=N-2u*m;
+  int64_t S=0;
+  for (uint32_t i=0;i<cnt;i++){
+    int32_t a=adev_x[(uint16_t)((base+i)%ADEV_N)];
+    int32_t b=adev_x[(uint16_t)((base+i+m)%ADEV_N)];
+    int32_t c=adev_x[(uint16_t)((base+i+2u*m)%ADEV_N)];
+    int32_t d=c-2*b+a;                                        // second difference, ticks
+    S += (int64_t)d*d;
+  }
+  double var=(double)S/(2.0*(double)cnt);                    // int64 kernel; one double sqrt/octave
+  return (float)(sqrt(var)/((double)ADEV_FCPU*(double)m));   // -> fractional frequency (dimensionless)
+}
+// Recompute the octave cache (thread context). Publish adev_noct under IRQ mask (torn-read guard).
+static void adev_reduce(void){
+  uint8_t noct=0;
+  for (uint8_t k=0;k<ADEV_OCT;k++){
+    uint32_t m=1u<<k;
+    if (adev_valid < 2u*m+1u) break;
+    adev_sigma_cache[k]=adev_sigma_for_m(m);
+    noct=(uint8_t)(k+1);
+  }
+  __disable_irq(); adev_noct=noct; __enable_irq();
+}
+
 #define capturePPS() do { \
     pps_cap.dwt_pps  = DWT->CYCCNT; \
     pps_cap.systick  = SysTick->VAL; \
@@ -1988,6 +2063,7 @@ void EXTI9_5_IRQHandler(void){__HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_7);}
     pps_cap.flags    = (data_valid?1:0) | (had_pps?2:0) | (rtc_good?4:0); \
     pps_cap.seq++; \
     pps_record_pending = 1; \
+    adev_push_dwt(pps_cap.dwt_pps, pps_cap.epoch); /* free-running Allan-deviation sample */ \
   } while(0)
 
 // PPS rising edge
@@ -3518,6 +3594,7 @@ int main(void)
   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
   DWT->CYCCNT = 0;
   DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
+  adev_reset();   // clear the (un-zeroed) RAM2 Allan-deviation ring before the first PPS sample
 
   buffer_c[0].high=0b11001110;
   buffer_c[1].high=0b11001101;
