@@ -103,6 +103,8 @@ static void MX_ADC3_Init(void);
 void tmToBcd(struct tm *in, bcdStamp_t *out );
 uint8_t loadRulesSingle(char * str);
 void nextMode(_Bool);
+static uint8_t adev_disp_noct(void);        // Allan-deviation display accessors (engine defined far below;
+static float   adev_disp_sigma(uint8_t k);  // sendDate() lives above the engine, so read via these)
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -268,6 +270,7 @@ float tc_cfg_hse[3] = {NAN, NAN, NAN};     // [0] unused, [1] ppm/°C, [2] ppm/�
 float tc_cfg_lse[3] = {NAN, NAN, NAN};     // absolute: ppm, ppm/°C, ppm/°C²
 volatile _Bool tc_dump_pending = 0;        // set by the serial parser, serviced in the main loop
 volatile _Bool tc_reset_pending = 0;
+volatile _Bool adev_dump_pending = 0;      // "adev_dump = on" over serial -> emit one $PMADEV sentence
 
 // Validated coefficient parse: garbage/'----'/empty leaves the value untouched (a pasted-back
 // commented dump line must not freeze 0.0); an explicit "nan" parses and UNFREEZES the slot.
@@ -601,6 +604,25 @@ void sendDate( _Bool now ){
     } else {
       unsigned long ns = tc_n_hse > 999999UL ? 999999UL : tc_n_hse;
       i = sprintf((char*)&uart2_tx_buffer[1], "n%6lu %c", ns, tc_disp_state);
+    }
+    break;
+  }
+  case MODE_ADEV: {
+    // sigma_y(tau) paged one octave per page_ms dwell; tau = 2^page seconds. Until the ring has
+    // enough contiguous 1 s samples for even tau=1 (needs 3), show a filling marker. The layout is
+    // a compact scientific that always fits the 10-char row: "<tau>s <sigma>", mantissa dropped as
+    // the tau label grows ("1s 3.2e-11" / "64s 3e-11" / "1024s3e-11"). Fractional-frequency values.
+    uint8_t noct = adev_disp_noct();
+    if (noct == 0) {
+      i = sprintf((char*)&uart2_tx_buffer[1], "Adev ----");   // filling, or PPS not locked yet
+    } else {
+      uint32_t k   = (uwTick / page_ms()) % noct;
+      uint32_t tau = 1u << k;
+      double   s   = (double)adev_disp_sigma((uint8_t)k);
+      char sig[12];
+      sprintf(sig, (tau < 10) ? "%.1e" : "%.0e", s);          // room for a mantissa digit only when tau is short
+      i = sprintf((char*)&uart2_tx_buffer[1], "%lus%s%s",
+                  (unsigned long)tau, (tau < 100) ? " " : "", sig);
     }
     break;
   }
@@ -1695,6 +1717,8 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     set_mode_enabled(MODE_LST, value);
   } else if (strcasecmp(key, "MODE_SOLAR") == 0) {
     set_mode_enabled(MODE_SOLAR, value);
+  } else if (strcasecmp(key, "MODE_ADEV") == 0) {
+    set_mode_enabled(MODE_ADEV, value);
   } else if (strcasecmp(key, "tc_learn") == 0) {
     tc_learn = truthy(value);         // accumulate (die temp, ppm) samples while GPS-locked
   } else if (strcasecmp(key, "tc_apply") == 0) {
@@ -1739,6 +1763,8 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     // Serial-only trigger: print the learned model as paste-ready config lines. A stray
     // tc_dump left in config.txt must not fire on every (re)load, hence the origin guard.
     if (from_serial && truthy(value)) tc_dump_pending = 1;
+  } else if (strcasecmp(key, "adev_dump") == 0) {
+    if (from_serial && truthy(value)) adev_dump_pending = 1;  // serial-only: emit one $PMADEV sentence
   } else if (strcasecmp(key, "tc_reset") == 0) {
     if (from_serial && truthy(value)) tc_reset_pending = 1;   // serial-only, same guard
 
@@ -2051,6 +2077,9 @@ static void adev_reduce(void){
   }
   __disable_irq(); adev_noct=noct; __enable_irq();
 }
+// Display accessors — sendDate() is defined above the engine, so it reads through these.
+static uint8_t adev_disp_noct(void){ return adev_noct; }
+static float   adev_disp_sigma(uint8_t k){ return (k < ADEV_OCT) ? adev_sigma_cache[k] : 0.0f; }
 
 #define capturePPS() do { \
     pps_cap.dwt_pps  = DWT->CYCCNT; \
@@ -2746,6 +2775,47 @@ static void tc_dump_step(void){
   }
   dn = -1;
   if (++idx > 9) { idx = 0; tc_dump_pending = 0; }
+}
+
+// "adev_dump = on" over serial: emit the whole live Allan-deviation curve as ONE checksummed
+// sentence — $PMADEV,<valid>,<noct>,<sigma_0>,..,<sigma_{noct-1}>*CC — with sigma_k = sigma_y(tau)
+// at tau = 2^k s (fractional frequency, %.2e). valid = contiguous phase samples behind the estimate
+// (confidence). Fresh cache computed here (thread context) so the dump works in any display mode.
+// Serviced from the main loop; retries only the CDC submit on USBD_BUSY, like tc_dump_step/emitPPS.
+static void adev_dump_step(void){
+  static int      dn = -1;                    // formatted length; -1 = not built yet
+  static uint16_t busy_ct = 0;
+  static char     dline[NMEA_BUF_SIZE];
+  if (!adev_dump_pending) return;
+  if (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED) { adev_dump_pending = 0; dn = -1; return; }
+
+  if (dn < 0) {
+    adev_reduce();                            // fresh octave cache (never in an ISR)
+    uint8_t  noct  = adev_noct;
+    uint16_t valid = adev_valid;
+    char body[112];
+    int nb = snprintf(body, sizeof body, "PMADEV,%u,%u", (unsigned)valid, (unsigned)noct);
+    if (nb < 0 || nb >= (int)sizeof body) { adev_dump_pending = 0; return; }
+    for (uint8_t k = 0; k < noct; k++) {
+      int t = snprintf(body + nb, sizeof body - nb, ",%.2e", (double)adev_sigma_cache[k]);
+      if (t < 0 || t >= (int)(sizeof body - nb)) { adev_dump_pending = 0; return; }
+      nb += t;
+    }
+    uint8_t cks = 0;
+    for (int i = 0; i < nb; i++) cks ^= (uint8_t)body[i];
+    int n = snprintf(dline, sizeof dline, "$%s*%02X\r\n", body, (unsigned)cks);
+    if (n <= 0 || n >= (int)sizeof dline) { adev_dump_pending = 0; return; }
+    dn = n; busy_ct = 0;
+  }
+
+  __disable_irq();                            // serialise against the ISR NMEA passthrough
+  uint8_t r = CDC_Copy_Transmit((uint8_t*)dline, (uint16_t)dn);
+  __enable_irq();
+  if (r == USBD_BUSY) {                        // retry the SUBMIT only; the line stays built
+    if (++busy_ct > 5000) { adev_dump_pending = 0; dn = -1; }
+    return;
+  }
+  dn = -1; adev_dump_pending = 0;
 }
 
 // Main-loop entry point, called every pass. With every tc key at its default this reduces to
@@ -3857,6 +3927,7 @@ int main(void)
     if (pps_ts_enabled && pps_record_pending) emitPPSTimestamp(); // emit clears pending itself on success
 
     tc_housekeeping();   // temp-comp learn/steer/dump; four flag checks when everything is off
+    adev_dump_step();    // one-shot $PMADEV emit when adev_dump was set over serial (else 1 flag check)
 
     if (displayMode == MODE_VBAT)
       measure_vbat();
@@ -3882,6 +3953,15 @@ int main(void)
       static uint32_t tc_last_pg = 0;
       uint32_t pg = uwTick / page_ms();
       if (pg != tc_last_pg && decisec != 9) { tc_last_pg = pg; sendDate(1); }
+    }
+
+    // MODE_ADEV pages the octave taus on the same dwell. Recompute the octave cache on each flip
+    // (thread context, ~sub-ms) so the shown sigma tracks the growing series, then repaint. The
+    // 0xFFFFFFFF sentinel forces a reduce+paint on first entry rather than waiting a full dwell.
+    if (displayMode == MODE_ADEV) {
+      static uint32_t adev_last_pg = 0xFFFFFFFFu;
+      uint32_t pg = uwTick / page_ms();
+      if (pg != adev_last_pg && decisec != 9) { adev_last_pg = pg; adev_reduce(); sendDate(1); }
     }
 
     // MODE_LST / MODE_SOLAR: stage the next civil boundary's alternate reading

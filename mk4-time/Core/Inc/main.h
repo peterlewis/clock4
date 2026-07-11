@@ -183,6 +183,11 @@ enum {
   MODE_LST,
   MODE_SOLAR,
 
+  // Live Allan deviation of the free-running crystal, sigma_y(tau) paged across octave
+  // taus (1,2,4,...,1024 s) on the date row. Date-row diagnostic (satview pattern); the
+  // time row keeps live GPS time. Enabled via the MODE_ADEV config key like any mode.
+  MODE_ADEV,
+
   NUM_DISPLAY_MODES
 };
 
