@@ -4131,12 +4131,19 @@ static void tc_model_check(void){
       if (d>0.2f){ tc_model_dirty=1; return; } }
   }
 }
+// A $PMTXTS timestamp is actually awaiting emission ONLY when PPS-out is enabled and a capture is
+// pending. pps_record_pending on its own is set on every PPS edge (it also feeds ADEV/RTC/tempcomp)
+// and is cleared only by the emit path, so on a GPS-locked clock with PPS-out off (the default) it
+// latches high forever — gating a flash commit on it directly wedges persistence permanently. Both
+// commit gates below defer a page erase around a real pending emit via this predicate.
+static inline _Bool pps_emit_pending(void){ return pps_ts_enabled && pps_record_pending; }
+
 // Main-loop: persist the model when dirty AND well-supported, throttled to >=30 min on a MONOTONIC
 // clock (uwTick, never GPS wall time), on the menu commit's PPS-safe / UART-idle / L0 gate.
 static void tc_persist_step(void){
   if (tc_model_dirty && tc_persist && ee2_avail && tc_model_supported() &&
       menu_layer==L0_CLOCK && !waitingForLatch &&
-      huart2.gState==HAL_UART_STATE_READY && !pps_record_pending && !tc_dump_pending &&
+      huart2.gState==HAL_UART_STATE_READY && !pps_emit_pending() && !tc_dump_pending &&
       (uint32_t)(uwTick - tc_last_commit_ms) >= 1800000u){     // >= 30 min, wrap-safe
     if (ee2_commit()){ tc_model_dirty = 0; tc_last_commit_ms = uwTick; }
   }
@@ -4404,8 +4411,10 @@ void menu_poll(void){
   }
   // Flush a pending edit to flash only back at the clock, with the display UART idle and no PPS
   // timestamp waiting to emit — a page erase stalls the CPU ~20 ms and mustn't delay a $PMTXTS.
+  // NB: guard on pps_emit_pending() (a REAL pending $PMTXTS emit), not pps_record_pending alone —
+  // that flag latches high on any GPS-locked clock with PPS-out off, and would wedge the gate forever.
   if (menu_dirty && menu_layer==L0_CLOCK && !waitingForLatch &&
-      huart2.gState==HAL_UART_STATE_READY && !pps_record_pending){
+      huart2.gState==HAL_UART_STATE_READY && !pps_emit_pending()){
     if (ee_commit()) menu_dirty=0;
   }
 }
