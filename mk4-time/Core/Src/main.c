@@ -241,6 +241,7 @@ static struct {
   uint16_t simple_mask;                // bit per KID 1..9 (u16: KID_MATRIX_FREQ=8 / KID_TEMPCOMP=9 overflow a u8)
   int16_t  brightness; uint8_t colon, alt_colon; uint16_t page_ms;
   uint8_t  sig_fade, pps, nmea;
+  uint32_t matrix_freq;                // KID_MATRIX_FREQ (u32: 100000 > u16)
   uint32_t modes_mask, modes_val;      // bit per MODE_* ordinal
 } ovr;
 static uint16_t cfg_simple_defined;    // bit per KID 1..9 set by config.txt this load
@@ -1568,6 +1569,7 @@ void segbal_poll(void){
   if (display_scan_len != want_len) setDisplayPWM(want_len);   // extend to the D-cycle scan
 }
 
+static uint32_t matrix_freq_hz = 20000;   // §4 shadow of the display refresh rate (menu MATRIX reads/writes this)
 void setDisplayFreq(uint32_t freq){
   if (waitingForLatch) {
     delayedDisplayFreq = freq;
@@ -1589,6 +1591,7 @@ void setDisplayFreq(uint32_t freq){
 
   TIM1->ARR = arr;
   TIM7->ARR = arr;
+  matrix_freq_hz = freq;             // §4 shadow of the applied rate (menu reads this, not the lossy ARR)
 }
 
 #define colonAnimationStart() \
@@ -1780,6 +1783,7 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
   } else if (strcasecmp(key, "MATRIX_FREQUENCY") == 0) {
 
     setDisplayFreq(atoi(value));
+    if (!from_serial) cfg_simple_defined |= (1u<<KID_MATRIX_FREQ);   // config.txt keeps priority over the menu
 
   } else if (strcasecmp(key, "zone_override") == 0) {
 
@@ -3887,8 +3891,9 @@ static uint16_t ee_crc16(const uint8_t*p, uint32_t n){   // CRC-16-CCITT (poly 0
 }
 // Record byte layout: 0 magic u32 | 4 gen u32 | 8 schema u16 | 10 fdate u16 | 12 ftime u16 |
 // 14 simple_mask u16 | 16 modes_mask u32 | 20 modes_val u32 | 24 brightness i16 | 26 colon u8 |
-// 27 alt_colon u8 | 28 page_ms u16 | 30 sig_fade u8 | 31 pps u8 | 32 nmea u8 | 33..61 rsvd | 62 crc16.
-// (byte 15 was zeroed padding in every prior record, so widening simple_mask u8->u16 round-trips old records; schema stays 1.)
+// 27 alt_colon u8 | 28 page_ms u16 | 30 sig_fade u8 | 31 pps u8 | 32 nmea u8 | 33 matrix_freq u32 | 37..61 rsvd | 62 crc16.
+// (bytes 15 and 33..36 were zeroed padding in every prior record, so widening simple_mask u8->u16 and
+//  adding matrix_freq u32 round-trip old records with those fields clear; EE_SCHEMA stays 1.)
 static void ee_pack(uint8_t*r, uint32_t gen){
   memset(r,0,EE_REC_SZ);
   uint32_t mg=EE_MAGIC; memcpy(r+0,&mg,4); memcpy(r+4,&gen,4);
@@ -3898,6 +3903,7 @@ static void ee_pack(uint8_t*r, uint32_t gen){
   memcpy(r+16,&ovr.modes_mask,4); memcpy(r+20,&ovr.modes_val,4);
   memcpy(r+24,&ovr.brightness,2); r[26]=ovr.colon; r[27]=ovr.alt_colon;
   memcpy(r+28,&ovr.page_ms,2); r[30]=ovr.sig_fade; r[31]=ovr.pps; r[32]=ovr.nmea;
+  memcpy(r+33,&ovr.matrix_freq,4);
   uint16_t crc=ee_crc16(r,62); memcpy(r+62,&crc,2);
 }
 static void ee_unpack(const uint8_t*r){
@@ -3906,6 +3912,7 @@ static void ee_unpack(const uint8_t*r){
   memcpy(&ovr.modes_mask,r+16,4); memcpy(&ovr.modes_val,r+20,4);
   memcpy(&ovr.brightness,r+24,2); ovr.colon=r[26]; ovr.alt_colon=r[27];
   memcpy(&ovr.page_ms,r+28,2); ovr.sig_fade=r[30]; ovr.pps=r[31]; ovr.nmea=r[32];
+  memcpy(&ovr.matrix_freq,r+33,4);
   ovr.valid=1;
 }
 static void ee_init_base(void){
@@ -4189,6 +4196,7 @@ void menu_apply_overrides(void){
   OVR_S(KID_SIG_FADE,   significance_fade=ovr.sig_fade)
   OVR_S(KID_PPS,        pps_ts_enabled=ovr.pps)
   OVR_S(KID_NMEA,       nmea_cdc_level=ovr.nmea)
+  OVR_S(KID_MATRIX_FREQ,setDisplayFreq(ovr.matrix_freq))   // clamping setter (never ARR-direct) -> a bad stored value can't brick
   #undef OVR_S
   for (uint8_t m=0;m<NUM_DISPLAY_MODES;m++)
     if ((ovr.modes_mask&(1u<<m)) && (!(cfg_modes_defined&(1u<<m))||stamp_ok))
@@ -4216,6 +4224,7 @@ static void menu_record_key(uint8_t key_id, int32_t v){
     case KID_SIG_FADE:   ovr.sig_fade=(uint8_t)v; break;
     case KID_PPS:        ovr.pps=(uint8_t)v; break;
     case KID_NMEA:       ovr.nmea=(uint8_t)v; break;
+    case KID_MATRIX_FREQ:ovr.matrix_freq=(uint32_t)v; break;
   }
 }
 
@@ -4291,6 +4300,13 @@ static int32_t g_pps   (const MItem*m){ (void)m; return pps_ts_enabled; }
 static void    s_pps   (const MItem*m,int32_t v){ (void)m; pps_ts_enabled=v?1:0; }
 static int32_t g_nmea  (const MItem*m){ (void)m; return nmea_cdc_level; }
 static void    s_nmea  (const MItem*m,int32_t v){ (void)m; nmea_cdc_level=(uint8_t)v; }
+static int32_t g_matrix(const MItem*m){ (void)m; return (int32_t)matrix_freq_hz; }
+static void    s_matrix(const MItem*m,int32_t v){   // §4 live-preview: ARR every tap; throttle the blocking date-board UART
+  (void)m; if(v<1000)v=1000; if(v>100000)v=100000;              // hardware floor/ceiling (defensive)
+  static uint32_t last_tx=0;
+  if ((uint32_t)(uwTick-last_tx) >= 100u){ setDisplayFreq((uint32_t)v); last_tx=uwTick; }  // <=10 Hz UART to the date board
+  else { uint32_t a=(uint32_t)(16000000.0/(double)v)-1u; TIM1->ARR=a; TIM7->ARR=a; matrix_freq_hz=(uint32_t)v; }  // instant local ARR
+}
 static int32_t g_mode  (const MItem*m){ return config.modes_enabled[m->lo]; }
 static void    s_mode  (const MItem*m,int32_t v){ menuSetMode((uint8_t)m->lo, v?1:0); }
 static void    s_fwcrc (const MItem*m,int32_t v){ (void)m; menuSetMode(MODE_FIRMWARE_CRC_T,v?1:0); config.modes_enabled[MODE_FIRMWARE_CRC_D]=v?1:0; }
@@ -4308,6 +4324,7 @@ static const MItem menu_items[] = {
   { KID_SIG_FADE,   MIT_TOGGLE,"SIG FADE", 0,1,1,      NULL,     g_sig,    s_sig,    SEC_DISP },
   { KID_PPS,        MIT_TOGGLE,"PPS OUT",  0,1,1,      NULL,     g_pps,    s_pps,    SEC_SYS  },
   { KID_NMEA,       MIT_ENUM,  "NMEA",     0,2,1,      en_nmea,  g_nmea,   s_nmea,   SEC_SYS  },
+  { KID_MATRIX_FREQ,MIT_STEP,  "MATRIX",   8000,100000,1000,NULL,g_matrix, s_matrix, SEC_SYS  },   // menu floor 8000 (flicker); config MATRIX_FREQUENCY reaches the 1000 hw floor
   MODE_ROW(MODE_ISO8601_STD,SEC_CAL,"ISO 8601"), MODE_ROW(MODE_ISO_ORDINAL,SEC_CAL,"ISO ORD"),
   MODE_ROW(MODE_ISO_WEEK,SEC_CAL,"ISO WEEK"),     MODE_ROW(MODE_UNIX,SEC_CAL,"UNIX"),
   MODE_ROW(MODE_JULIAN_DATE,SEC_CAL,"JULIAN"),    MODE_ROW(MODE_MODIFIED_JD,SEC_CAL,"MOD JD"),
@@ -4419,11 +4436,14 @@ static void menu_edit_step(int dir){
 }
 static void menu_cancel_edit(void){
   const MItem *m=&menu_items[menu_idx];
-  m->set(m, menu_orig); menu_layer=L2_ITEM; menu_render_item();     // restore pre-edit value
+  m->set(m, menu_orig);                                            // restore pre-edit value
+  if (m->key_id==KID_MATRIX_FREQ) setDisplayFreq(matrix_freq_hz);  // §4: force the last rate to the date board (set-hook throttles)
+  menu_layer=L2_ITEM; menu_render_item();
 }
 static void menu_commit_edit(void){
   const MItem *m=&menu_items[menu_idx];
   menu_record_key(m->key_id, menu_val);   // record for flash (value already applied live)
+  if (m->key_id==KID_MATRIX_FREQ) setDisplayFreq(matrix_freq_hz);  // §4: authoritative final sync past the UART throttle
   menu_layer=L2_ITEM; menu_render_item();
 }
 
