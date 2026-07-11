@@ -4769,7 +4769,7 @@ static void menu_render_item(void){
     char val[10]; int32_t v = m->get(m);
     if (m->type==MIT_STEP){
       if      (m->key_id==KID_PAGE_MS)     snprintf(val,sizeof val,"%ld.%ldS",(long)(v/1000),(long)((v%1000)/100)); // 5.5S
-      else if (m->key_id==KID_MATRIX_FREQ) snprintf(val,sizeof val,"%ldKHZ",(long)(v/1000));                        // 20KHZ
+      else if (m->key_id==KID_MATRIX_FREQ) snprintf(val,sizeof val,"%ld",(long)(v/1000));                          // 20 (kHz; K/Z have no 7-seg glyph, the MATRIX label carries the unit) -> "MATRIX 20"
       else                                 menu_fmt_val(m, v, val);            // BRIGHT etc.
       if (snprintf(buf,sizeof buf,"%s %s",m->label,val) > 10){                 // overflow -> keep the value, trim the label
         int labcap = 10 - 1 - (int)strlen(val);
@@ -4785,7 +4785,9 @@ static void menu_render_item(void){
     }
     menu_show(buf);
   } else {                       // L3_EDIT: show the value being scrubbed
-    menu_fmt_val(m, menu_val, buf); menu_show(buf);
+    if (m->key_id==KID_MATRIX_FREQ) snprintf(buf,sizeof buf,"%ld",(long)(menu_val/1000));  // kHz, matches the L2 form (the stored value stays Hz; step is 1000 Hz = 1 kHz)
+    else menu_fmt_val(m, menu_val, buf);
+    menu_show(buf);
   }
 }
 
