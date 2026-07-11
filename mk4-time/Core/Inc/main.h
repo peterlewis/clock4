@@ -193,6 +193,11 @@ enum {
   // time row keeps live GPS time. Enabled via the MODE_ADEV config key like any mode.
   MODE_ADEV,
 
+  // Bright-star meridian-transit predictor: the soonest bright stars to cross the local
+  // meridian (culminate), paged as "<name> <h:mm>" countdowns on the date row. Uses the
+  // GPS fix + local_sidereal_time (transit when LST == RA). Gated by the MODE_STAR key.
+  MODE_STAR,
+
   NUM_DISPLAY_MODES
 };
 
