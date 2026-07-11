@@ -82,13 +82,15 @@ Tolerance_time_100ms = 100000
 significance_fade = off
 
 
-# nonlinear brightness curve, five stops of input->output, use brightness-curve.htm for a GUI
+# nonlinear brightness curve, five stops of input->output, use brightness-curve.htm for a GUI.
+# The measured VTT9812FH (R11 = 470K) curve below is now the compiled-in firmware default, so these
+# lines are only needed to OVERRIDE it (e.g. a different photodiode). Uncomment and edit to change a stop.
 # VTT9812FH with R11 = 470K
-BS1 = 0,0
-BS2 = 131,365
-BS3 = 1076,1422
-BS4 = 2774,2665
-BS5 = 3849,4095
+#BS1 = 0,0
+#BS2 = 131,365
+#BS3 = 1076,1422
+#BS4 = 2774,2665
+#BS5 = 3849,4095
 
 # shows input and output values of DAC/ADC
 MODE_DEBUG_BRIGHTNESS = 0
@@ -124,6 +126,16 @@ pps = off
 tc_learn = off
 tc_apply = off
 tc_rtc = off
+
+# Auto-persist the learned model to a dedicated 2-page flash store (separate from config.txt and the
+# menu store), so the very first holdover after a power-up is already temperature-compensated instead
+# of waiting to re-learn. With tc_persist on, a well-supported model is saved at most once every 30
+# minutes (and only when it has moved meaningfully) — a handful of writes a day, so the flash lasts
+# for decades. On the next boot it loads as an EVOLVING seed (like tc_seed, but sourced from flash);
+# config.txt still wins per-key, so a tc_seed/coefficient/tc_t0 line here overrides the stored model.
+# "tc_forget = on" over USB serial erases the stored copy (live learning is untouched); "tc_reset = on"
+# clears the live model AND the stored copy. Both are ignored inside this file.
+tc_persist = off
 
 # show die temp / model offsets / sample count on the date row (pages like the astro modes)
 mode_tempcomp = 0
