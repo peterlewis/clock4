@@ -1296,16 +1296,16 @@ static uint32_t segbal_duty(uint32_t n, uint32_t eff){
 // Effective strength for THIS refill. AUTO (seg_balance = 1/on) follows the hardware calibration:
 // a full eyeballed sweep across the whole rail on a production Mk IV (2026-07-11) landed the even
 // point on a clean EXPONENTIAL — the round-number rails fell on a x3-per-half-brightness geometric
-// progression (rail brightest -> 10, mid -> 30, dimmest -> 90), i.e. K = 10 * 9^(dac/4096). That is
+// progression (rail brightest -> 10, mid -> 30, dimmest -> 90), i.e. K = 10 * 9^(dac/4095). That is
 // exactly the LED knee: near the bottom of the rail, segment current is exponential in forward
 // voltage, so a sparse digit pulls away exponentially fast and needs exponentially more duty haircut.
-// 4096 (= 2^12, the count of 12-bit DAC codes) is the full-scale, so the breakpoints below land on
-// clean powers of two and K evaluates to the measured anchors exactly. Sampled to a 9-point LUT
-// (cheaper than a per-refill powf, and exponentials interpolate linearly to well under 1 K).
-// A numeric value (2..300) instead applies a fixed manual strength for experiments.
+// 4095 is the 12-bit DAC full-scale code (dac_target maxes there, matching the original firmware); the
+// intermediate breakpoints below stay on clean powers of two and K evaluates to the measured anchors.
+// Sampled to a 9-point LUT (cheaper than a per-refill powf, and exponentials interpolate linearly to
+// well under 1 K). A numeric value (2..300) instead applies a fixed manual strength for experiments.
 // seg_balance = 0/off (the default) keeps the stock scan and stock timing untouched.
-static const uint16_t SEGBAL_AUTO_DAC[9] = { 0, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4096 };
-static const uint16_t SEGBAL_AUTO_K[9]   = { 10,  13,   17,   23,   30,   39,   52,   68,   90 };  // 10*9^(dac/4096)
+static const uint16_t SEGBAL_AUTO_DAC[9] = { 0, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4095 };
+static const uint16_t SEGBAL_AUTO_K[9]   = { 10,  13,   17,   23,   30,   39,   52,   68,   90 };  // 10*9^(dac/4095)
 
 static uint32_t segbal_strength(void){
   if (seg_balance != 1) return seg_balance;                // manual fixed strength, or 0 = off
@@ -1523,9 +1523,9 @@ void applyColonForMode(void){
 }
 
 // AUTO colon scale vs rail (dac_target 0 = brightest .. 4095 = dimmest): full at the bright end,
-// tapering to a dim floor so the separators stay present but recessed. Sampled 0..4096 like
+// tapering to a dim floor so the separators stay present but recessed. Sampled 0..4095 like
 // seg_balance; a physically-reasonable STARTING curve — refine by eye with a colon_balance sweep.
-static const uint16_t COLON_AUTO_DAC[9]   = {   0, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4096 };
+static const uint16_t COLON_AUTO_DAC[9]   = {   0, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4095 };
 static const uint16_t COLON_AUTO_SCALE[9] = { 256, 233,  209,  184,  158,  129,   97,   60,   20 };
 static uint16_t colon_scale_for(int32_t d){
   if (d <= COLON_AUTO_DAC[0]) return COLON_AUTO_SCALE[0];
@@ -1573,7 +1573,7 @@ _Bool falsey(char const* str){
   return 0;
 }
 
-// Accept a float between 0.0 and 1.0, or an int from 0 to 4096
+// Accept a float between 0.0 and 1.0, or an int from 0 to 4095
 float parseBrightness(char *v, _Bool invert){
   if (!v[0]) return -1;
   float b = strtof(v, NULL);
