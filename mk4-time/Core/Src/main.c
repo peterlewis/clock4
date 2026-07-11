@@ -4574,7 +4574,7 @@ void menu_apply_overrides(void){
   OVR_S(KID_NMEA,       nmea_cdc_level=ovr.nmea)
   OVR_S(KID_MATRIX_FREQ,setDisplayFreq(ovr.matrix_freq))   // clamping setter (never ARR-direct) -> a bad stored value can't brick
   OVR_S(KID_TEMPCOMP,   tc_learn=tc_apply=ovr.tc?1:0)
-  OVR_S(KID_BALANCE,    { seg_balance=colon_balance=ovr.bal?1:0; colonForce=1; })
+  OVR_S(KID_BALANCE,    { if(ovr.bal){ if(!seg_balance)seg_balance=1; if(!colon_balance)colon_balance=1; } else seg_balance=colon_balance=0; colonForce=1; })  // config parse ran first: a stored "on" must not clobber a manual strength
   #undef OVR_S
   for (uint8_t m=0;m<NUM_DISPLAY_MODES;m++)
     if ((ovr.modes_mask&(1u<<m)) && (!(cfg_modes_defined&(1u<<m))||stamp_ok))
@@ -4697,7 +4697,13 @@ static void    s_tc    (const MItem*m,int32_t v){ (void)m; tc_learn = tc_apply =
 // per-segment duty equalisation (seg_balance) AND rail-tied colon dimming (colon_balance). config.txt
 // keeps the finer seg_balance / colon_balance keys (incl. manual strengths) for calibration.
 static int32_t g_bal   (const MItem*m){ (void)m; return (seg_balance && colon_balance) ? 1 : 0; }
-static void    s_bal   (const MItem*m,int32_t v){ (void)m; seg_balance = colon_balance = v?1:0; colonForce = 1; }
+static void    s_bal   (const MItem*m,int32_t v){ (void)m;
+  // ON enables AUTO only where the sub-system is OFF, so toggling BALANCE never stomps a hand-tuned
+  // manual seg_balance (2..300) / colon_balance (2..256) down to the coarse AUTO(1); OFF disables both.
+  if (v){ if(!seg_balance) seg_balance=1; if(!colon_balance) colon_balance=1; }
+  else  { seg_balance = colon_balance = 0; }
+  colonForce = 1;
+}
 static int32_t g_mode  (const MItem*m){ return config.modes_enabled[m->lo]; }
 static void    s_mode  (const MItem*m,int32_t v){ menuSetMode((uint8_t)m->lo, v?1:0); }
 static void    s_fwcrc (const MItem*m,int32_t v){ (void)m; menuSetMode(MODE_FIRMWARE_CRC_T,v?1:0); config.modes_enabled[MODE_FIRMWARE_CRC_D]=v?1:0; }
@@ -4907,7 +4913,10 @@ static void menu_dispatch(uint8_t e){
 // window where the SysTick ISR runs its own non-reentrant sendDate(0).
 void menu_poll(void){
   if (menu_repaint && decisec!=9){ menu_repaint=0; sendDate(1); }
-  if (menu_layer!=L0_CLOCK && (uint32_t)(uwTick-menu_last_ms) >= MENU_IDLE_MS) menu_to_L0();
+  if (menu_layer!=L0_CLOCK && (uint32_t)(uwTick-menu_last_ms) >= MENU_IDLE_MS) {
+    if (menu_layer==L3_EDIT) menu_cancel_edit();   // idle-out mid-edit == abandon: revert the live scrub + flush the final MATRIX rate to the date board, exactly like CANCEL (menu_to_L0 alone did neither)
+    menu_to_L0();
+  }
   if (decisec==9) return;
   while (menu_ev_t != menu_ev_h){
     uint8_t e = menu_evq[menu_ev_t]; menu_ev_t=(uint8_t)((menu_ev_t+1)&(MENU_EVQ-1));
@@ -5022,6 +5031,7 @@ int main(void)
   MX_DMA_Init();
   MX_QUADSPI_Init();
   MX_TIM1_Init();
+  matrix_freq_hz = 16000000u / (TIM1->ARR + 1u);   // §4: reconcile the MATRIX shadow with the real timer (CubeMX default ARR) so g_matrix never reports a rate the hardware isn't running before config load
   MX_USART2_UART_Init();
   MX_FATFS_Init();
   //MX_USB_DEVICE_Init();
