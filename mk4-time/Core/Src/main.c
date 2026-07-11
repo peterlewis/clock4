@@ -216,6 +216,11 @@ static _Bool     menu_banner  = 0;      // L2: show the section name once on ENT
 static uint32_t  menu_last_ms = 0;      // uwTick of the last event (drives 15 s idle)
 static char      menu_text[11]= {0};    // non-empty => the menu OWNS the date row (see sendDate)
 static _Bool     menu_repaint = 0;      // a repaint was deferred out of the SysTick sendDate window
+// §3c hold-acceleration: a run of same-direction STEP taps within ACCEL_GAP_MS grows the increment
+// (main-loop-only state; never volatile / ISR-touched). Reset on enter-edit and on exit/idle.
+static uint32_t  menu_run_last_ms = 0;
+static int8_t    menu_run_dir = 0;
+static uint16_t  menu_run_len = 0;
 // ISR -> main-loop event ring (single-producer USART2 ISR, single-consumer menu_poll)
 #define MENU_EVQ 16
 static volatile uint8_t menu_evq[MENU_EVQ];
@@ -4254,7 +4259,7 @@ static void menu_show(const char *s){
 }
 static void menu_flash(const char *s){ menu_show(s); }   // transient; cleared by the next render
 static void menu_to_L0(void){
-  menu_layer=L0_CLOCK; menu_chord=0; menu_stage=0; menu_banner=0; menu_text[0]=0;
+  menu_layer=L0_CLOCK; menu_chord=0; menu_stage=0; menu_banner=0; menu_run_dir=0; menu_run_len=0; menu_text[0]=0;
   // KEEP menu_section/menu_idx: SETUP re-entry resumes on the last section (and last item, §fire_stage).
   if (decisec!=9) sendDate(1); else menu_repaint=1;      // restore the normal date row
 }
@@ -4345,8 +4350,25 @@ static void menu_render_item(void){
   char buf[20];
   if (menu_layer==L2_ITEM){
     if (menu_banner){ menu_show(sect_name[menu_section]); return; }           // sticky breadcrumb until 1st tap/edit
-    char val[10]; menu_fmt_val(m, m->get(m), val);
-    if (snprintf(buf,sizeof buf,"%s %s",m->label,val) > 10) snprintf(buf,sizeof buf,"%s",m->label);
+    // §3b never hide a NUMBER: STEP items get a compact unit form + label-trim (the value is the point).
+    // ENUM/TOGGLE keep the LABEL recognisable (you scroll by label) — truncate the value, or label-only.
+    char val[10]; int32_t v = m->get(m);
+    if (m->type==MIT_STEP){
+      if      (m->key_id==KID_PAGE_MS)     snprintf(val,sizeof val,"%ld.%ldS",(long)(v/1000),(long)((v%1000)/100)); // 5.5S
+      else if (m->key_id==KID_MATRIX_FREQ) snprintf(val,sizeof val,"%ldKHZ",(long)(v/1000));                        // 20KHZ
+      else                                 menu_fmt_val(m, v, val);            // BRIGHT etc.
+      if (snprintf(buf,sizeof buf,"%s %s",m->label,val) > 10){                 // overflow -> keep the value, trim the label
+        int labcap = 10 - 1 - (int)strlen(val);
+        snprintf(buf,sizeof buf,"%.*s %s", labcap<0?0:labcap, m->label, val);
+      }
+    } else {                                                                   // ENUM / TOGGLE
+      menu_fmt_val(m, v, val);
+      if (snprintf(buf,sizeof buf,"%s %s",m->label,val) > 10){
+        int valcap = 10 - (int)strlen(m->label) - 1;
+        if (valcap >= 2) snprintf(buf,sizeof buf,"%s %.*s", m->label, valcap, val);   // keep label, truncate value
+        else             snprintf(buf,sizeof buf,"%s", m->label);              // no room -> label only
+      }
+    }
     menu_show(buf);
   } else {                       // L3_EDIT: show the value being scrubbed
     menu_fmt_val(m, menu_val, buf); menu_show(buf);
@@ -4356,14 +4378,40 @@ static void menu_render_item(void){
 // ---- L2 value editor (live-preview on the real digits) ----
 static void menu_enter_edit(void){
   const MItem *m=&menu_items[menu_idx];
-  menu_orig = m->get(m); menu_val = menu_orig; menu_banner=0; menu_layer=L3_EDIT; menu_render_item();
+  menu_orig = m->get(m); menu_val = menu_orig; menu_banner=0; menu_run_dir=0; menu_run_len=0;
+  menu_layer=L3_EDIT; menu_render_item();
+}
+// §3c: coarse-while-held, fine-on-single-tap. A same-direction run within ACCEL_GAP_MS grows the
+// increment by doubling after a short grace, capped at range/16; a pause or reversal drops back to
+// fine. Accelerated steps snap to the coarse grid so you can't sail past a round target.
+#define ACCEL_GAP_MS   350u   // slower than this (or a reversal) = a new run -> back to 1x
+#define ACCEL_GRACE    2      // first taps of a run stay at 1x (precise nudge)
+#define ACCEL_DOUBLE   2      // double the increment every 2 further held taps
+#define ACCEL_SPAN_DIV 16     // fast cap = range/16  (~full sweep in a few seconds @5 Hz)
+#define ACCEL_RUN_CAP  4000u  // bound run length so the tier arithmetic can't overflow
+static int32_t menu_accel_inc(const MItem*m,int dir){
+  uint32_t now=uwTick;
+  if (dir==menu_run_dir && (uint32_t)(now-menu_run_last_ms)<=ACCEL_GAP_MS){
+    if (menu_run_len<ACCEL_RUN_CAP) menu_run_len++;
+  } else { menu_run_dir=(int8_t)dir; menu_run_len=0; }     // pause or reversal -> fine again
+  menu_run_last_ms=now;
+  int32_t inc=m->step, cap=(m->hi-m->lo)/ACCEL_SPAN_DIV; if(cap<m->step) cap=m->step;
+  if (menu_run_len>=ACCEL_GRACE){
+    uint16_t tiers=(uint16_t)((menu_run_len-ACCEL_GRACE)/ACCEL_DOUBLE);
+    while (tiers-- && inc<cap) inc<<=1;
+    if (inc>cap) inc=cap;
+  }
+  return inc*dir;
 }
 static void menu_edit_step(int dir){
   const MItem *m=&menu_items[menu_idx];
   int32_t want;
   if (m->type==MIT_ENUM){ want=menu_val+dir; if(want>m->hi)want=0; if(want<0)want=m->hi; }
   else if (m->type==MIT_TOGGLE){ want=!menu_val; }
-  else { want=menu_val+(int32_t)dir*m->step; if(want>m->hi)want=m->hi; if(want<m->lo)want=m->lo; }
+  else { int32_t d=menu_accel_inc(m,dir), inc=d<0?-d:d;    // MIT_STEP: accelerated increment
+         want=menu_val+d;
+         if (inc>m->step) want=(want/inc)*inc;             // snap to the coarse grid -> can't overshoot round targets
+         if(want>m->hi)want=m->hi; if(want<m->lo)want=m->lo; }
   m->set(m, want);
   int32_t now = m->get(m);
   if (now!=want && m->type==MIT_TOGGLE){ menu_val=now; menu_flash("LASt"); return; }  // refused (LASt)
