@@ -241,12 +241,12 @@ void menu_isr_event(uint8_t evt){
 static struct {
   _Bool    valid;
   uint16_t stamp_fdate, stamp_ftime;   // config.txt mtime when the override was made
-  uint8_t  simple_mask;                // bit per KID 1..7
+  uint16_t simple_mask;                // bit per KID 1..9 (u16: KID_MATRIX_FREQ=8 / KID_TEMPCOMP=9 overflow a u8)
   int16_t  brightness; uint8_t colon, alt_colon; uint16_t page_ms;
   uint8_t  sig_fade, pps, nmea;
   uint32_t modes_mask, modes_val;      // bit per MODE_* ordinal
 } ovr;
-static uint8_t  cfg_simple_defined;    // bit per KID 1..7 set by config.txt this load
+static uint16_t cfg_simple_defined;    // bit per KID 1..9 set by config.txt this load
 static uint32_t cfg_modes_defined;     // bit per MODE_* ordinal set by config.txt this load
 static _Bool    menu_dirty = 0;        // a menu edit is awaiting flash commit
 
@@ -2103,7 +2103,7 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
 
     colonModeAlt = parseColonName(value);   // shared by MODE_LST and MODE_SOLAR ("COLONALT" in the menu)
     colonAltExplicit = 1;
-    if (!from_serial) cfg_simple_defined |= (1u<<KID_ALT_COLON);
+    if (!from_serial) cfg_simple_defined |= (1u<<KID_COLON_ALT);
 
   } else if (strcasecmp(key, "nmea") == 0) {
 
@@ -4241,14 +4241,15 @@ static uint16_t ee_crc16(const uint8_t*p, uint32_t n){   // CRC-16-CCITT (poly 0
   return c;
 }
 // Record byte layout: 0 magic u32 | 4 gen u32 | 8 schema u16 | 10 fdate u16 | 12 ftime u16 |
-// 14 simple_mask u8 | 16 modes_mask u32 | 20 modes_val u32 | 24 brightness i16 | 26 colon u8 |
+// 14 simple_mask u16 | 16 modes_mask u32 | 20 modes_val u32 | 24 brightness i16 | 26 colon u8 |
 // 27 alt_colon u8 | 28 page_ms u16 | 30 sig_fade u8 | 31 pps u8 | 32 nmea u8 | 33..61 rsvd | 62 crc16.
+// (byte 15 was zeroed padding in every prior record, so widening simple_mask u8->u16 round-trips old records; schema stays 1.)
 static void ee_pack(uint8_t*r, uint32_t gen){
   memset(r,0,EE_REC_SZ);
   uint32_t mg=EE_MAGIC; memcpy(r+0,&mg,4); memcpy(r+4,&gen,4);
   uint16_t sc=EE_SCHEMA; memcpy(r+8,&sc,2);
   memcpy(r+10,&ovr.stamp_fdate,2); memcpy(r+12,&ovr.stamp_ftime,2);
-  r[14]=ovr.simple_mask;
+  memcpy(r+14,&ovr.simple_mask,2);
   memcpy(r+16,&ovr.modes_mask,4); memcpy(r+20,&ovr.modes_val,4);
   memcpy(r+24,&ovr.brightness,2); r[26]=ovr.colon; r[27]=ovr.alt_colon;
   memcpy(r+28,&ovr.page_ms,2); r[30]=ovr.sig_fade; r[31]=ovr.pps; r[32]=ovr.nmea;
@@ -4256,7 +4257,7 @@ static void ee_pack(uint8_t*r, uint32_t gen){
 }
 static void ee_unpack(const uint8_t*r){
   memcpy(&ovr.stamp_fdate,r+10,2); memcpy(&ovr.stamp_ftime,r+12,2);
-  ovr.simple_mask=r[14];
+  memcpy(&ovr.simple_mask,r+14,2);
   memcpy(&ovr.modes_mask,r+16,4); memcpy(&ovr.modes_val,r+20,4);
   memcpy(&ovr.brightness,r+24,2); ovr.colon=r[26]; ovr.alt_colon=r[27];
   memcpy(&ovr.page_ms,r+28,2); ovr.sig_fade=r[30]; ovr.pps=r[31]; ovr.nmea=r[32];
@@ -4538,7 +4539,7 @@ void menu_apply_overrides(void){
   #define OVR_S(kid, apply) if ((ovr.simple_mask&(1u<<(kid))) && (!(cfg_simple_defined&(1u<<(kid)))||stamp_ok)) { apply; }
   OVR_S(KID_BRIGHTNESS, config.brightness_override=(float)ovr.brightness)
   OVR_S(KID_COLON,      colonModeCivil=ovr.colon)
-  OVR_S(KID_ALT_COLON,  { colonModeAlt=ovr.alt_colon; colonAltExplicit=1; })
+  OVR_S(KID_COLON_ALT,  { colonModeAlt=ovr.alt_colon; colonAltExplicit=1; })
   OVR_S(KID_PAGE_MS,    config.page_ms=ovr.page_ms)
   OVR_S(KID_SIG_FADE,   significance_fade=ovr.sig_fade)
   OVR_S(KID_PPS,        pps_ts_enabled=ovr.pps)
@@ -4561,11 +4562,11 @@ static void menu_record_key(uint8_t key_id, int32_t v){
     }
     return;
   }
-  ovr.simple_mask |= (uint8_t)(1u<<key_id);
+  ovr.simple_mask |= (uint16_t)(1u<<key_id);
   switch(key_id){
     case KID_BRIGHTNESS: ovr.brightness=(int16_t)v; break;
     case KID_COLON:      ovr.colon=(uint8_t)v; break;
-    case KID_ALT_COLON:  ovr.alt_colon=(uint8_t)v; break;
+    case KID_COLON_ALT:  ovr.alt_colon=(uint8_t)v; break;
     case KID_PAGE_MS:    ovr.page_ms=(uint16_t)v; break;
     case KID_SIG_FADE:   ovr.sig_fade=(uint8_t)v; break;
     case KID_PPS:        ovr.pps=(uint8_t)v; break;
@@ -4636,7 +4637,7 @@ static int32_t g_colon (const MItem*m){ (void)m; return colonModeCivil; }
 static void    s_colon (const MItem*m,int32_t v){ (void)m; colonModeCivil=(uint8_t)v; applyColonForMode(); }
 static int32_t g_acolon(const MItem*m){ (void)m; return colonModeAlt; }
 static void    s_acolon(const MItem*m,int32_t v){ (void)m; colonModeAlt=(uint8_t)v; colonAltExplicit=1; applyColonForMode(); }
-static int32_t g_page  (const MItem*m){ (void)m; return config.page_ms; }
+static int32_t g_page  (const MItem*m){ (void)m; return (int32_t)page_ms(); }   // EFFECTIVE (5500 default / 250 floor), not the raw-0 sentinel
 static void    s_page  (const MItem*m,int32_t v){ (void)m; config.page_ms=(uint16_t)v; }
 static int32_t g_sig   (const MItem*m){ (void)m; return significance_fade; }
 static void    s_sig   (const MItem*m,int32_t v){ (void)m; significance_fade=v?1:0; }
@@ -4655,8 +4656,8 @@ static const char *const en_nmea[]  = {"ALL","RMC","NONE"};
 static const MItem menu_items[] = {
   { KID_BRIGHTNESS, MIT_STEP,  "BRIGHT",  -1,4095,256, NULL,     g_bright, s_bright },
   { KID_COLON,      MIT_ENUM,  "COLON",    0,5,1,      en_colon, g_colon,  s_colon  },
-  { KID_ALT_COLON,  MIT_ENUM,  "ALTCOLON", 0,5,1,      en_colon, g_acolon, s_acolon },
-  { KID_PAGE_MS,    MIT_STEP,  "PAGE MS",  0,60000,250,NULL,     g_page,   s_page   },
+  { KID_COLON_ALT,  MIT_ENUM,  "ALTCOLON", 0,5,1,      en_colon, g_acolon, s_acolon },
+  { KID_PAGE_MS,    MIT_STEP,  "PAGE MS",  250,60000,250,NULL,   g_page,   s_page   },
   { KID_SIG_FADE,   MIT_TOGGLE,"SIG FADE", 0,1,1,      NULL,     g_sig,    s_sig    },
   { KID_PPS,        MIT_TOGGLE,"PPS OUT",  0,1,1,      NULL,     g_pps,    s_pps    },
   { KID_NMEA,       MIT_ENUM,  "NMEA",     0,2,1,      en_nmea,  g_nmea,   s_nmea   },
