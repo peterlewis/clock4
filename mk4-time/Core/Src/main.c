@@ -223,6 +223,22 @@ void menu_isr_event(uint8_t evt){
   if (nh != menu_ev_t) { menu_evq[menu_ev_h] = evt; menu_ev_h = nh; }   // drop if full
 }
 
+// ---- Menu persistence: the RAM override store (mirrors the winning flash record) ----------------
+// Records ONLY what the user changed on-device (which keys, their values, and the config.txt mtime at
+// edit time), so the boot merge can honour config.txt precedence. cfg_*_defined marks which keys the
+// current config.txt actually set, rebuilt each readConfigFile().
+static struct {
+  _Bool    valid;
+  uint16_t stamp_fdate, stamp_ftime;   // config.txt mtime when the override was made
+  uint8_t  simple_mask;                // bit per KID 1..7
+  int16_t  brightness; uint8_t colon, alt_colon; uint16_t page_ms;
+  uint8_t  sig_fade, pps, nmea;
+  uint32_t modes_mask, modes_val;      // bit per MODE_* ordinal
+} ovr;
+static uint8_t  cfg_simple_defined;    // bit per KID 1..7 set by config.txt this load
+static uint32_t cfg_modes_defined;     // bit per MODE_* ordinal set by config.txt this load
+static _Bool    menu_dirty = 0;        // a menu edit is awaiting flash commit
+
 uint8_t nmea_cdc_level=0;
 int debug_rtc_val = 0;
 
@@ -1705,7 +1721,8 @@ float parseBrightness(char *v, _Bool invert){
 }
 
 #define set_mode_enabled(mode, value) \
-  if ((config.modes_enabled[mode] = truthy(value))) requestMode=mode;
+  do { if ((config.modes_enabled[mode] = truthy(value))) requestMode=mode; \
+       if (!from_serial) cfg_modes_defined |= (1u<<(mode)); } while(0)   /* menu-precedence tracking */
 
 static uint8_t parseColonName(const char *value){
   if (strcasecmp(value, "solid") == 0)        return COLON_MODE_SOLID;
@@ -1737,6 +1754,7 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
   } else if (strcasecmp(key, "brightness") == 0) {
 
     config.brightness_override = parseBrightness(value, 1);
+    if (!from_serial) cfg_simple_defined |= (1u<<KID_BRIGHTNESS);
 
   } else if (strcasecmp(key, "countdown_to") == 0) {
 
@@ -1811,6 +1829,7 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
   } else if (strcasecmp(key, "page_ms") == 0) {
     int v = atoi(value);
     config.page_ms = v < 0 ? 0 : (v > 65535 ? 65535 : v);   // fits uint16; 0 -> default
+    if (!from_serial) cfg_simple_defined |= (1u<<KID_PAGE_MS);
   } else if (strcasecmp(key, "Tolerance_time_1ms") == 0) {
     config.tolerance_1ms = atoi(value);
   } else if (strcasecmp(key, "Tolerance_time_10ms") == 0) {
@@ -1824,11 +1843,13 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
   } else if (strcasecmp(key, "colon_mode") == 0) {
 
     colonModeCivil = parseColonName(value);
+    if (!from_serial) cfg_simple_defined |= (1u<<KID_COLON);
 
   } else if (strcasecmp(key, "alt_colon_mode") == 0) {
 
     colonModeAlt = parseColonName(value);   // shared by MODE_LST and MODE_SOLAR
     colonAltExplicit = 1;
+    if (!from_serial) cfg_simple_defined |= (1u<<KID_ALT_COLON);
 
   } else if (strcasecmp(key, "nmea") == 0) {
 
@@ -1837,10 +1858,12 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     } else if (strcasecmp(value, "rmc") == 0) {
       nmea_cdc_level = NMEA_RMC;
     } else nmea_cdc_level = NMEA_ALL;
+    if (!from_serial) cfg_simple_defined |= (1u<<KID_NMEA);
 
   } else if (strcasecmp(key, "pps") == 0) {
 
     pps_ts_enabled = truthy(value);   // emit a $PMTXTS timing sentence on each PPS edge
+    if (!from_serial) cfg_simple_defined |= (1u<<KID_PPS);
 
   } else if (strcasecmp(key, "MODE_TEMPCOMP") == 0) {
     set_mode_enabled(MODE_TEMPCOMP, value);
@@ -1858,6 +1881,7 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     tc_apply = truthy(value);         // steer the SysTick timebase during GPS-loss holdover
   } else if (strcasecmp(key, "significance_fade") == 0) {
     significance_fade = truthy(value);      // fade sub-second digits by significance in holdover, not dash
+    if (!from_serial) cfg_simple_defined |= (1u<<KID_SIG_FADE);
   } else if (strcasecmp(key, "seg_balance") == 0) {
     // Equalise per-segment brightness by duty (see segbal_poll). "on" (or 1) = AUTO, the
     // calibrated strength-vs-rail curve — the intended setting. A numeric 2..300 applies a
@@ -2035,10 +2059,12 @@ void readConfigFile(void){
   colonModeCivil = 0;
   colonModeAlt = COLON_MODE_ALT_SAWTOOTH;
   colonAltExplicit = 0;
+  cfg_simple_defined = 0; cfg_modes_defined = 0;   // rebuilt below as config.txt keys are parsed
 
   FIL file;
 
    if (f_open(&file, CONFIG_FILENAME, FA_READ) != FR_OK) {
+     menu_apply_overrides();   // no config.txt: stored menu overrides are the only settings
      postConfigCleanup();
      return;
    }
@@ -2078,6 +2104,8 @@ void readConfigFile(void){
 
      }
    }
+
+   menu_apply_overrides();   // merge stored menu overrides (config.txt precedence) before the boot mode
 
    // if enabled, always boot into ttff
    if (config.modes_enabled[MODE_TTFF]) requestMode=MODE_TTFF;
@@ -3753,6 +3781,171 @@ void buttonsBothHeld(void){
   NVIC_SystemReset();
 }
 
+// ================= Menu persistence: firmware-owned emulated-EEPROM =============================
+// Two flash pages, append-only ping-pong. Each 64-byte record: {magic, generation, schema, config.txt
+// mtime stamp, the packed override set, CRC16 in the LAST doubleword}. Boot picks the highest-
+// generation CRC-valid record. The pages are the TOP TWO of physical flash, derived AT RUNTIME from
+// the flash-size register: on the 1 MB RG they land in bank 2 (read-while-write -> no CPU stall) and
+// ABOVE the app-CRC region; on the 256 KB RC there is no room above the app, so persistence DISABLES
+// itself (settings stay RAM-only) rather than write into the CRC-covered app and brick the boot.
+#define EE_MAGIC   0x4D4B3445u        // "MK4E"
+#define EE_SCHEMA  1u
+#define EE_REC_SZ  64u                // 8 doublewords; CRC16 lives in DW7 so it programs last
+#define EE_SLOTS   (FLASH_PAGE_SIZE / EE_REC_SZ)
+static uint32_t ee_page_a=0, ee_page_b=0, ee_active=0, ee_gen=0;
+static uint16_t ee_next=0;            // next free slot in the active page
+static _Bool    ee_avail=0;
+
+#ifdef __EMSCRIPTEN__
+static uint8_t ee_emu[2*FLASH_PAGE_SIZE];   // emu: back the two flash pages with RAM (0xFF = erased)
+static uint32_t ee_rd32(uint32_t a){ uint32_t v; memcpy(&v,&ee_emu[a-ee_page_a],4); return v; }
+static void ee_rd(uint32_t a, void*d, uint32_t n){ memcpy(d,&ee_emu[a-ee_page_a],n); }
+static void ee_erase(uint32_t a){ memset(&ee_emu[a-ee_page_a],0xFF,FLASH_PAGE_SIZE); }
+static void ee_prog_dw(uint32_t a, uint64_t v){ memcpy(&ee_emu[a-ee_page_a],&v,8); }
+#else
+static uint32_t ee_rd32(uint32_t a){ return *(volatile uint32_t*)a; }
+static void ee_rd(uint32_t a, void*d, uint32_t n){ memcpy(d,(const void*)a,n); }
+static void ee_erase(uint32_t a){
+  FLASH_EraseInitTypeDef e = {0}; uint32_t err;
+  e.TypeErase = FLASH_TYPEERASE_PAGES; e.NbPages = 1;
+  uint32_t bank_sz = FLASH_BANK_SIZE;                 // RG 512K, RC 128K
+  if (a - FLASH_BASE >= bank_sz){ e.Banks=FLASH_BANK_2; e.Page=(a-FLASH_BASE-bank_sz)/FLASH_PAGE_SIZE; }
+  else { e.Banks=FLASH_BANK_1; e.Page=(a-FLASH_BASE)/FLASH_PAGE_SIZE; }
+  HAL_FLASHEx_Erase(&e,&err);
+}
+static void ee_prog_dw(uint32_t a, uint64_t v){ HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, a, v); }
+#endif
+
+static uint16_t ee_crc16(const uint8_t*p, uint32_t n){   // CRC-16-CCITT (poly 0x1021, init 0xFFFF)
+  uint16_t c=0xFFFF;
+  for (uint32_t i=0;i<n;i++){ c ^= (uint16_t)((uint16_t)p[i]<<8);
+    for (int b=0;b<8;b++) c = (c&0x8000)?(uint16_t)((c<<1)^0x1021):(uint16_t)(c<<1); }
+  return c;
+}
+// Record byte layout: 0 magic u32 | 4 gen u32 | 8 schema u16 | 10 fdate u16 | 12 ftime u16 |
+// 14 simple_mask u8 | 16 modes_mask u32 | 20 modes_val u32 | 24 brightness i16 | 26 colon u8 |
+// 27 alt_colon u8 | 28 page_ms u16 | 30 sig_fade u8 | 31 pps u8 | 32 nmea u8 | 33..61 rsvd | 62 crc16.
+static void ee_pack(uint8_t*r, uint32_t gen){
+  memset(r,0,EE_REC_SZ);
+  uint32_t mg=EE_MAGIC; memcpy(r+0,&mg,4); memcpy(r+4,&gen,4);
+  uint16_t sc=EE_SCHEMA; memcpy(r+8,&sc,2);
+  memcpy(r+10,&ovr.stamp_fdate,2); memcpy(r+12,&ovr.stamp_ftime,2);
+  r[14]=ovr.simple_mask;
+  memcpy(r+16,&ovr.modes_mask,4); memcpy(r+20,&ovr.modes_val,4);
+  memcpy(r+24,&ovr.brightness,2); r[26]=ovr.colon; r[27]=ovr.alt_colon;
+  memcpy(r+28,&ovr.page_ms,2); r[30]=ovr.sig_fade; r[31]=ovr.pps; r[32]=ovr.nmea;
+  uint16_t crc=ee_crc16(r,62); memcpy(r+62,&crc,2);
+}
+static void ee_unpack(const uint8_t*r){
+  memcpy(&ovr.stamp_fdate,r+10,2); memcpy(&ovr.stamp_ftime,r+12,2);
+  ovr.simple_mask=r[14];
+  memcpy(&ovr.modes_mask,r+16,4); memcpy(&ovr.modes_val,r+20,4);
+  memcpy(&ovr.brightness,r+24,2); ovr.colon=r[26]; ovr.alt_colon=r[27];
+  memcpy(&ovr.page_ms,r+28,2); ovr.sig_fade=r[30]; ovr.pps=r[31]; ovr.nmea=r[32];
+  ovr.valid=1;
+}
+static void ee_init_base(void){
+#ifdef __EMSCRIPTEN__
+  ee_page_a = 0x08040000u; ee_page_b = 0x08040000u + FLASH_PAGE_SIZE; ee_avail=1;   // emu: RAM-backed
+#else
+  uint32_t kb  = *(uint16_t*)FLASHSIZE_BASE;      // flash size in KB from the die reg (RG 1024, RC 256)
+  uint32_t top = FLASH_BASE + kb*1024u;
+  ee_page_b = top - FLASH_PAGE_SIZE;
+  ee_page_a = top - 2u*FLASH_PAGE_SIZE;
+  ee_avail  = (ee_page_a >= 0x08040000u);          // RC has no room above the app-CRC region -> RAM only
+#endif
+}
+// Boot: derive the base, scan both pages, unpack the highest-generation CRC-valid record into ovr.
+void ee_load(void){
+  ee_init_base();
+  ovr.valid=0; ee_active=ee_page_a; ee_next=0; ee_gen=0;
+  if (!ee_avail) return;
+  uint8_t rec[EE_REC_SZ];
+  int found=0; uint32_t best_gen=0, best_page=ee_page_a; uint16_t best_slot=0;
+  for (int pg=0; pg<2; pg++){
+    uint32_t base = pg? ee_page_b : ee_page_a;
+    for (uint16_t s=0; s<EE_SLOTS; s++){
+      uint32_t addr = base + (uint32_t)s*EE_REC_SZ;
+      if (ee_rd32(addr) != EE_MAGIC) continue;
+      ee_rd(addr, rec, EE_REC_SZ);
+      uint16_t sc; memcpy(&sc,rec+8,2); if (sc!=EE_SCHEMA) continue;
+      uint16_t crc; memcpy(&crc,rec+62,2); if (ee_crc16(rec,62)!=crc) continue;   // torn write -> reject
+      uint32_t gen; memcpy(&gen,rec+4,4);
+      if (!found || gen>best_gen){ found=1; best_gen=gen; best_page=base; best_slot=s; }
+    }
+  }
+  if (found){
+    ee_rd(best_page + (uint32_t)best_slot*EE_REC_SZ, rec, EE_REC_SZ); ee_unpack(rec);
+    ee_active=best_page; ee_gen=best_gen; ee_next=(uint16_t)(best_slot+1);   // append after the winner
+  }
+}
+// Write ovr as the next record. Erase + switch page when the active one is full (CRC lands last, so a
+// power loss mid-write just fails CRC and ee_load falls back to the prior generation). Caller gates.
+static _Bool ee_commit(void){
+  if (!ee_avail || !ovr.valid) return 0;
+  uint8_t rec[EE_REC_SZ];
+#ifndef __EMSCRIPTEN__
+  HAL_FLASH_Unlock();
+  __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
+#endif
+  if (ee_next >= EE_SLOTS){
+    uint32_t other = (ee_active==ee_page_a)? ee_page_b : ee_page_a;
+    ee_erase(other); ee_active=other; ee_next=0;
+  }
+  uint32_t addr = ee_active + (uint32_t)ee_next*EE_REC_SZ;
+  ee_pack(rec, ee_gen+1);
+  for (uint32_t o=0;o<EE_REC_SZ;o+=8){ uint64_t dw; memcpy(&dw, rec+o, 8); ee_prog_dw(addr+o, dw); }
+  ee_gen++; ee_next++;
+#ifndef __EMSCRIPTEN__
+  HAL_FLASH_Lock();
+#endif
+  return 1;
+}
+// Boot merge: apply an override to a key iff config.txt didn't define it OR the stored mtime matches
+// the current config.txt mtime. A zero mtime never matches (an RTC-less host writes 0/0), so a real
+// config.txt edit on such a host always wins over a stored override.
+void menu_apply_overrides(void){
+  if (!ovr.valid) return;
+  _Bool stamp_ok = (ovr.stamp_fdate || ovr.stamp_ftime) &&
+                   ovr.stamp_fdate==config.fdate && ovr.stamp_ftime==config.ftime;
+  #define OVR_S(kid, apply) if ((ovr.simple_mask&(1u<<(kid))) && (!(cfg_simple_defined&(1u<<(kid)))||stamp_ok)) { apply; }
+  OVR_S(KID_BRIGHTNESS, config.brightness_override=(float)ovr.brightness)
+  OVR_S(KID_COLON,      colonModeCivil=ovr.colon)
+  OVR_S(KID_ALT_COLON,  { colonModeAlt=ovr.alt_colon; colonAltExplicit=1; })
+  OVR_S(KID_PAGE_MS,    config.page_ms=ovr.page_ms)
+  OVR_S(KID_SIG_FADE,   significance_fade=ovr.sig_fade)
+  OVR_S(KID_PPS,        pps_ts_enabled=ovr.pps)
+  OVR_S(KID_NMEA,       nmea_cdc_level=ovr.nmea)
+  #undef OVR_S
+  for (uint8_t m=0;m<NUM_DISPLAY_MODES;m++)
+    if ((ovr.modes_mask&(1u<<m)) && (!(cfg_modes_defined&(1u<<m))||stamp_ok))
+      config.modes_enabled[m] = (ovr.modes_val>>m)&1u;   // postConfigCleanup's >=1 guard backstops this
+}
+// Record a menu edit into the override store (value already applied live). Stamped with the current
+// config.txt mtime so a later host re-save (mtime advances) reasserts that key.
+static void menu_record_key(uint8_t key_id, int32_t v){
+  ovr.stamp_fdate=config.fdate; ovr.stamp_ftime=config.ftime; ovr.valid=1; menu_dirty=1;
+  if (key_id>=KID_MODE_BASE){
+    uint8_t m=(uint8_t)(key_id-KID_MODE_BASE);
+    ovr.modes_mask|=(1u<<m); if(config.modes_enabled[m]) ovr.modes_val|=(1u<<m); else ovr.modes_val&=~(1u<<m);
+    if (m==MODE_FIRMWARE_CRC_T){    // the FW-CRC row drives both display slots; persist both
+      ovr.modes_mask|=(1u<<MODE_FIRMWARE_CRC_D);
+      if(config.modes_enabled[MODE_FIRMWARE_CRC_D]) ovr.modes_val|=(1u<<MODE_FIRMWARE_CRC_D); else ovr.modes_val&=~(1u<<MODE_FIRMWARE_CRC_D);
+    }
+    return;
+  }
+  ovr.simple_mask |= (uint8_t)(1u<<key_id);
+  switch(key_id){
+    case KID_BRIGHTNESS: ovr.brightness=(int16_t)v; break;
+    case KID_COLON:      ovr.colon=(uint8_t)v; break;
+    case KID_ALT_COLON:  ovr.alt_colon=(uint8_t)v; break;
+    case KID_PAGE_MS:    ovr.page_ms=(uint16_t)v; break;
+    case KID_SIG_FADE:   ovr.sig_fade=(uint8_t)v; break;
+    case KID_PPS:        ovr.pps=(uint8_t)v; break;
+    case KID_NMEA:       ovr.nmea=(uint8_t)v; break;
+  }
+}
+
 // ================= On-device 2-button menu (receiving FSM) ======================================
 // Runs entirely in the MAIN LOOP (menu_poll), fed button events from the USART2 ISR via menu_evq.
 // The 9-digit TIME row never leaves live GPS time; all menu chrome lives on the 10-char DATE row via
@@ -3870,6 +4063,11 @@ static void menu_cancel_edit(void){
   const MItem *m=&menu_items[menu_idx];
   m->set(m, menu_orig); menu_layer=L1_RING; menu_render_item();     // restore pre-edit value
 }
+static void menu_commit_edit(void){
+  const MItem *m=&menu_items[menu_idx];
+  menu_record_key(m->key_id, menu_val);   // record for flash (value already applied live)
+  menu_layer=L1_RING; menu_render_item();
+}
 
 // ---- rolling self-labeled chord stages (read the label, release on the one you want) ----
 static const char *const chord_L0[4] = { "", "SETUP",  "",       "RESET"  };
@@ -3889,7 +4087,7 @@ static void menu_fire_stage(void){
     if (menu_stage==1) menu_enter_edit();
     else if (menu_stage==2) menu_to_L0();                // BACK
   } else { /* L2 */
-    if (menu_stage==1){ menu_layer=L1_RING; menu_render_item(); }   // SAVE (value already live)
+    if (menu_stage==1) menu_commit_edit();               // SAVE (records the override; value already live)
     else if (menu_stage==2) menu_cancel_edit();          // CANCEL (restore)
   }
   menu_chord=0; menu_stage=0;
@@ -3922,6 +4120,12 @@ void menu_poll(void){
     uint8_t e = menu_evq[menu_ev_t]; menu_ev_t=(uint8_t)((menu_ev_t+1)&(MENU_EVQ-1));
     menu_last_ms = uwTick;
     menu_dispatch(e);
+  }
+  // Flush a pending edit to flash only back at the clock, with the display UART idle and no PPS
+  // timestamp waiting to emit — a page erase stalls the CPU ~20 ms and mustn't delay a $PMTXTS.
+  if (menu_dirty && menu_layer==L0_CLOCK && !waitingForLatch &&
+      huart2.gState==HAL_UART_STATE_READY && !pps_record_pending){
+    if (ee_commit()) menu_dirty=0;
   }
 }
 
@@ -4109,6 +4313,7 @@ int main(void)
   //setDisplayPWM(5);
   displayOn();
 
+  ee_load();          // scan the emulated-EEPROM into the override store before config.txt is read
   readConfigFile();
   checkDelayedLoadRules();
 
