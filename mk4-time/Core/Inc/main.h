@@ -156,14 +156,14 @@ typedef struct MItem {
   uint8_t     key_id;          // STABLE persistence id (KID_*), never renumbered
   MItemType   type;
   const char *label;           // <=10 chars, shown on the date row
-  int16_t     lo, hi, step;    // STEP bounds+increment; ENUM uses 0..hi (step ignored)
+  int32_t     lo, hi, step;    // STEP bounds+increment; ENUM uses 0..hi (step ignored). i32: page_ms hi=60000 / matrix hi=100000 overflow i16
   const char *const *enums;    // ENUM label array [0..hi], else NULL
   int32_t   (*get)(const struct MItem *m);
   void      (*set)(const struct MItem *m, int32_t v);   // write global + apply live effect
 } MItem;
 // Stable key ids (append-only; mode rows use KID_MODE_BASE + MODE_* ordinal).
-enum { KID_BRIGHTNESS=1, KID_COLON=2, KID_ALT_COLON=3, KID_PAGE_MS=4,
-       KID_SIG_FADE=5, KID_PPS=6, KID_NMEA=7, KID_MODE_BASE=64 };
+enum { KID_BRIGHTNESS=1, KID_COLON=2, KID_COLON_ALT=3, KID_PAGE_MS=4,
+       KID_SIG_FADE=5, KID_PPS=6, KID_NMEA=7, KID_MATRIX_FREQ=8, KID_TEMPCOMP=9, KID_MODE_BASE=64 };
 
 void menu_isr_event(uint8_t evt);   // called from the USART2 ISR — enqueue only, no work
 void menu_poll(void);               // main-loop FSM tick
