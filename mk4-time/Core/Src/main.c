@@ -212,6 +212,10 @@ uint8_t displayMode = 0, countMode = 0, colonMode = 0;
 uint8_t colonModeCivil = 0;
 uint8_t colonModeAlt = COLON_MODE_ALT_SAWTOOTH;
 _Bool colonAltExplicit = 0;    // user explicitly set colon_alt_mode
+// §3.5 colon context-preview: while a colon-animation item is being EDITED, force the value under the
+// cursor onto the real colons regardless of the display context (so ALTCOLON is visible even from a
+// civil face). 0xFF = no preview -> applyColonForMode() uses the normal context choice.
+uint8_t colon_preview = 0xFF;
 uint8_t requestMode = 255;
 
 // ---- On-device menu FSM state (all thread-context except the ISR event ring) -------------------
@@ -1910,7 +1914,9 @@ void loadColonAnimation(void){
 // Select the colon animation for the current display mode (idempotent, thread context).
 // Alternate-timebase modes get their own animation so they read as "not civil" at a glance.
 void applyColonForMode(void){
-  uint8_t want = (displayMode == MODE_LST || displayMode == MODE_SOLAR)
+  uint8_t want = (colon_preview != 0xFF)                         // §3.5: an editor is previewing a choice
+               ? colon_preview
+               : (displayMode == MODE_LST || displayMode == MODE_SOLAR)
                ? colonModeAlt : colonModeCivil;
   if (want != colonMode) {
     colonMode = want;
@@ -4643,6 +4649,7 @@ static void menu_show(const char *s){
 static void menu_flash(const char *s){ menu_show(s); }   // transient; cleared by the next render
 static void menu_to_L0(void){
   menu_layer=L0_CLOCK; menu_chord=0; menu_stage=0; menu_banner=0; menu_run_dir=0; menu_run_len=0; menu_text[0]=0;
+  if (colon_preview != 0xFF){ colon_preview = 0xFF; applyColonForMode(); }  // §3.5: never leave a preview stuck if we idle/EXIT mid-edit
   // KEEP menu_section/menu_idx: SETUP re-entry resumes on the last section (and last item, §fire_stage).
   if (decisec!=9) sendDate(1); else menu_repaint=1;      // restore the normal date row
 }
@@ -4663,9 +4670,9 @@ static void menuSetMode(uint8_t m, _Bool on){
 static int32_t g_bright(const MItem*m){ (void)m; return (int32_t)config.brightness_override; }
 static void    s_bright(const MItem*m,int32_t v){ (void)m; config.brightness_override=(float)v; }
 static int32_t g_colon (const MItem*m){ (void)m; return colonModeCivil; }
-static void    s_colon (const MItem*m,int32_t v){ (void)m; colonModeCivil=(uint8_t)v; applyColonForMode(); }
+static void    s_colon (const MItem*m,int32_t v){ (void)m; colonModeCivil=(uint8_t)v; if(colon_preview!=0xFF)colon_preview=(uint8_t)v; applyColonForMode(); }
 static int32_t g_acolon(const MItem*m){ (void)m; return colonModeAlt; }
-static void    s_acolon(const MItem*m,int32_t v){ (void)m; colonModeAlt=(uint8_t)v; colonAltExplicit=1; applyColonForMode(); }
+static void    s_acolon(const MItem*m,int32_t v){ (void)m; colonModeAlt=(uint8_t)v; colonAltExplicit=1; if(colon_preview!=0xFF)colon_preview=(uint8_t)v; applyColonForMode(); }
 static int32_t g_page  (const MItem*m){ (void)m; return (int32_t)page_ms(); }   // EFFECTIVE (5500 default / 250 floor), not the raw-0 sentinel
 static void    s_page  (const MItem*m,int32_t v){ (void)m; config.page_ms=(uint16_t)v; }
 static int32_t g_sig   (const MItem*m){ (void)m; return significance_fade; }
@@ -4782,6 +4789,9 @@ static void menu_render_item(void){
 static void menu_enter_edit(void){
   const MItem *m=&menu_items[menu_idx];
   menu_orig = m->get(m); menu_val = menu_orig; menu_banner=0; menu_run_dir=0; menu_run_len=0;
+  if (m->key_id==KID_COLON || m->key_id==KID_COLON_ALT){        // §3.5: begin previewing the choice under the cursor
+    colon_preview = (uint8_t)menu_orig; applyColonForMode();
+  }
   menu_layer=L3_EDIT; menu_render_item();
 }
 // §3c: coarse-while-held, fine-on-single-tap. A same-direction run within ACCEL_GAP_MS grows the
@@ -4820,16 +4830,22 @@ static void menu_edit_step(int dir){
   if (now!=want && m->type==MIT_TOGGLE){ menu_val=now; menu_flash("LASt"); return; }  // refused (LASt)
   menu_val=now; menu_render_item();
 }
+// §3.5: leave colon-preview and repaint the colon the display context actually calls for.
+static void menu_colon_preview_end(void){
+  if (colon_preview != 0xFF){ colon_preview = 0xFF; applyColonForMode(); }
+}
 static void menu_cancel_edit(void){
   const MItem *m=&menu_items[menu_idx];
   m->set(m, menu_orig);                                            // restore pre-edit value
   if (m->key_id==KID_MATRIX_FREQ) setDisplayFreq(matrix_freq_hz);  // §4: force the last rate to the date board (set-hook throttles)
+  menu_colon_preview_end();                                        // §3.5: back to the context colon
   menu_layer=L2_ITEM; menu_render_item();
 }
 static void menu_commit_edit(void){
   const MItem *m=&menu_items[menu_idx];
   menu_record_key(m->key_id, menu_val);   // record for flash (value already applied live)
   if (m->key_id==KID_MATRIX_FREQ) setDisplayFreq(matrix_freq_hz);  // §4: authoritative final sync past the UART throttle
+  menu_colon_preview_end();                                        // §3.5: back to the context colon
   menu_layer=L2_ITEM; menu_render_item();
 }
 
