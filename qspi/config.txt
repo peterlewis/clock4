@@ -171,17 +171,6 @@ MODE_GRID = disabled
 # Latitude / longitude in decimal degrees. Pages LAT -> LON (see page_ms).
 MODE_LATLON = disabled
 
-# Observing twilight ladder. Pages a live countdown to astronomical darkness, then
-# civil / nautical / astronomical dusk and the dawn that ends it (see page_ms):
-# "DARK 02.14" -> "CIV  21.56" -> "NAU  22.57" -> "AST  23.41" -> "End  05.59".
-# Where the sun never reaches -18 deg the astronomical pages read "----" and the
-# headline reads NO DARK; inside a polar night it reads DARK NOW.
-MODE_DARK = disabled
-
-# Dwell per sub-screen for the paged modes (MODE_SUN, MODE_LATLON, MODE_DARK), in ms.
-# Default 5500 (a subjectively-tuned cadence, found by feel); floored at 250.
-page_ms = 5500
-
 # Bright-star meridian-transit predictor. Paged countdowns to the soonest bright stars crossing
 # your local meridian (culminating), e.g. "SIR  0:45" = Sirius transits in 45 min. Needs a position
 # (GPS fix or fake_longitude); shows "STAr ----" without one. J2000 catalogue precessed to date.
@@ -193,14 +182,14 @@ MODE_STAR = disabled
 #star_max_mag = 1.5
 
 # Local Sidereal Time as a LIVE TICKING CLOCK on the time row (big digits). The date row
-# keeps the civil date, and the colons animate differently (colon_alt_mode below) so it
-# can never be mistaken for civil time. Sidereal runs 1.00273791x faster than civil, so the
-# seconds display double-steps about once every 6 minutes -- real sidereal behaviour, not a
-# glitch. Needs a position (GPS fix or fake_longitude); shows dashes without one.
+# keeps the civil date, and the colons animate differently (alt_colon_mode below) so
+# it can never be mistaken for civil time. Sidereal runs 1.00273791x faster than civil, so
+# the seconds display double-steps about once every 6 minutes — real sidereal behaviour,
+# not a glitch. Needs a position (GPS fix or fake_longitude); shows dashes without one.
 MODE_LST = disabled
 
-# Apparent solar time on the time row -- what a sundial reads: UTC shifted by
-# your longitude plus the equation of time. Reads exactly 12:00:00 at local solar noon.
+# Apparent solar time on the time row — what a sundial reads: UTC shifted by your
+# longitude plus the equation of time. Reads exactly 12:00:00 at local solar noon.
 MODE_SOLAR = disabled
 
 # Live Allan deviation of the FREE-RUNNING crystal (its true stability, undisciplined). Pages
@@ -210,17 +199,23 @@ MODE_SOLAR = disabled
 # (Companion serial command: "adev_dump = on" prints the whole curve as $PMADEV.)
 MODE_ADEV = disabled
 
-# Colon animation while MODE_LST / MODE_SOLAR is shown, so the alternate timebase is
-# unmistakable at a glance -- solar especially, which can sit within minutes of civil.
-# Same names as colon_mode; automatically kept different from your civil colon unless you
-# explicitly set them equal here. One of: slowfade, heartbeat, sawtooth, alt_sawtooth,
-# toggle, solid
-#colon_alt_mode = alt_sawtooth
+# Colon animation while an alternate-timebase mode (MODE_LST / MODE_SOLAR) is shown, so
+# it can never be mistaken for civil time at a glance — solar especially, which can sit
+# within minutes of civil. Same names as colon_mode; automatically kept different from
+# your civil colon unless you explicitly set them equal here. Leave commented to keep the
+# automatic distinctness guarantee (an explicit value disables the auto-demotion).
+# One of: slowfade, heartbeat, sawtooth, alt_sawtooth, toggle, solid
+#alt_colon_mode = alt_sawtooth
+
+# Dwell per sub-screen for the paged modes (MODE_SUN, MODE_LATLON, MODE_TEMPCOMP, MODE_ADEV,
+# MODE_STAR), in ms. Default 5500 (a subjectively-tuned cadence, found by feel); floored at 250.
+page_ms = 5500
 
 # Fixed position for the astro modes when there is no GPS fix (decimal degrees, N+/E+).
 # Note: setting these also pins the clock's position (GPS position updates are ignored).
 #fake_latitude  = 51.48
 #fake_longitude = -0.01
+
 
 ## display balance
 
@@ -232,9 +227,4 @@ MODE_ADEV = disabled
 # otherwise stay bright as the digits dim down). "on"/1 = the auto curve; a number 2..256 pins a
 # fixed scale of 256. Leave off until the digit brightness levels are dialled in, then switch on.
 #colon_balance = on
-# Per-hardware anchors for the AUTO colon curve above (ignored when colon_balance is off or
-# pinned to a fixed number). colon_full_at is the brightness DAC value at and below which the
-# colons run at full scale; colon_floor is the scale, out of 256, they fall to at the dimmest
-# rail (DAC 4095). Defaults 2048 and 20; values are clamped to 0..4000 and 0..256.
-#colon_full_at = 2048
-#colon_floor   = 20
+
