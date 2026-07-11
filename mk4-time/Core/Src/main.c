@@ -227,7 +227,6 @@ static uint8_t   menu_idx     = 0;      // L2 cursor into menu_items[] (ABSOLUTE
 static int32_t   menu_val     = 0;      // L3 working value (already live via set-hook)
 static uint8_t   menu_chord   = 0;      // a chord gesture is in progress (>=1 stage seen)
 static uint8_t   menu_stage   = 0;      // 0..3 self-labeled chord stage currently shown
-static _Bool     menu_banner  = 0;      // L2: show the section name once on ENTER (sticky breadcrumb)
 static uint32_t  menu_last_ms = 0;      // uwTick of the last event (drives 15 s idle)
 static char      menu_text[11]= {0};    // non-empty => the menu OWNS the date row (see sendDate)
 static _Bool     menu_repaint = 0;      // a repaint was deferred out of the SysTick sendDate window
@@ -4648,7 +4647,7 @@ static void menu_show(const char *s){
 }
 static void menu_flash(const char *s){ menu_show(s); }   // transient; cleared by the next render
 static void menu_to_L0(void){
-  menu_layer=L0_CLOCK; menu_chord=0; menu_stage=0; menu_banner=0; menu_run_dir=0; menu_run_len=0; menu_text[0]=0;
+  menu_layer=L0_CLOCK; menu_chord=0; menu_stage=0; menu_run_dir=0; menu_run_len=0; menu_text[0]=0;
   if (colon_preview != 0xFF){ colon_preview = 0xFF; applyColonForMode(); }  // §3.5: never leave a preview stuck if we idle/EXIT mid-edit
   // KEEP menu_section/menu_idx: SETUP re-entry resumes on the last section (and last item, §fire_stage).
   if (decisec!=9) sendDate(1); else menu_repaint=1;      // restore the normal date row
@@ -4765,7 +4764,6 @@ static void menu_render_item(void){
   const MItem *m=&menu_items[menu_idx];
   char buf[20];
   if (menu_layer==L2_ITEM){
-    if (menu_banner){ menu_show(sect_name[menu_section]); return; }           // sticky breadcrumb until 1st tap/edit
     // §3b never hide a NUMBER: STEP items get a compact unit form + label-trim (the value is the point).
     // ENUM/TOGGLE keep the LABEL recognisable (you scroll by label) — truncate the value, or label-only.
     char val[10]; int32_t v = m->get(m);
@@ -4794,7 +4792,7 @@ static void menu_render_item(void){
 // ---- L2 value editor (live-preview on the real digits) ----
 static void menu_enter_edit(void){
   const MItem *m=&menu_items[menu_idx];
-  menu_orig = m->get(m); menu_val = menu_orig; menu_banner=0; menu_run_dir=0; menu_run_len=0;
+  menu_orig = m->get(m); menu_val = menu_orig; menu_run_dir=0; menu_run_len=0;
   if (m->key_id==KID_COLON || m->key_id==KID_COLON_ALT){        // §3.5: begin previewing the choice under the cursor
     colon_preview = (uint8_t)menu_orig; applyColonForMode();
   }
@@ -4875,10 +4873,10 @@ static void menu_fire_stage(void){
   } else if (menu_layer==L1_SECTION){
     if (menu_stage==1){                                                // ENTER -> item ring of this section
       if (menu_items[menu_idx].section != menu_section) menu_idx = menu_first_in_section(menu_section);
-      menu_banner=1; menu_layer=L2_ITEM; menu_render_item();           // (resumes last item if still in-section)
+      menu_layer=L2_ITEM; menu_render_item();     // land directly on the first item (resumes last item if still in-section) — no separate section banner
     } else if (menu_stage==2) menu_to_L0();                            // EXIT -> clock
   } else if (menu_layer==L2_ITEM){
-    if (menu_stage==1) menu_enter_edit();                              // EDIT
+    if (menu_stage==1) menu_enter_edit();                              // EDIT (item is always visible now — no banner to reveal first)
     else if (menu_stage==2){ menu_layer=L1_SECTION; menu_render_item(); } // BACK -> section ring
   } else { /* L3_EDIT */
     if (menu_stage==1) menu_commit_edit();                             // SAVE
@@ -4900,7 +4898,6 @@ static void menu_dispatch(uint8_t e){
     else if (e==EVT_BTN2) menu_section=(uint8_t)((menu_section+NSEC-1)%NSEC);
     menu_render_item();
   } else if (menu_layer==L2_ITEM){
-    if (menu_banner){ menu_banner=0; menu_render_item(); return; }     // first tap dismisses the breadcrumb, reveals the item
     if (e==EVT_BTN1) menu_idx=menu_step_in_section(menu_idx,+1);
     else if (e==EVT_BTN2) menu_idx=menu_step_in_section(menu_idx,-1);
     menu_render_item();
