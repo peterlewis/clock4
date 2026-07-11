@@ -204,12 +204,15 @@ _Bool colonAltExplicit = 0;    // user explicitly set alt_colon_mode
 uint8_t requestMode = 255;
 
 // ---- On-device menu FSM state (all thread-context except the ISR event ring) -------------------
-typedef enum { L0_CLOCK=0, L1_RING, L2_EDIT } MenuLayer;
+// v2 four layers: CLOCK -> SECTION ring -> ITEM ring (within a section) -> value EDITor.
+typedef enum { L0_CLOCK=0, L1_SECTION, L2_ITEM, L3_EDIT } MenuLayer;
 static MenuLayer menu_layer   = L0_CLOCK;
-static uint8_t   menu_idx     = 0;      // L1 cursor into menu_items[]
-static int32_t   menu_val     = 0;      // L2 working value (already live via set-hook)
+static uint8_t   menu_section = 0;      // L1/L2 current section (SEC_*); preserved across exits (resume)
+static uint8_t   menu_idx     = 0;      // L2 cursor into menu_items[] (ABSOLUTE index; walk by .section)
+static int32_t   menu_val     = 0;      // L3 working value (already live via set-hook)
 static uint8_t   menu_chord   = 0;      // a chord gesture is in progress (>=1 stage seen)
 static uint8_t   menu_stage   = 0;      // 0..3 self-labeled chord stage currently shown
+static _Bool     menu_banner  = 0;      // L2: show the section name once on ENTER (sticky breadcrumb)
 static uint32_t  menu_last_ms = 0;      // uwTick of the last event (drives 15 s idle)
 static char      menu_text[11]= {0};    // non-empty => the menu OWNS the date row (see sendDate)
 static _Bool     menu_repaint = 0;      // a repaint was deferred out of the SysTick sendDate window
@@ -4251,7 +4254,8 @@ static void menu_show(const char *s){
 }
 static void menu_flash(const char *s){ menu_show(s); }   // transient; cleared by the next render
 static void menu_to_L0(void){
-  menu_layer=L0_CLOCK; menu_chord=0; menu_stage=0; menu_text[0]=0;
+  menu_layer=L0_CLOCK; menu_chord=0; menu_stage=0; menu_banner=0; menu_text[0]=0;
+  // KEEP menu_section/menu_idx: SETUP re-entry resumes on the last section (and last item, §fire_stage).
   if (decisec!=9) sendDate(1); else menu_repaint=1;      // restore the normal date row
 }
 
@@ -4322,22 +4326,37 @@ static void menu_fmt_val(const MItem*m, int32_t v, char*out){   // out must hold
   if (m->type==MIT_TOGGLE) { strcpy(out, v?"ON":"OFF"); return; }
   snprintf(out,10,"%ld",(long)v);
 }
+// ---- section walk (physical table order UNCHANGED; step over rows in the current section) ----
+static uint8_t menu_first_in_section(uint8_t sec){
+  for (uint8_t i=0;i<MENU_N;i++) if (menu_items[i].section==sec) return i;
+  return 0;   // every section is compile-time non-empty; 0 is a safe fallback
+}
+static uint8_t menu_step_in_section(uint8_t from, int dir){
+  uint8_t i=from;
+  for (uint8_t k=0;k<MENU_N;k++){                       // bounded; wraps within the whole table
+    i=(uint8_t)((i + (dir>0 ? 1u : (unsigned)(MENU_N-1))) % MENU_N);
+    if (menu_items[i].section==menu_section) return i;
+  }
+  return from;                                          // lone item in section -> stay put
+}
 static void menu_render_item(void){
+  if (menu_layer==L1_SECTION){ menu_show(sect_name[menu_section]); return; }  // section ring == breadcrumb
   const MItem *m=&menu_items[menu_idx];
   char buf[20];
-  if (menu_layer==L1_RING){
+  if (menu_layer==L2_ITEM){
+    if (menu_banner){ menu_show(sect_name[menu_section]); return; }           // sticky breadcrumb until 1st tap/edit
     char val[10]; menu_fmt_val(m, m->get(m), val);
     if (snprintf(buf,sizeof buf,"%s %s",m->label,val) > 10) snprintf(buf,sizeof buf,"%s",m->label);
-  } else {                       // L2_EDIT: show the value being scrubbed
-    menu_fmt_val(m, menu_val, buf);
+    menu_show(buf);
+  } else {                       // L3_EDIT: show the value being scrubbed
+    menu_fmt_val(m, menu_val, buf); menu_show(buf);
   }
-  menu_show(buf);
 }
 
 // ---- L2 value editor (live-preview on the real digits) ----
 static void menu_enter_edit(void){
   const MItem *m=&menu_items[menu_idx];
-  menu_orig = m->get(m); menu_val = menu_orig; menu_layer=L2_EDIT; menu_render_item();
+  menu_orig = m->get(m); menu_val = menu_orig; menu_banner=0; menu_layer=L3_EDIT; menu_render_item();
 }
 static void menu_edit_step(int dir){
   const MItem *m=&menu_items[menu_idx];
@@ -4352,34 +4371,42 @@ static void menu_edit_step(int dir){
 }
 static void menu_cancel_edit(void){
   const MItem *m=&menu_items[menu_idx];
-  m->set(m, menu_orig); menu_layer=L1_RING; menu_render_item();     // restore pre-edit value
+  m->set(m, menu_orig); menu_layer=L2_ITEM; menu_render_item();     // restore pre-edit value
 }
 static void menu_commit_edit(void){
   const MItem *m=&menu_items[menu_idx];
   menu_record_key(m->key_id, menu_val);   // record for flash (value already applied live)
-  menu_layer=L1_RING; menu_render_item();
+  menu_layer=L2_ITEM; menu_render_item();
 }
 
 // ---- rolling self-labeled chord stages (read the label, release on the one you want) ----
-static const char *const chord_L0[4] = { "", "SETUP",  "",       "RESET"  };
-static const char *const chord_L1[4] = { "", "EDIT",   "BACK",   ""       };
-static const char *const chord_L2[4] = { "", "SAVE",   "CANCEL", ""       };
+static const char *const chord_L0[4]    = { "", "SETUP", "",       "RESET" };
+static const char *const chord_L1sec[4] = { "", "ENTER", "EXIT",   ""      };  // L1_SECTION
+static const char *const chord_L2itm[4] = { "", "EDIT",  "BACK",   ""      };  // L2_ITEM
+static const char *const chord_L3edt[4] = { "", "SAVE",  "CANCEL", ""      };  // L3_EDIT
 static void menu_show_stage(void){
-  const char *const *t = (menu_layer==L0_CLOCK)?chord_L0:(menu_layer==L1_RING)?chord_L1:chord_L2;
+  const char *const *t = (menu_layer==L0_CLOCK)   ? chord_L0
+                       : (menu_layer==L1_SECTION) ? chord_L1sec
+                       : (menu_layer==L2_ITEM)    ? chord_L2itm : chord_L3edt;
   const char *s = (menu_stage<=3)? t[menu_stage] : "";
   menu_show(s[0]? s : "----");
 }
 static void menu_fire_stage(void){
   if (!menu_chord) return;
   if (menu_layer==L0_CLOCK){
-    if (menu_stage==1){ menu_layer=L1_RING; menu_idx=0; menu_render_item(); }
-    else if (menu_stage>=3){ buttonsBothHeld(); }        // deepest labeled hold = reset
-  } else if (menu_layer==L1_RING){
-    if (menu_stage==1) menu_enter_edit();
-    else if (menu_stage==2) menu_to_L0();                // BACK
-  } else { /* L2 */
-    if (menu_stage==1) menu_commit_edit();               // SAVE (records the override; value already live)
-    else if (menu_stage==2) menu_cancel_edit();          // CANCEL (restore)
+    if (menu_stage==1){ menu_layer=L1_SECTION; menu_render_item(); }   // SETUP -> section ring (resumes menu_section)
+    else if (menu_stage>=3){ buttonsBothHeld(); }                      // deepest labeled hold = reset (L0 ONLY)
+  } else if (menu_layer==L1_SECTION){
+    if (menu_stage==1){                                                // ENTER -> item ring of this section
+      if (menu_items[menu_idx].section != menu_section) menu_idx = menu_first_in_section(menu_section);
+      menu_banner=1; menu_layer=L2_ITEM; menu_render_item();           // (resumes last item if still in-section)
+    } else if (menu_stage==2) menu_to_L0();                            // EXIT -> clock
+  } else if (menu_layer==L2_ITEM){
+    if (menu_stage==1) menu_enter_edit();                              // EDIT
+    else if (menu_stage==2){ menu_layer=L1_SECTION; menu_render_item(); } // BACK -> section ring
+  } else { /* L3_EDIT */
+    if (menu_stage==1) menu_commit_edit();                             // SAVE
+    else if (menu_stage==2) menu_cancel_edit();                        // CANCEL
   }
   menu_chord=0; menu_stage=0;
 }
@@ -4392,11 +4419,16 @@ static void menu_dispatch(uint8_t e){
   }
   if (menu_layer==L0_CLOCK){
     if (e==EVT_BTN1) button1pressed(); else if (e==EVT_BTN2) button2pressed();
-  } else if (menu_layer==L1_RING){
-    if (e==EVT_BTN1) menu_idx=(uint8_t)((menu_idx+1)%MENU_N);
-    else if (e==EVT_BTN2) menu_idx=(uint8_t)((menu_idx+MENU_N-1)%MENU_N);
+  } else if (menu_layer==L1_SECTION){
+    if (e==EVT_BTN1) menu_section=(uint8_t)((menu_section+1)%NSEC);
+    else if (e==EVT_BTN2) menu_section=(uint8_t)((menu_section+NSEC-1)%NSEC);
     menu_render_item();
-  } else { /* L2 */
+  } else if (menu_layer==L2_ITEM){
+    if (menu_banner){ menu_banner=0; menu_render_item(); return; }     // first tap dismisses the breadcrumb, reveals the item
+    if (e==EVT_BTN1) menu_idx=menu_step_in_section(menu_idx,+1);
+    else if (e==EVT_BTN2) menu_idx=menu_step_in_section(menu_idx,-1);
+    menu_render_item();
+  } else { /* L3_EDIT */
     if (e==EVT_BTN1) menu_edit_step(+1); else if (e==EVT_BTN2) menu_edit_step(-1);
   }
 }
