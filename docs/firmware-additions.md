@@ -263,7 +263,7 @@ tc_rtc = on
 temperature-driven *change* since the moment GPS was lost, so it engages glitch-free at zero and
 grows only as the temperature moves. `tc_rtc` additionally trims the battery RTC's calibration
 register from the model while GPS is absent, so the RTC hands over better time across a power loss.
-The menu's DIAG > TEMPCOMP toggle arms `tc_learn` and `tc_apply` as a pair.
+The menu's DIAG > TEMPCOMP toggle arms `tc_learn`, `tc_apply` and `tc_persist` together — switch the compensator on from the front panel and its learned model persists across power-off.
 
 ```
 tc_t0 = 40

@@ -256,7 +256,7 @@ static struct {
   int16_t  brightness; uint8_t colon, alt_colon; uint16_t page_ms;
   uint8_t  sig_fade, pps, nmea;
   uint32_t matrix_freq;                // KID_MATRIX_FREQ (u32: 100000 > u16)
-  uint8_t  tc;                         // KID_TEMPCOMP: 1 = learn+apply armed
+  uint8_t  tc;                         // KID_TEMPCOMP: 1 = learn+apply+persist armed
   uint8_t  bal;                        // KID_BALANCE: 1 = seg+colon balance AUTO
   uint32_t modes_mask, modes_val;      // bit per MODE_* ordinal
 } ovr;
@@ -2212,6 +2212,7 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     if (!from_serial) cfg_tc_defined |= CFG_TC_HI;
   } else if (strcasecmp(key, "tc_persist") == 0) {
     tc_persist = truthy(value);       // opt-in: auto-save the learned model to its retained flash store
+    if (!from_serial) cfg_simple_defined |= (1u<<KID_TEMPCOMP);   // menu TEMPCOMP bundles this too — a file that defines it wins
   } else if (strcasecmp(key, "tc_forget") == 0) {
     if (from_serial && truthy(value)) tc_forget_pending = 1;   // serial-only: erase the retained model (keeps live learning)
   } else if (strcasecmp(key, "tc_dump") == 0) {
@@ -4820,7 +4821,7 @@ void menu_apply_overrides(void){
   OVR_S(KID_PPS,        pps_ts_enabled=ovr.pps)
   OVR_S(KID_NMEA,       nmea_cdc_level=ovr.nmea)
   OVR_S(KID_MATRIX_FREQ,setDisplayFreq(ovr.matrix_freq))   // clamping setter (never ARR-direct) -> a bad stored value can't brick
-  OVR_S(KID_TEMPCOMP,   tc_learn=tc_apply=ovr.tc?1:0)
+  OVR_S(KID_TEMPCOMP,   tc_learn=tc_apply=tc_persist=ovr.tc?1:0)
   OVR_S(KID_BALANCE,    { if(ovr.bal){ if(!seg_balance)seg_balance=1; if(!colon_balance)colon_balance=1; } else seg_balance=colon_balance=0; colonForce=1; })  // config parse ran first: a stored "on" must not clobber a manual strength
   #undef OVR_S
   for (uint8_t m=0;m<NUM_DISPLAY_MODES;m++)
@@ -4955,7 +4956,7 @@ static void    s_matrix(const MItem*m,int32_t v){   // §4 live-preview: ARR eve
 // temp while GPS-locked) AND apply (steer SysTick from the model during GPS-loss holdover). config.txt
 // still exposes tc_learn / tc_apply separately for asymmetric setups; the menu treats them as a pair.
 static int32_t g_tc    (const MItem*m){ (void)m; return (tc_learn && tc_apply) ? 1 : 0; }
-static void    s_tc    (const MItem*m,int32_t v){ (void)m; tc_learn = tc_apply = v?1:0; }
+static void    s_tc    (const MItem*m,int32_t v){ (void)m; tc_learn = tc_apply = tc_persist = v?1:0; }   // the WHOLE compensator: learn + steer + persist the model
 // BALANCE: one DISP toggle arms BOTH brightness-uniformity systems at their baked AUTO curves —
 // per-segment duty equalisation (seg_balance) AND rail-tied colon dimming (colon_balance). config.txt
 // keeps the finer seg_balance / colon_balance keys (incl. manual strengths) for calibration.
@@ -4991,7 +4992,7 @@ static const MItem menu_items[] = {
   { KID_NMEA,       MIT_ENUM,  "NMEA",     0,2,1,      en_nmea,  g_nmea,   s_nmea,   SEC_SYS  },
   { KID_MATRIX_FREQ,MIT_STEP,  "MATRIX",   8000,100000,1000,NULL,g_matrix, s_matrix, SEC_SYS  },   // menu floor 8000 (flicker); config MATRIX_FREQUENCY reaches the 1000 hw floor
   { KID_RESET,      MIT_ACTION,"RESET",    0,0,0,       NULL,     g_reset,  s_reset,  SEC_SYS  },   // factory-reset the on-device settings (confirm required)
-  { KID_TEMPCOMP,   MIT_TOGGLE,"TEMPCOMP", 0,1,1,      NULL,     g_tc,     s_tc,     SEC_DIAG },   // arms learn+apply; the TC VIEW mode below just displays the model
+  { KID_TEMPCOMP,   MIT_TOGGLE,"TEMPCOMP", 0,1,1,      NULL,     g_tc,     s_tc,     SEC_DIAG },   // arms learn+apply+persist; the TC DATA mode below just displays the model
   MODE_ROW(MODE_ISO8601_STD,SEC_CAL,"ISO 8601"), MODE_ROW(MODE_ISO_ORDINAL,SEC_CAL,"ISO ORD"),
   MODE_ROW(MODE_ISO_WEEK,SEC_CAL,"ISO WEEK"),     MODE_ROW(MODE_UNIX,SEC_CAL,"UNIX"),
   MODE_ROW(MODE_JULIAN_DATE,SEC_CAL,"JULIAN"),    MODE_ROW(MODE_MODIFIED_JD,SEC_CAL,"MOD JD"),
