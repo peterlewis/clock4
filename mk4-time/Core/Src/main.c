@@ -494,7 +494,7 @@ static const struct { char nm[4]; float ra; float dec; } star_cat_default[] = {
 #define STAR_MAX   128u            // RAM cap on the loaded catalogue (the SD file is clamped to this)
 #define STAR_SHOW  8u              // cache the soonest 8 upcoming transits
 #define STAR_SIDSEC_PER_HR 3590.1704   // solar seconds the meridian takes to sweep one hour of RA
-typedef struct { char nm[4]; uint32_t epoch; int8_t alt; } star_entry_t;
+typedef struct { char nm[4]; uint32_t epoch; int8_t alt; char dir; } star_entry_t;   // dir: culminates due (S)outh / (N)orth
 static star_entry_t star_cache[STAR_SHOW];
 static volatile uint8_t star_ncache;
 
@@ -603,18 +603,21 @@ static void star_update(void){
   // Single pass: keep the soonest STAR_SHOW visible stars in a small array sorted ascending by
   // sidereal-hours-to-transit. No per-star scratch (star_count can be the whole SD catalogue), so the
   // stack stays bounded regardless of catalogue size.
-  struct { float dt; int8_t alt; char nm[4]; } top[STAR_SHOW]; uint8_t n = 0;
+  struct { float dt; int8_t alt; char nm[4]; char dir; } top[STAR_SHOW]; uint8_t n = 0;
   for (uint16_t s = 0; s < star_count; s++) {
     double a_now = (double)star_buf[s].ra_now, d_now = (double)star_buf[s].dec_now;  // apparent of date (cached)
-    double alt = 90.0 - fabs((double)lat - d_now);                         // upper-transit altitude
-    if (alt <= 0.0) continue;                                             // never clears the horizon
+    double diff = (double)lat - d_now;                                     // sign = which horizon it culminates over
+    double alt = 90.0 - fabs(diff);                                        // upper-transit altitude (geometric)
+    if (alt <= -0.57) continue;                                            // horizon gate WITH refraction: ~34' lifts a grazer into view
     double dt = fmod(a_now - lst, 24.0); if (dt < 0.0) dt += 24.0;         // sidereal hours to transit
     float dtf = (float)dt;
     if (n < STAR_SHOW || dtf < top[n-1].dt) {                             // insertion-sort into the top-N
       uint8_t pos = (n < STAR_SHOW) ? n : (uint8_t)(STAR_SHOW - 1);
       if (n < STAR_SHOW) n++;
       while (pos > 0 && top[pos-1].dt > dtf) { top[pos] = top[pos-1]; pos--; }
-      top[pos].dt = dtf; top[pos].alt = (int8_t)(alt + 0.5); memcpy(top[pos].nm, star_buf[s].nm, 4);
+      top[pos].dt = dtf; memcpy(top[pos].nm, star_buf[s].nm, 4);
+      top[pos].alt = (int8_t)(alt >= 0.0 ? alt + 0.5 : 0.0);              // refraction-band grazers read alt 0
+      top[pos].dir = (diff >= 0.0) ? 'S' : 'N';                           // dec below latitude -> due south, else due north
     }
   }
   __disable_irq();
@@ -622,6 +625,7 @@ static void star_update(void){
     memcpy(star_cache[i].nm, top[i].nm, 4);
     star_cache[i].epoch = (uint32_t)currentTime + (uint32_t)((double)top[i].dt * STAR_SIDSEC_PER_HR + 0.5);
     star_cache[i].alt = top[i].alt;
+    star_cache[i].dir = top[i].dir;
   }
   star_ncache = n;
   __enable_irq();
@@ -839,6 +843,19 @@ void sendDate( _Bool now ){
     // down to culmination. The countdown ticks every second (recomputed here from the cached transit
     // epoch); star_update() re-sorts the list in the main loop. "STAr ----" with no GPS fix.
     if (star_ncache == 0) { i = sprintf((char*)&uart2_tx_buffer[1], "STAr ----"); break; }
+    // The payoff moment: when the soonest star reaches culmination, latch its name and hold a "NOW"
+    // tell for 8 s — otherwise the next star_update() re-sort rolls it off the list the second it
+    // happens and the event is invisible.
+    static char     star_now_nm[4];
+    static uint32_t star_now_until;
+    if ((long)star_cache[0].epoch - (long)currentTime <= 1L){
+      memcpy(star_now_nm, star_cache[0].nm, 4);
+      star_now_until = (uint32_t)currentTime + 8u;
+    }
+    if (star_now_until && (uint32_t)currentTime < star_now_until){
+      i = sprintf((char*)&uart2_tx_buffer[1], "%-4.4s  NOW", star_now_nm);
+      break;
+    }
     uint32_t p = (uwTick / page_ms()) % star_ncache;
     long rem = (long)star_cache[p].epoch - (long)currentTime;   // seconds to transit
     if (rem < 0) rem = 0;
@@ -3299,20 +3316,20 @@ static void hdev_dump_step(void){
 static void star_dump_step(void){
   static int      dn = -1;
   static uint16_t busy_ct = 0;
-  static char     dline[NMEA_BUF_SIZE];
+  static char     dline[192];   // 8 entries x ",NAME,SSSSS,AA,D" + header outgrow NMEA_BUF_SIZE
   if (!star_dump_pending) return;
   if (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED) { star_dump_pending = 0; dn = -1; return; }
 
   if (dn < 0) {
     star_update();                             // fresh transit list (never in an ISR)
     uint8_t n = star_ncache;
-    char body[132];
+    char body[176];
     int nb = snprintf(body, sizeof body, "PMSTAR,%u,%c", (unsigned)n, star_from_card ? 'C' : 'B');  // provenance: Card / Baked-fallback
     if (nb < 0 || nb >= (int)sizeof body) { star_dump_pending = 0; return; }
     for (uint8_t k = 0; k < n; k++) {
       long rem = (long)star_cache[k].epoch - (long)currentTime; if (rem < 0) rem = 0;
-      int t = snprintf(body + nb, sizeof body - nb, ",%.4s,%ld,%d",
-                       star_cache[k].nm, rem, (int)star_cache[k].alt);
+      int t = snprintf(body + nb, sizeof body - nb, ",%.4s,%ld,%d,%c",
+                       star_cache[k].nm, rem, (int)star_cache[k].alt, star_cache[k].dir);
       if (t < 0 || t >= (int)(sizeof body - nb)) { star_dump_pending = 0; return; }
       nb += t;
     }
