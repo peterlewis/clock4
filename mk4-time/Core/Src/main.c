@@ -1525,21 +1525,25 @@ void applyColonForMode(void){
   }
 }
 
-// AUTO colon scale vs rail (dac_target 0 = brightest .. 4095 = dimmest): full at the bright end,
-// tapering to a dim floor so the separators stay present but recessed. Sampled 0..4095 like
-// seg_balance; a physically-reasonable STARTING curve — refine by eye with a colon_balance sweep.
-static const uint16_t COLON_AUTO_DAC[9]   = {   0, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4095 };
-static const uint16_t COLON_AUTO_SCALE[9] = { 256, 233,  209,  184,  158,  129,   97,   60,   20 };
+// AUTO colon scale vs rail (dac_target 0 = brightest .. 4095 = dimmest). A full eyeballed sweep on a
+// production Mk IV (2026-07-11) landed a clean straight line: the colons want full animation scale at
+// the bright half of the rail and taper linearly to a dim floor at the darkest, so the separators stay
+// present but recessed while the digits blaze at low rail. Two anchors define it (both baked here and
+// overridable per-hardware from config.txt, exactly like the BS brightness curve):
+//   colon_full_at — the dac at/below which colons run at full scale (256). Default 2048 (mid rail).
+//   colon_floor   — the minimum scale, reached at the dimmest rail (dac 4095). Default 20.
+// The line runs from (colon_full_at, 256) toward (4095, 0), clamped at the top to 256 and the bottom to
+// colon_floor: scale = clamp( 256*(4095-dac) / (4095-colon_full_at), colon_floor, 256 ). With the
+// defaults this is ~ (4095-dac)/8 and passes through the measured points (dac 3276->102, 2867->153).
+volatile int32_t colon_full_at = 2048;   // baked default; config "colon_full_at = N" overrides
+volatile int32_t colon_floor   = 20;     // baked default; config "colon_floor = N" overrides
 static uint16_t colon_scale_for(int32_t d){
-  if (d <= COLON_AUTO_DAC[0]) return COLON_AUTO_SCALE[0];
-  for (uint32_t i = 1; i < 9; i++) {
-    if (d <= (int32_t)COLON_AUTO_DAC[i]) {
-      int32_t d0 = COLON_AUTO_DAC[i-1], d1 = COLON_AUTO_DAC[i];
-      int32_t s0 = COLON_AUTO_SCALE[i-1], s1 = COLON_AUTO_SCALE[i];
-      return (uint16_t)(s0 + (s1 - s0) * (d - d0) / (d1 - d0));
-    }
-  }
-  return COLON_AUTO_SCALE[8];
+  int32_t span = 4095 - colon_full_at; if (span < 1) span = 1;   // guard div-by-zero / inverted anchor
+  int32_t s = 256 * (4095 - d) / span;
+  if (s > 256) s = 256;
+  if (s < colon_floor) s = colon_floor;
+  if (s < 0) s = 0;
+  return (uint16_t)s;
 }
 // Re-mirror the colon scale into the animation buffer when the live rail (or the config) moves it.
 // Main-loop only (loadColonAnimation touches 400 samples); throttled so it reloads on real change.
@@ -1752,6 +1756,15 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     int v = truthy(value) ? 1 : (falsey(value) ? 0 : atoi(value));
     colon_balance = (uint16_t)(v < 0 ? 0 : (v > 256 ? 256 : v));
     colonForce = 1;                   // land an explicit sweep step even if within the hysteresis band
+  } else if (strcasecmp(key, "colon_full_at") == 0) {
+    // Per-hardware anchor: the dac (0..4095) at/below which AUTO colons run at full scale. Overrides
+    // the baked default. Kept below full-scale so 4095-colon_full_at stays a positive span.
+    int v = atoi(value); colon_full_at = v < 0 ? 0 : (v > 4000 ? 4000 : v);
+    colonForce = 1;
+  } else if (strcasecmp(key, "colon_floor") == 0) {
+    // Per-hardware anchor: the AUTO colon scale (of 256) at the dimmest rail. Overrides the baked default.
+    int v = atoi(value); colon_floor = v < 0 ? 0 : (v > 256 ? 256 : v);
+    colonForce = 1;
   } else if (strcasecmp(key, "tc_rtc") == 0) {
     tc_rtc = truthy(value);           // additionally trim RTC->CALR while GPS is absent
   } else if (strcasecmp(key, "tc_t0") == 0) {
