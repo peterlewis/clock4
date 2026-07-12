@@ -204,3 +204,14 @@ MODE_SOLAR = disabled
 # Note: setting these also pins the clock's position (GPS position updates are ignored).
 #fake_latitude  = 51.48
 #fake_longitude = -0.01
+
+## display balance
+
+# Equalise per-segment brightness by duty, so a "1" isn't brighter than an "8" (current sharing).
+# "on"/1 = the calibrated auto curve (recommended). A number 2..300 pins a fixed manual strength.
+#seg_balance = on
+
+# Dim the colons in step with the main display brightness (they are on their own PWM rail and
+# otherwise stay bright as the digits dim down). "on"/1 = the auto curve; a number 2..256 pins a
+# fixed scale of 256. Leave off until the digit brightness levels are dialled in, then switch on.
+#colon_balance = on

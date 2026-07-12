@@ -1362,7 +1362,16 @@ void segbal_poll(void){
   uint32_t eff = (seg_balance && D) ? segbal_strength() : 0;
   segbal_forward(eff);                              // keep the date row in step (0 = identity/off)
 
-  if (!eff) {
+  // Gradual significance fade — the per-digit dimmer PR #9 anticipated. While any sub-second
+  // digit is mid-fade, run the mirror even with seg_balance off (identity duty) so digit_bright
+  // (0..FADE_MAX, recomputed each second from the live U(τ)) can scale each digit's cycles: the
+  // real display renders the partial fade the emulator always could. Columns c1/c2/c3 = ds/cs/ms;
+  // the decimal point (c0.high, cSegDP) follows digit_bright[3]. Big digits never fade.
+  uint32_t fading = significance_fade && D && countMode == COUNT_NORMAL &&
+                    (digit_bright[0] < FADE_MAX || digit_bright[1] < FADE_MAX ||
+                     digit_bright[2] < FADE_MAX || digit_bright[3] < FADE_MAX);
+
+  if (!eff && !fading) {
     if (display_scan_len != 5) setDisplayPWM(5);    // live-disable: back to the stock scan
     return;
   }
@@ -1385,14 +1394,30 @@ void segbal_poll(void){
     // duty on the 0..16 scale, rescaled to this depth (D=16 is exact; lit digits keep >= 1 cycle)
     uint32_t sb = (segbal_duty(nb, eff) * D + 8u) / 16u;  if (nb && !sb) sb = 1u;
     uint32_t sc = (segbal_duty(nc, eff) * D + 8u) / 16u;  if (nc && !sc) sc = 1u;
+    uint32_t sdp = sc;                                     // the DP rides its digit's cycles...
+    if (fading) {
+      if (col >= 1 && col <= 3) {                          // ds/cs/ms: scale by live significance
+        uint32_t f = digit_bright[col - 1];
+        sc = (sc * f + 8u) / 16u;
+        if (f && ml && !sc) sc = 1u;                       // mid-fade digits never fully dark...
+        if (!f) sc = 0u;                                   // ...but zero significance is zero
+        sdp = sc;
+      } else if (col == 0) {                               // ...except the seconds column's DP,
+        uint32_t f = digit_bright[3];                      // which fades with the 0.1 s digit
+        sdp = (sc * f + 8u) / 16u;
+        if (f && !sdp) sdp = 1u;
+        if (!f) sdp = 0u;
+      }
+    }
     uint16_t cat = mb & (uint16_t)~SEGBAL_BSEG_MASK;
     uint8_t  csel = mh & (uint8_t)~cSegDP;                 // GPIOC column select + enables
     for (uint32_t k = 1; k < D; k++) {
       uint32_t i = col + 5u*k;
-      uint32_t litc = ((k*sc) % D < sc);
+      uint32_t litc  = ((k*sc)  % D < sc);
+      uint32_t litdp = ((k*sdp) % D < sdp);
       buffer_b[i]      = ((k*sb) % D < sb) ? mb : cat;     // column select stays in every slot
-      buffer_c[i].low  = litc ? ml : 0;                    // the DP rides the SAME cycles as its
-      buffer_c[i].high = csel | (litc ? (mh & cSegDP) : 0);// digit — it is one of its segments
+      buffer_c[i].low  = litc ? ml : 0;
+      buffer_c[i].high = csel | (litdp ? (mh & cSegDP) : 0);
     }
   }
   if (display_scan_len != want_len) setDisplayPWM(want_len);   // extend to the D-cycle scan
