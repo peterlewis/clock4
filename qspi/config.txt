@@ -182,6 +182,12 @@ MODE_DARK = disabled
 # Default 5500 (a subjectively-tuned cadence, found by feel); floored at 250.
 page_ms = 5500
 
+# Bright-star meridian-transit predictor. Paged countdowns to the soonest bright stars crossing
+# your local meridian (culminating), e.g. "SIR  0:45" = Sirius transits in 45 min. Needs a position
+# (GPS fix or fake_longitude); shows "STAr ----" without one. J2000 catalogue precessed to date.
+# (Companion serial command: "star_dump = on" prints the whole list as $PMSTAR.)
+MODE_STAR = disabled
+
 # Local Sidereal Time as a LIVE TICKING CLOCK on the time row (big digits). The date row
 # keeps the civil date, and the colons animate differently (colon_alt_mode below) so it
 # can never be mistaken for civil time. Sidereal runs 1.00273791x faster than civil, so the
