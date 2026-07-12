@@ -1308,6 +1308,19 @@ static const uint8_t SEGBAL_REV16[16] = {0,8,4,12,2,10,6,14,1,9,5,13,3,11,7,15};
 static const uint8_t SEGBAL_PH_B[5] = {0, 4, 8, 12, 1};
 static const uint8_t SEGBAL_PH_C[5] = {5, 9, 13, 2, 6};
 
+// Mirror freshness across main-loop stalls. The sub-second MASTERS are written from the SysTick
+// ISR (SysTick_CountUp_*), so the stock 5-slot scan never lags the main loop — but the mirrors
+// carry (D-1)/D of the light when balancing, and a refill that lives only in the main loop goes
+// stale for the length of any long pass (the once-per-second PendSV display prep, housekeeping,
+// a flash commit): hardware showed the sub-second digits freezing once per second, present since
+// the first segbal ship and independent of the dither order. segbal_poll() therefore EXPORTS the
+// per-column lit-cycle bitmaps, and every SysTick tick re-copies the live master values through
+// them (segbal_isr_refresh), pinning mirror VALUE freshness to the same 1 ms the masters get.
+// The bitmaps may lag a main-loop pass behind a glyph change — a duty lag of one pass,
+// imperceptible where a frozen digit was not.
+static volatile uint16_t segbal_lit_b[5], segbal_lit_c[5], segbal_lit_dp[5];  // bit k = cycle k lit
+static volatile uint8_t  segbal_mirror_live = 0;   // ISR refresh armed (D-cycle scan up, bitmaps valid)
+
 // Lit cycles (of 16) for a digit with n lit segments at effective strength `eff` (0..300).
 // n <= 8 always (7 segments + DP). Returns 16 (always lit) .. 1 (floor for any lit digit).
 static uint32_t segbal_duty(uint32_t n, uint32_t eff){
@@ -1379,7 +1392,7 @@ static void segbal_forward(uint32_t eff){
 void segbal_poll(void){
   static uint16_t last_ms = 0xFFFF;
 
-  if (displayMode == MODE_STANDBY) return;          // display is off — never (re)start its DMA here
+  if (displayMode == MODE_STANDBY) { segbal_mirror_live = 0; return; }   // display is off — never (re)start its DMA here
 
   uint32_t D = segbal_depth();
   uint32_t eff = (seg_balance && D) ? segbal_strength() : 0;
@@ -1395,6 +1408,7 @@ void segbal_poll(void){
                      digit_bright[2] < FADE_MAX || digit_bright[3] < FADE_MAX);
 
   if (!eff && !fading) {
+    segbal_mirror_live = 0;                         // stop the ISR refresh before dropping the scan
     if (display_scan_len != 5) setDisplayPWM(5);    // live-disable: back to the stock scan
     return;
   }
@@ -1438,18 +1452,61 @@ void segbal_poll(void){
     uint32_t ring = D - 1u;                                // mirror ranks 1..D-1 rotate mod D-1
     uint32_t pb = SEGBAL_PH_B[col] % ring;
     uint32_t pc = SEGBAL_PH_C[col] % ring;
+    uint16_t bm_b = 1u, bm_c = 1u, bm_dp = 1u;             // cycle 0 = the master, always lit
     for (uint32_t k = 1; k < D; k++) {
       uint32_t i = col + 5u*k;
       uint32_t r = (uint32_t)(SEGBAL_REV16[k] >> revsh);   // 1..D-1 for k >= 1
       uint32_t rb = r - 1u + pb; if (rb >= ring) rb -= ring;
       uint32_t rc = r - 1u + pc; if (rc >= ring) rc -= ring;
-      buffer_b[i]      = (rb + 1u < sb) ? mb : cat;        // column select stays in every slot
-      buffer_c[i].low  = (rc + 1u < sc) ? ml : 0;
-      buffer_c[i].high = csel | ((rc + 1u < sdp) ? (mh & cSegDP) : 0);
+      uint32_t lb = (rb + 1u < sb), lc = (rc + 1u < sc), ldp = (rc + 1u < sdp);
+      bm_b |= (uint16_t)(lb << k); bm_c |= (uint16_t)(lc << k); bm_dp |= (uint16_t)(ldp << k);
+      buffer_b[i]      = lb ? mb : cat;                    // column select stays in every slot
+      buffer_c[i].low  = lc ? ml : 0;
+      buffer_c[i].high = csel | (ldp ? (mh & cSegDP) : 0);
     }
+    segbal_lit_b[col] = bm_b; segbal_lit_c[col] = bm_c; segbal_lit_dp[col] = bm_dp;
   }
   if (display_scan_len != want_len) setDisplayPWM(want_len);   // extend to the D-cycle scan
+  segbal_mirror_live = 1;                                  // bitmaps valid — arm the ISR refresh
 }
+
+// SysTick-side mirror refresh: re-copy the live master values through the exported bitmaps every
+// millisecond, so the mirrors can never go staler than the masters (see the bitmap block above).
+// Cost with D=16: 5 x 15 slot writes, ~10 us at 80 MHz — 1% of one SysTick period, only while
+// the D-cycle scan is up. Bitmaps and masters are each written whole (halfword stores), so the
+// worst race with the main-loop refill is one slot showing one frame of the other's value.
+void segbal_isr_refresh(void){
+  if (!segbal_mirror_live || display_scan_len <= 5) return;
+  uint32_t D = (uint32_t)display_scan_len / 5u;
+  for (uint32_t col = 0; col < 5; col++) {
+    uint16_t mb = buffer_b[col];
+    uint8_t  ml = buffer_c[col].low, mh = buffer_c[col].high;
+    uint16_t cat  = mb & (uint16_t)~SEGBAL_BSEG_MASK;
+    uint8_t  csel = mh & (uint8_t)~cSegDP;
+    uint16_t lb = segbal_lit_b[col], lc = segbal_lit_c[col], ldp = segbal_lit_dp[col];
+    for (uint32_t k = 1; k < D; k++) {
+      uint32_t i = col + 5u*k;
+      buffer_b[i]      = ((lb >> k) & 1u) ? mb : cat;
+      buffer_c[i].low  = ((lc >> k) & 1u) ? ml : 0;
+      buffer_c[i].high = csel | (((ldp >> k) & 1u) ? (mh & cSegDP) : 0);
+    }
+  }
+}
+
+// ---- $PMLOOP: main-loop latency diagnostic (`loop_diag = on` over serial or config) -----------
+// Once per second, emit the WORST gap (ms of uwTick) between consecutive profiler marks and the
+// tag of the section that produced it: $PMLOOP,<worst_ms>,<tag>. Marks bracket the main loop's
+// sections; PendSV stamps tag 15 when it preempts, so the once-per-second display prep shows up
+// under its own name. Emission is lossy on a busy USB endpoint by design (1 Hz diagnostic).
+// Tags: 1 menu . 2 balance/colon . 3 tz-lookup . 4 delayed-housekeeping . 5 vbus/temp .
+//       6 pps-emit/tempcomp/dumps . 7 vbat/astro . 8 mode-pages/star . 9 alt/loop-tail . 15 PendSV
+volatile uint8_t loop_diag = 0;
+volatile uint8_t pmloop_lasttag = 0;
+static uint32_t  pmloop_last = 0, pmloop_max = 0, pmloop_win = 0;
+static uint8_t   pmloop_maxtag = 0;
+#define LP_MARK(n) do { uint32_t t_ = uwTick, g_ = t_ - pmloop_last; \
+    if (g_ > pmloop_max) { pmloop_max = g_; pmloop_maxtag = pmloop_lasttag; } \
+    pmloop_last = t_; pmloop_lasttag = (n); } while (0)
 
 void setDisplayFreq(uint32_t freq){
   if (waitingForLatch) {
@@ -1847,6 +1904,8 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     // Serial-only trigger: print the learned model as paste-ready config lines. A stray
     // tc_dump left in config.txt must not fire on every (re)load, hence the origin guard.
     if (from_serial && truthy(value)) tc_dump_pending = 1;
+  } else if (strcasecmp(key, "loop_diag") == 0) {
+    loop_diag = truthy(value) ? 1 : 0;   // 1 Hz $PMLOOP main-loop latency diagnostic
   } else if (strcasecmp(key, "tc_reset") == 0) {
     if (from_serial && truthy(value)) tc_reset_pending = 1;   // serial-only, same guard
 
@@ -2907,7 +2966,7 @@ void SysTick_CountUp_P3(void)
   buffer_c[2].low=cLut[centisec];
   buffer_c[1].low=cLut[decisec];
 
-
+  segbal_isr_refresh();   // mirrors track the masters at ISR freshness (seg_balance)
 
   HAL_IncTick();
 
@@ -2928,6 +2987,8 @@ void SysTick_CountUp_P2(void) {
   buffer_c[2].low=cLut[centisec];
   buffer_c[1].low=cLut[decisec];
 
+  segbal_isr_refresh();
+
   HAL_IncTick();
 
   if (decisec==9 && centisec==0 && millisec==0){
@@ -2942,6 +3003,8 @@ void SysTick_CountUp_P1(void) {
 
   buffer_c[1].low=cLut[decisec];
 
+  segbal_isr_refresh();
+
   HAL_IncTick();
 
   if (decisec==9 && centisec==0 && millisec==0){
@@ -2954,6 +3017,8 @@ void SysTick_CountUp_P1(void) {
 void SysTick_CountUp_P0(void) {
 
   timetick()
+
+  segbal_isr_refresh();
 
   HAL_IncTick();
 
@@ -2981,6 +3046,8 @@ void SysTick_CountUp_NoUpdate(void) {
     }
   }
 
+  segbal_isr_refresh();   // masters are main-loop-drawn here (TEXT etc.) — keep mirrors no staler
+
   HAL_IncTick();
 
   if (decisec==9 && centisec==0 && millisec==0){
@@ -2999,6 +3066,7 @@ void SysTick_CountDown_P3(void)
   buffer_c[2].low=cLut[9-centisec];
   buffer_c[1].low=cLut[9-decisec];
 
+  segbal_isr_refresh();
 
   HAL_IncTick();
 
@@ -3017,6 +3085,7 @@ void SysTick_CountDown_P2(void)
   buffer_c[2].low=cLut[9-centisec];
   buffer_c[1].low=cLut[9-decisec];
 
+  segbal_isr_refresh();
 
   HAL_IncTick();
 
@@ -3035,6 +3104,7 @@ void SysTick_CountDown_P1(void)
   //buffer_c[2].low=cLut[9-centisec];
   buffer_c[1].low=cLut[9-decisec];
 
+  segbal_isr_refresh();
 
   HAL_IncTick();
 
@@ -3054,6 +3124,8 @@ void SysTick_CountDown_P0(void)
   //buffer_c[3].low=cLut[9-millisec];
   //buffer_c[2].low=cLut[9-centisec];
   //buffer_c[1].low=cLut[9-decisec];
+
+  segbal_isr_refresh();
 
   HAL_IncTick();
 
@@ -3075,6 +3147,8 @@ void SysTick_Alt_P3(void)
   buffer_c[2].low=cLut[centisec];
   buffer_c[1].low=cLut[decisec];
 
+  segbal_isr_refresh();
+
   HAL_IncTick();
 
   if (decisec==9 && centisec==0 && millisec==0){
@@ -3088,6 +3162,8 @@ void SysTick_Alt_P2(void) {
   buffer_c[2].low=cLut[centisec];
   buffer_c[1].low=cLut[decisec];
 
+  segbal_isr_refresh();
+
   HAL_IncTick();
 
   if (decisec==9 && centisec==0 && millisec==0){
@@ -3100,6 +3176,8 @@ void SysTick_Alt_P1(void) {
 
   buffer_c[1].low=cLut[decisec];
 
+  segbal_isr_refresh();
+
   HAL_IncTick();
 
   if (decisec==9 && centisec==0 && millisec==0){
@@ -3109,6 +3187,8 @@ void SysTick_Alt_P1(void) {
 
 void SysTick_Alt_P0(void) {
   timetick()
+
+  segbal_isr_refresh();
 
   HAL_IncTick();
 
@@ -3814,9 +3894,19 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    LP_MARK(1);      // $PMLOOP section marks — see the pmloop block above segbal_isr_refresh
+    if (loop_diag && (uint32_t)(uwTick - pmloop_win) >= 1000u) {
+      pmloop_win = uwTick;
+      char pl[40];
+      int pn = sprintf(pl, "$PMLOOP,%lu,%u\r\n", (unsigned long)pmloop_max, (unsigned)pmloop_maxtag);
+      __disable_irq(); CDC_Copy_Transmit((uint8_t*)pl, (uint16_t)pn); __enable_irq();   // lossy: diag
+      pmloop_max = 0;
+    }
+    LP_MARK(2);
     segbal_poll();   // per-segment brightness balance (seg_balance) — refills the mirror slots, ≤1 kHz
     colon_balance_poll();   // dim the colons with the rail (colon_balance) — reloads the anim buffer on change
 
+    LP_MARK(3);
     // Distance gate: skip the ~300 ms FATFS/ZoneDetect lookup unless the fix has actually moved far
     // enough to plausibly change zone. 0.005° ≈ 0.5 km — ~100× the metre-scale jitter of a stationary
     // clock, yet far finer than any timezone boundary, so a moving clock still re-detects its zone
@@ -3862,6 +3952,7 @@ int main(void)
       fatfs_busy=0;
     }
 
+    LP_MARK(4);
     if (delayedCheckOnEject) firmwareCheckOnEject();
 
     if (delayedPostConfigCleanup) {
@@ -3881,6 +3972,7 @@ int main(void)
 
     if (delayedDisplayFreq) setDisplayFreq(delayedDisplayFreq);
 
+    LP_MARK(5);
     monitor_vbus();
 
     // significance_fade is a die-temp consumer too: computeHoldoverFade charges an out-of-coverage
@@ -3892,10 +3984,12 @@ int main(void)
         measure_temp();
       }
     }
+    LP_MARK(6);
     if (pps_ts_enabled && pps_record_pending) emitPPSTimestamp(); // emit clears pending itself on success
 
     tc_housekeeping();   // temp-comp learn/steer/dump; four flag checks when everything is off
 
+    LP_MARK(7);
     if (displayMode == MODE_VBAT)
       measure_vbat();
 
@@ -3907,7 +4001,8 @@ int main(void)
       // page-independent "----"), and never in the last decisecond -- there the SysTick ISR
       // runs its own (non-reentrant, shared-UART) sendDate(0), so we'd race it. Same
       // decisec!=9 guard the existing main-loop sendDate(1) calls use.
-      if ((displayMode == MODE_SUN || displayMode == MODE_LATLON || displayMode == MODE_DARK) && astro.have_pos && astro.epoch) {
+      LP_MARK(8);
+    if ((displayMode == MODE_SUN || displayMode == MODE_LATLON || displayMode == MODE_DARK) && astro.have_pos && astro.epoch) {
         static uint32_t last_pg = 0;
         uint32_t pg = uwTick / page_ms();
         if (pg != last_pg && decisec != 9) { last_pg = pg; sendDate(1); }
@@ -3916,6 +4011,7 @@ int main(void)
 
     // MODE_LST / MODE_SOLAR: stage the next civil boundary's alternate reading
     // (thread-context doubles; no-op in every other mode)
+    LP_MARK(9);
     alt_update();
 
 
