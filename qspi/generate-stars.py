@@ -2,10 +2,10 @@
 """
 generate-stars.py  ->  output/stars.bin
 
-Build the bright-star transit catalogue the clock reads from the QSPI/SD card, mirroring
-generate-tzrules.py. Source is the HYG database v4 (CC0), decimal J2000 RA (hours) / Dec (degrees) —
+Build the bright-star transit catalogue the clock reads from the QSPI flash (the CLOCK drive), mirroring
+generate-tzrules.py. Source is the HYG database v4.1 (CC0), decimal J2000 RA (hours) / Dec (degrees) —
 the same units the firmware wants. We keep the naked-eye "stars people actually recognise" (default
-mag <= 2.5, ~90 stars), magnitude-sorted so the firmware can early-stop at a `star_max_mag` config
+mag <= 2.5 -> 93 stars incl. the Megrez allow-list), magnitude-sorted so the firmware can early-stop at a `star_max_mag` config
 knob. Names are 4-char, uppercase (the mk4-date 7-seg font is uppercase-only and has a glyph for every
 letter; I/O/S/Z read as 1/0/5/2 and K/M/Q/V/W/X are rough approximations — flagged, not excluded).
 

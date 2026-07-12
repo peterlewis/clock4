@@ -204,7 +204,7 @@ MODE_GRID = disabled
 MODE_LATLON = disabled
 
 # Bright-star meridian-transit predictor. Paged countdowns to the soonest bright stars crossing
-# your local meridian (culminating), e.g. "SIR  0:45" = Sirius transits in 45 min. Needs a position
+# your local meridian (culminating), e.g. "SIRI  0 45" = Sirius transits in 45 min. Needs a position
 # (GPS fix or fake_longitude); shows "STAr ----" without one. J2000 catalogue precessed to date.
 # (Companion serial command: "star_dump = on" prints the whole list as $PMSTAR.)
 MODE_STAR = disabled
@@ -225,7 +225,7 @@ MODE_LST = disabled
 MODE_SOLAR = disabled
 
 # Live Allan deviation of the FREE-RUNNING crystal (its true stability, undisciplined). Pages
-# sigma_y(tau) across octave averaging times on the date row: "1s 3.2e-11", "64s 3e-11", ... up to
+# sigma_y(tau) across octave averaging times on the date row: "1 3.2e-11", "64 3e-11", ... up to
 # tau=1024 s, while the time row keeps live GPS time. Shows "Adev ----" until it has a few contiguous
 # locked seconds. The honest crystal signal (DWT phase, not the disciplined output).
 # (Companion serial command: "adev_dump = on" prints the whole curve as $PMADEV.)
