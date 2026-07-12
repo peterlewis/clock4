@@ -336,6 +336,7 @@ volatile _Bool adev_dump_pending = 0;      // "adev_dump = on" over serial -> em
 volatile _Bool hdev_dump_pending = 0;      // "hdev_dump = on" over serial -> emit one $PMHDEV sentence (Hadamard)
 volatile _Bool menu_reset_pending = 0;     // "menu_reset = on" over serial -> factory-reset the menu store
 volatile _Bool star_dump_pending = 0;      // "star_dump = on" over serial -> emit one $PMSTAR sentence
+volatile _Bool menu_dump_pending = 0;      // "menu_dump = on" over serial -> emit the store-persistence diagnostic
 
 // Validated coefficient parse: garbage/'----'/empty leaves the value untouched (a pasted-back
 // commented dump line must not freeze 0.0); an explicit "nan" parses and UNFREEZES the slot.
@@ -2228,6 +2229,8 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     if (isfinite(smm)) star_max_mag = smm;   // atof("nan") is a real NaN -> the float->int16 magcut cast would be UB
   } else if (strcasecmp(key, "loop_diag") == 0) {
     loop_diag = truthy(value) ? 1 : 0;   // 1 Hz $PMLOOP main-loop latency diagnostic
+  } else if (strcasecmp(key, "menu_dump") == 0) {
+    if (from_serial && truthy(value)) menu_dump_pending = 1;  // serial-only: report whether the store is flash-backed or RAM-only
   } else if (strcasecmp(key, "menu_reset") == 0) {
     if (from_serial && truthy(value)) menu_reset_pending = 1; // serial-only: wipe stored menu overrides
   } else if (strcasecmp(key, "tc_reset") == 0) {
@@ -3423,6 +3426,11 @@ static void star_dump_step(void){
   dn = -1; star_dump_pending = 0;
 }
 
+// "menu_dump = on" diagnostic — reports whether the override store is flash-backed or RAM-only.
+// Defined below the ee_* globals (needs ee_avail / ee_page_a / ee_gen); forward-declared here so the
+// main loop can call it.
+static void menu_dump_step(void);
+
 // Main-loop entry point, called every pass. With every tc key at its default this reduces to
 // four flag checks — no measurable cost, no behaviour change.
 // Holdover fade: from the residual 1σ time uncertainty during GPS-loss holdover, set each trailing
@@ -3513,6 +3521,7 @@ void tc_housekeeping(void){
   }
 
   tc_dump_step();
+  menu_dump_step();
 }
 
 // tc_steer(): holdover rate steering (see tc_governor). Sets the length of the NEXT 1 ms
@@ -4324,6 +4333,39 @@ void ee_load(void){
     ee_rd(best_page + (uint32_t)best_slot*EE_REC_SZ, rec, EE_REC_SZ); ee_unpack(rec);
     ee_active=best_page; ee_gen=best_gen; ee_next=(uint16_t)(best_slot+1);   // append after the winner
   }
+}
+// "menu_dump = on" over serial: ONE human-readable line reporting whether the on-device override store
+// (menu settings + tempcomp model) is FLASH-BACKED or RAM-only. The store lives in the two flash pages
+// above the app-CRC region (top-2*PAGE): RG silicon (1 MB) has room there and the store survives a
+// power cycle; RC silicon (256 KB) ends exactly at the app-CRC boundary (0x08040000), so ee_avail is 0
+// and every setting is lost on power-off. This one line tells us which without guessing at the die.
+// Same CDC/BUSY-retry contract as star_dump_step.
+static void menu_dump_step(void){
+  static int      dn = -1;
+  static uint16_t busy_ct = 0;
+  static char     dline[NMEA_BUF_SIZE];
+  if (!menu_dump_pending) return;
+  if (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED) { menu_dump_pending = 0; dn = -1; return; }
+
+  if (dn < 0) {
+#ifdef __EMSCRIPTEN__
+    unsigned kb = 0;                                  // emu: RAM-backed store, no die flash-size register
+#else
+    unsigned kb = *(uint16_t*)FLASHSIZE_BASE;         // die-programmed flash size in KB (RG 1024, RC 256)
+#endif
+    int nn = snprintf(dline, sizeof dline,
+        "# menu store: avail=%u flash=%uKB page_a=%08lX gen=%lu ovr=%u -- %s\r\n",
+        (unsigned)ee_avail, kb, (unsigned long)ee_page_a, (unsigned long)ee_gen, (unsigned)ovr.valid,
+        ee_avail ? "flash-backed (settings persist)" : "RAM-ONLY (settings lost on power-off)");
+    if (nn <= 0 || nn >= (int)sizeof dline) { menu_dump_pending = 0; return; }
+    dn = nn; busy_ct = 0;
+  }
+
+  __disable_irq();
+  uint8_t r = CDC_Copy_Transmit((uint8_t*)dline, (uint16_t)dn);
+  __enable_irq();
+  if (r == USBD_BUSY) { if (++busy_ct > 5000) { menu_dump_pending = 0; dn = -1; } return; }
+  dn = -1; menu_dump_pending = 0;
 }
 // Write ovr as the next record. Erase + switch page when the active one is full (CRC lands last, so a
 // power loss mid-write just fails CRC and ee_load falls back to the prior generation). Caller gates.
