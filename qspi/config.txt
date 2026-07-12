@@ -193,6 +193,13 @@ MODE_LST = disabled
 # your longitude plus the equation of time. Reads exactly 12:00:00 at local solar noon.
 MODE_SOLAR = disabled
 
+# Live Allan deviation of the FREE-RUNNING crystal (its true stability, undisciplined). Pages
+# sigma_y(tau) across octave averaging times on the date row: "1s 3.2e-11", "64s 3e-11", ... up to
+# tau=1024 s, while the time row keeps live GPS time. Shows "Adev ----" until it has a few contiguous
+# locked seconds. The honest crystal signal (DWT phase, not the disciplined output).
+# (Companion serial command: "adev_dump = on" prints the whole curve as $PMADEV.)
+MODE_ADEV = disabled
+
 # Colon animation while MODE_LST / MODE_SOLAR is shown, so the alternate timebase is
 # unmistakable at a glance -- solar especially, which can sit within minutes of civil.
 # Same names as colon_mode; automatically kept different from your civil colon unless you
