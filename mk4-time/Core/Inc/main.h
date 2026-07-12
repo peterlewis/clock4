@@ -178,15 +178,15 @@ enum {
   // high-latitude white nights that never reach -18 report NO DARK; polar night reports DARK NOW.
   MODE_DARK,
 
+  // Temperature-compensation diagnostics: die temp / model offsets / sample count
+  // paged on the date row (satview pattern). Values come from the tempcomp module.
+  MODE_TEMPCOMP,
+
   // Alternate-timebase TIME-ROW modes: the big digits tick Local Sidereal Time or
   // apparent solar time, reseeded from the GPS-disciplined second; the
   // date row keeps the civil date and a dedicated colon animation marks the mode.
   MODE_LST,
   MODE_SOLAR,
-
-  // Temperature-compensation diagnostics: die temp / model offsets / sample count
-  // paged on the date row (satview pattern). Values come from the tempcomp module.
-  MODE_TEMPCOMP,
 
   NUM_DISPLAY_MODES
 };

@@ -600,12 +600,12 @@ void sendDate( _Bool now ){
     }
     break;
   case MODE_TEMPCOMP: {
-    // Pages: die temp -> HSE model -> LSE model -> samples+state, 5.5 s dwell each.
+    // Pages: die temp -> HSE model -> LSE model -> samples+state, page_ms dwell each.
     // Values are the governor's display cache (clamped so the row never overflows). Layout is
     // the RISE/SET style: label, separator space, a sign slot (space when positive), then the
     // digits — numbers align whether signed or not, and short values keep clear space at the
     // row's end beside the time row: "tC  32C" / "HSE -0.25" / "rtC  18.68" / "n 159 L".
-    int tcp = (int)((uwTick / 5500) % 4);
+    int tcp = (int)((uwTick / page_ms()) % 4);
     char num[12];
     if (tcp == 0) {
       int t2 = (int)die_temp_c;
