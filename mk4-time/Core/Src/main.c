@@ -323,6 +323,7 @@ float tc_cfg_lse[3] = {NAN, NAN, NAN};     // absolute: ppm, ppm/°C, ppm/°C²
 volatile _Bool tc_dump_pending = 0;        // set by the serial parser, serviced in the main loop
 volatile _Bool tc_reset_pending = 0;
 volatile _Bool adev_dump_pending = 0;      // "adev_dump = on" over serial -> emit one $PMADEV sentence
+volatile _Bool hdev_dump_pending = 0;      // "hdev_dump = on" over serial -> emit one $PMHDEV sentence (Hadamard)
 volatile _Bool menu_reset_pending = 0;     // "menu_reset = on" over serial -> factory-reset the menu store
 volatile _Bool star_dump_pending = 0;      // "star_dump = on" over serial -> emit one $PMSTAR sentence
 volatile _Bool menu_dump_pending = 0;      // "menu_dump = on" over serial -> emit the store-persistence diagnostic
@@ -552,7 +553,7 @@ static const struct { char nm[4]; float ra; float dec; } star_cat_default[] = {
 #define STAR_MAX   128u            // RAM cap on the loaded catalogue (the SD file is clamped to this)
 #define STAR_SHOW  8u              // cache the soonest 8 upcoming transits
 #define STAR_SIDSEC_PER_HR 3590.1704   // solar seconds the meridian takes to sweep one hour of RA
-typedef struct { char nm[4]; uint32_t epoch; int8_t alt; } star_entry_t;
+typedef struct { char nm[4]; uint32_t epoch; int8_t alt; char dir; } star_entry_t;   // dir: culminates due (S)outh / (N)orth
 static star_entry_t star_cache[STAR_SHOW];
 static volatile uint8_t star_ncache;
 
@@ -661,18 +662,21 @@ static void star_update(void){
   // Single pass: keep the soonest STAR_SHOW visible stars in a small array sorted ascending by
   // sidereal-hours-to-transit. No per-star scratch (star_count can be the whole SD catalogue), so the
   // stack stays bounded regardless of catalogue size.
-  struct { float dt; int8_t alt; char nm[4]; } top[STAR_SHOW]; uint8_t n = 0;
+  struct { float dt; int8_t alt; char nm[4]; char dir; } top[STAR_SHOW]; uint8_t n = 0;
   for (uint16_t s = 0; s < star_count; s++) {
     double a_now = (double)star_buf[s].ra_now, d_now = (double)star_buf[s].dec_now;  // apparent of date (cached)
-    double alt = 90.0 - fabs((double)lat - d_now);                         // upper-transit altitude
-    if (alt <= 0.0) continue;                                             // never clears the horizon
+    double diff = (double)lat - d_now;                                     // sign = which horizon it culminates over
+    double alt = 90.0 - fabs(diff);                                        // upper-transit altitude (geometric)
+    if (alt <= -0.57) continue;                                            // horizon gate WITH refraction: ~34' lifts a grazer into view
     double dt = fmod(a_now - lst, 24.0); if (dt < 0.0) dt += 24.0;         // sidereal hours to transit
     float dtf = (float)dt;
     if (n < STAR_SHOW || dtf < top[n-1].dt) {                             // insertion-sort into the top-N
       uint8_t pos = (n < STAR_SHOW) ? n : (uint8_t)(STAR_SHOW - 1);
       if (n < STAR_SHOW) n++;
       while (pos > 0 && top[pos-1].dt > dtf) { top[pos] = top[pos-1]; pos--; }
-      top[pos].dt = dtf; top[pos].alt = (int8_t)(alt + 0.5); memcpy(top[pos].nm, star_buf[s].nm, 4);
+      top[pos].dt = dtf; memcpy(top[pos].nm, star_buf[s].nm, 4);
+      top[pos].alt = (int8_t)(alt >= 0.0 ? alt + 0.5 : 0.0);              // refraction-band grazers read alt 0
+      top[pos].dir = (diff >= 0.0) ? 'S' : 'N';                           // dec below latitude -> due south, else due north
     }
   }
   __disable_irq();
@@ -680,6 +684,7 @@ static void star_update(void){
     memcpy(star_cache[i].nm, top[i].nm, 4);
     star_cache[i].epoch = (uint32_t)currentTime + (uint32_t)((double)top[i].dt * STAR_SIDSEC_PER_HR + 0.5);
     star_cache[i].alt = top[i].alt;
+    star_cache[i].dir = top[i].dir;
   }
   star_ncache = n;
   __enable_irq();
@@ -905,6 +910,19 @@ void sendDate( _Bool now ){
     // down to culmination. The countdown ticks every second (recomputed here from the cached transit
     // epoch); star_update() re-sorts the list in the main loop. "STAr ----" with no GPS fix.
     if (star_ncache == 0) { i = sprintf((char*)&uart2_tx_buffer[1], "STAr ----"); break; }
+    // The payoff moment: when the soonest star reaches culmination, latch its name and hold a "NOW"
+    // tell for 8 s — otherwise the next star_update() re-sort rolls it off the list the second it
+    // happens and the event is invisible.
+    static char     star_now_nm[4];
+    static uint32_t star_now_until;
+    if ((long)star_cache[0].epoch - (long)currentTime <= 1L){
+      memcpy(star_now_nm, star_cache[0].nm, 4);
+      star_now_until = (uint32_t)currentTime + 8u;
+    }
+    if (star_now_until && (uint32_t)currentTime < star_now_until){
+      i = sprintf((char*)&uart2_tx_buffer[1], "%-4.4s  NOW", star_now_nm);
+      break;
+    }
     uint32_t p = (uwTick / page_ms()) % star_ncache;
     long rem = (long)star_cache[p].epoch - (long)currentTime;   // seconds to transit
     if (rem < 0) rem = 0;
@@ -2097,6 +2115,8 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     if (from_serial && truthy(value)) tc_dump_pending = 1;
   } else if (strcasecmp(key, "adev_dump") == 0) {
     if (from_serial && truthy(value)) adev_dump_pending = 1;  // serial-only: emit one $PMADEV sentence
+  } else if (strcasecmp(key, "hdev_dump") == 0) {
+    if (from_serial && truthy(value)) hdev_dump_pending = 1;  // serial-only: emit one $PMHDEV sentence (drift-immune Hadamard)
   } else if (strcasecmp(key, "star_dump") == 0) {
     if (from_serial && truthy(value)) star_dump_pending = 1;  // serial-only: emit one $PMSTAR sentence
   } else if (strcasecmp(key, "star_max_mag") == 0) {
@@ -2453,6 +2473,32 @@ static void adev_display_update(void){
     adev_sigma_cache[k]=adev_sigma_for_m(1u<<(uint8_t)k);
   }
   __disable_irq(); adev_noct=noct; __enable_irq();
+}
+// Overlapping HADAMARD deviation for averaging factor m — the third-difference kernel cancels
+// LINEAR FREQUENCY DRIFT (temperature ramp / aging) that plain ADEV retains as a tau^+1 slope, so
+// the long-tau octaves report the oscillator, not the ramp. Serial-only ($PMHDEV): reuses the same
+// phase ring, no extra RAM, computed on demand. Same unsigned modulo arithmetic as the ADEV kernel.
+static float hdev_sigma_for_m(uint32_t m){
+  uint32_t N=adev_valid;
+  if (N < 3u*m+1u) return 0.0f;
+  uint16_t base=(adev_valid<ADEV_N)?0u:adev_widx;
+  uint32_t cnt=N-3u*m;
+  int64_t S=0;
+  for (uint32_t i=0;i<cnt;i++){
+    uint32_t a=(uint32_t)adev_x[(uint16_t)((base+i)%ADEV_N)];
+    uint32_t b=(uint32_t)adev_x[(uint16_t)((base+i+m)%ADEV_N)];
+    uint32_t c=(uint32_t)adev_x[(uint16_t)((base+i+2u*m)%ADEV_N)];
+    uint32_t d4=(uint32_t)adev_x[(uint16_t)((base+i+3u*m)%ADEV_N)];
+    int32_t d=(int32_t)(d4 - 3u*c + 3u*b - a);              // third difference, ticks
+    S += (int64_t)d*d;
+  }
+  double var=(double)S/(6.0*(double)cnt);
+  return (float)(sqrt(var)/((double)ADEV_FCPU*(double)m));
+}
+static uint8_t hdev_noct(void){                             // same 4m maturity gate as the ADEV publish path
+  uint8_t n=0;
+  for (uint8_t k=0;k<ADEV_OCT;k++){ if (adev_valid < 4u*(1u<<k)) break; n=(uint8_t)(k+1); }
+  return n;
 }
 // Display accessors — sendDate() is defined above the engine, so it reads through these.
 static uint8_t adev_disp_noct(void){ return adev_noct; }
@@ -3162,7 +3208,7 @@ static void tc_dump_step(void){
 static void adev_dump_step(void){
   static int      dn = -1;                    // formatted length; -1 = not built yet
   static uint16_t busy_ct = 0;
-  static char     dline[NMEA_BUF_SIZE];
+  static char     dline[160];                 // epoch+tau0 header + 11 octaves outgrow NMEA_BUF_SIZE
   if (!adev_dump_pending) return;
   if (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED) { adev_dump_pending = 0; dn = -1; return; }
 
@@ -3170,8 +3216,11 @@ static void adev_dump_step(void){
     adev_reduce();                            // fresh octave cache (never in an ISR)
     uint8_t  noct  = adev_noct;
     uint16_t valid = adev_valid;
-    char body[112];
-    int nb = snprintf(body, sizeof body, "PMADEV,%u,%u", (unsigned)valid, (unsigned)noct);
+    char body[128];
+    // Self-describing for machine consumers: epoch (unix s) + tau0 (s) lead the sentence, so tau_k =
+    // tau0 * 2^k needs no out-of-band spec and stale sentences are detectable.
+    int nb = snprintf(body, sizeof body, "PMADEV,%lu,1,%u,%u",
+                      (unsigned long)(uint32_t)currentTime, (unsigned)valid, (unsigned)noct);
     if (nb < 0 || nb >= (int)sizeof body) { adev_dump_pending = 0; return; }
     for (uint8_t k = 0; k < noct; k++) {
       int t = snprintf(body + nb, sizeof body - nb, ",%.2e", (double)adev_sigma_cache[k]);
@@ -3195,26 +3244,64 @@ static void adev_dump_step(void){
   dn = -1; adev_dump_pending = 0;
 }
 
+// "hdev_dump = on": one $PMHDEV sentence — the Hadamard twin of $PMADEV (same shape: epoch, tau0,
+// valid, noct, sigmas), computed on demand from the shared phase ring. Same CDC/BUSY-retry contract.
+static void hdev_dump_step(void){
+  static int      dn = -1;
+  static uint16_t busy_ct = 0;
+  static char     dline[160];
+  if (!hdev_dump_pending) return;
+  if (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED) { hdev_dump_pending = 0; dn = -1; return; }
+
+  if (dn < 0) {
+    uint8_t  noct  = hdev_noct();
+    uint16_t valid = adev_valid;
+    char body[128];
+    int nb = snprintf(body, sizeof body, "PMHDEV,%lu,1,%u,%u",
+                      (unsigned long)(uint32_t)currentTime, (unsigned)valid, (unsigned)noct);
+    if (nb < 0 || nb >= (int)sizeof body) { hdev_dump_pending = 0; return; }
+    for (uint8_t k = 0; k < noct; k++) {
+      int t = snprintf(body + nb, sizeof body - nb, ",%.2e", (double)hdev_sigma_for_m(1u<<k));
+      if (t < 0 || t >= (int)(sizeof body - nb)) { hdev_dump_pending = 0; return; }
+      nb += t;
+    }
+    uint8_t cks = 0;
+    for (int i = 0; i < nb; i++) cks ^= (uint8_t)body[i];
+    int n = snprintf(dline, sizeof dline, "$%s*%02X\r\n", body, (unsigned)cks);
+    if (n <= 0 || n >= (int)sizeof dline) { hdev_dump_pending = 0; return; }
+    dn = n; busy_ct = 0;
+  }
+
+  __disable_irq();
+  uint8_t r = CDC_Copy_Transmit((uint8_t*)dline, (uint16_t)dn);
+  __enable_irq();
+  if (r == USBD_BUSY) {
+    if (++busy_ct > 5000) { hdev_dump_pending = 0; dn = -1; }
+    return;
+  }
+  dn = -1; hdev_dump_pending = 0;
+}
+
 // "star_dump = on" over serial: the current soonest-transit list as ONE checksummed sentence —
 // $PMSTAR,<n>,<name>,<sec_to_transit>,<transit_alt_deg>,..*CC. Fresh list computed here so it works
 // in any display mode. Same CDC/BUSY-retry contract as adev_dump_step/emitPPSTimestamp.
 static void star_dump_step(void){
   static int      dn = -1;
   static uint16_t busy_ct = 0;
-  static char     dline[NMEA_BUF_SIZE];
+  static char     dline[192];   // 8 entries x ",NAME,SSSSS,AA,D" + header outgrow NMEA_BUF_SIZE
   if (!star_dump_pending) return;
   if (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED) { star_dump_pending = 0; dn = -1; return; }
 
   if (dn < 0) {
     star_update();                             // fresh transit list (never in an ISR)
     uint8_t n = star_ncache;
-    char body[132];
+    char body[176];
     int nb = snprintf(body, sizeof body, "PMSTAR,%u,%c", (unsigned)n, star_from_card ? 'C' : 'B');  // provenance: Card / Baked-fallback
     if (nb < 0 || nb >= (int)sizeof body) { star_dump_pending = 0; return; }
     for (uint8_t k = 0; k < n; k++) {
       long rem = (long)star_cache[k].epoch - (long)currentTime; if (rem < 0) rem = 0;
-      int t = snprintf(body + nb, sizeof body - nb, ",%.4s,%ld,%d",
-                       star_cache[k].nm, rem, (int)star_cache[k].alt);
+      int t = snprintf(body + nb, sizeof body - nb, ",%.4s,%ld,%d,%c",
+                       star_cache[k].nm, rem, (int)star_cache[k].alt, star_cache[k].dir);
       if (t < 0 || t >= (int)(sizeof body - nb)) { star_dump_pending = 0; return; }
       nb += t;
     }
@@ -4639,6 +4726,7 @@ static void menu_record_key(uint8_t key_id, int32_t v){
 // forget the RAM override store, then re-read config.txt so the clock returns to a config.txt-only
 // state immediately (no reboot). Serial-only + origin-guarded, like tc_reset. Serviced from the main
 // loop (flash erase stalls the CPU, and the config re-read touches the FAT + non-reentrant sendDate).
+static void menu_flash(const char *s);   // defined with the menu FSM below (transient date-row note)
 static void menu_reset_step(void){
   if (!menu_reset_pending) return;
   if (ee_avail && !settings_mapping_ok()) return;   // QSPI: never erase against a stale mapping; retry
@@ -4662,6 +4750,7 @@ static void menu_reset_step(void){
     ee_active = ee_page_a; ee_next = 0; ee_gen = 0;
   }
   delayedReadConfigFile = 1;             // re-apply config.txt with no overrides -> back to factory
+  if (menu_layer != L0_CLOCK) menu_flash("DONE");   // a destructive action must not return to an identical screen
 }
 
 // ================= On-device 2-button menu (receiving FSM) ======================================
@@ -4778,6 +4867,11 @@ static const MItem menu_items[] = {
   MODE_ROW(MODE_ADEV,SEC_DIAG,"ADEV"),            MODE_ROW(MODE_STAR,SEC_ASTRO,"STAR"),
   MODE_ROW(MODE_TEMPCOMP,SEC_DIAG,"TC DATA"),   // the model READOUT; "TEMPCOMP" beside it is the enable
   { KID_MODE_BASE+MODE_FIRMWARE_CRC_T, MIT_TOGGLE, "FW CRC", MODE_FIRMWARE_CRC_T,1,1, NULL, g_mode, s_fwcrc, SEC_DIAG },
+  // Read-only INFO rows (no editor, never persisted; .lo tags the readout). The everyday questions:
+  // "am I disciplined right now?" and "did my star catalogue actually load?" — the second would have
+  // surfaced a failed card a session earlier than the serial diagnostics did.
+  { 0, MIT_INFO, "PPS",   0,0,0, NULL, NULL, NULL, SEC_DIAG  },   // "PPS LOCK" / "HOLD <s>" / "PPS ----"
+  { 0, MIT_INFO, "STARS", 1,0,0, NULL, NULL, NULL, SEC_ASTRO },   // "STARS <n>" (card) / "STARS b<n>" (baked fallback)
 };
 static const char *const sect_name[NSEC] = { "CAL", "ASTRO", "DISP", "DIAG", "SYS" };
 #define MENU_N ((uint8_t)(sizeof(menu_items)/sizeof(menu_items[0])))
@@ -4806,6 +4900,19 @@ static void menu_render_item(void){
   const MItem *m=&menu_items[menu_idx];
   char buf[20];
   if (menu_layer==L2_ITEM){
+    if (m->type==MIT_INFO){                                                    // live read-only rows (no get/set hooks)
+      if (m->lo==0){                                                           // PPS discipline state
+        if (had_pps && (uint32_t)((uint32_t)currentTime - last_pps_time) <= 2u)
+          snprintf(buf,sizeof buf,"PPS LOCK");
+        else if (last_pps_time)
+          snprintf(buf,sizeof buf,"HOLD %lu",(unsigned long)((uint32_t)currentTime - last_pps_time));
+        else
+          snprintf(buf,sizeof buf,"PPS ----");
+      } else {                                                                 // star catalogue provenance + count
+        snprintf(buf,sizeof buf, star_from_card ? "STARS %u" : "STARS b%u", (unsigned)star_count);
+      }
+      menu_show(buf); return;
+    }
     // §3b never hide a NUMBER: STEP items get a compact unit form + label-trim (the value is the point).
     // ENUM/TOGGLE keep the LABEL recognisable (you scroll by label) — truncate the value, or label-only.
     char val[10]; int32_t v = m->get(m);
@@ -4844,6 +4951,7 @@ static void menu_render_item(void){
 // ---- L2 value editor (live-preview on the real digits) ----
 static void menu_enter_edit(void){
   const MItem *m=&menu_items[menu_idx];
+  if (m->type==MIT_INFO){ menu_render_item(); return; }   // nothing to edit — repaint the live readout
   menu_orig = m->get(m); menu_val = menu_orig; menu_run_dir=0; menu_run_len=0;
   if (m->key_id==KID_COLON_ALT) menu_acolx_orig = colonAltExplicit;   // s_acolon sets the flag on EVERY write incl. restores — snapshot so CANCEL/idle can put it back
   if (m->key_id==KID_COLON || m->key_id==KID_COLON_ALT){        // §3.5: begin previewing the choice under the cursor
@@ -4933,6 +5041,7 @@ static void menu_show_stage(void){
                        : (menu_layer==L2_ITEM)    ? chord_L2itm : chord_L3edt;
   const char *s = (menu_stage<=3)? t[menu_stage] : "";
   if (menu_layer==L0_CLOCK && menu_stage==3 && menu_cycle==0) s = "";  // REBOOT arms on the 2nd cycle only — never label what won't fire
+  if (menu_layer==L2_ITEM && menu_stage==1 && menu_items[menu_idx].type==MIT_INFO) s = "";  // read-only row: no EDIT to offer
   if (menu_layer==L3_EDIT && menu_items[menu_idx].type==MIT_TOGGLE && (menu_stage==1||menu_stage==2)) s = "DONE";  // a toggle exits-and-saves on either shallow release
   menu_show(s[0]? s : "----");
 }
@@ -5370,6 +5479,7 @@ int main(void)
 
     tc_housekeeping();   // temp-comp learn/steer/dump; four flag checks when everything is off
     adev_dump_step();    // one-shot $PMADEV emit when adev_dump was set over serial (else 1 flag check)
+    hdev_dump_step();    // one-shot $PMHDEV (Hadamard) twin
     star_dump_step();    // one-shot $PMSTAR emit when star_dump was set over serial (else 1 flag check)
     menu_reset_step();   // one-shot menu factory-reset when menu_reset was set over serial
     tc_persist_step();   // gated commit of the learned tempco model to its retained flash store

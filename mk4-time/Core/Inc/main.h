@@ -153,7 +153,7 @@ extern _Bool resendDate;
 #define EVT_CHORD_S3    0x96
 #define MENU_IDLE_MS    15000u
 
-typedef enum { MIT_TOGGLE, MIT_ENUM, MIT_STEP, MIT_ACTION } MItemType;   // MIT_ACTION: a one-shot command (e.g. factory reset) — EDIT opens a "SURE?" confirm, SAVE fires it
+typedef enum { MIT_TOGGLE, MIT_ENUM, MIT_STEP, MIT_ACTION, MIT_INFO } MItemType;   // MIT_ACTION: one-shot command (confirm at L3). MIT_INFO: read-only live readout (no editor; .lo = info kind)
 // v2 sections: the setup ring is grouped; physical table order is UNCHANGED (menu_idx stays absolute,
 // persistence keys off key_id) — the FSM just walks rows whose .section matches the entered section.
 enum { SEC_CAL=0, SEC_ASTRO, SEC_DISP, SEC_DIAG, SEC_SYS, NSEC };
