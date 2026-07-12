@@ -547,7 +547,7 @@ static volatile uint8_t star_ncache;
 
 // The live catalogue in RAM: J2000 RA hours / Dec degrees + proper motion (mas/yr; mu_alpha* incl.
 // cos-dec), plus the cached APPARENT place of date (ra_now/dec_now, refreshed daily) the transit
-// math consumes. Loaded from the card or the baked default.
+// math consumes. Loaded from /STARS.BIN (the mode requires it; no baked default).
 static struct { char nm[4]; float ra; float dec; int16_t pmra, pmdec; float ra_now, dec_now; } star_buf[STAR_MAX];
 static uint16_t star_count = 0;
 static uint32_t star_apparent_at = 0;  // currentTime of the last apparent-place refresh (0 = never)
