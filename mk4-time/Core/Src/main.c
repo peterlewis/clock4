@@ -152,6 +152,11 @@ uint8_t decisec=0, centisec=0, millisec=0;
 
 float longitude=-9999, latitude=-9999;
 _Bool data_valid=0, had_pps=0, rtc_good=0, new_position=1;
+// Last fix the ZoneDetect timezone lookup actually ran for. The NMEA parser sets new_position on
+// EVERY 1 Hz fix, but that lookup reads TZMAP.BIN off the QSPI FATFS and costs ~300 ms — so on a
+// stationary clock it re-ran every second on metre-scale GPS jitter, a 300 ms main-loop stall per
+// second (starves the balance mirrors, widens the date-board byte-drop window). 999 = never yet.
+double zone_lat=999.0, zone_lon=999.0;
 
 // Astro pack — sun/moon/grid read-outs, computed once a second in the main loop
 // (astro_update) and formatted by the sendDate cases, the same compute-in-loop /
@@ -5511,11 +5516,18 @@ int main(void)
     colon_balance_poll();   // dim the colons with the rail (colon_balance) — reloads the anim buffer on change
 
     LP_MARK(3);
+    // Distance gate: skip the ~300 ms FATFS/ZoneDetect lookup unless the fix has actually moved far
+    // enough to plausibly change zone. 0.005° ≈ 0.5 km — ~100× the metre-scale jitter of a stationary
+    // clock, yet far finer than any timezone boundary, so a moving clock still re-detects its zone
+    // within ~0.5 km of a crossing while a still one looks up exactly once. (dlat²+dlon² threshold
+    // 2.5e-5 = 0.005²; the cos-lat foreshortening of longitude only makes the gate MORE conservative.)
     if (new_position && !qspi_write_time && !config.zone_override
         && (data_valid || (config.fake_long && config.fake_lat))
-        && latitude>=-90.0 && latitude<=90.0 && longitude>=-180.0 && longitude<=180.0) {
+        && latitude>=-90.0 && latitude<=90.0 && longitude>=-180.0 && longitude<=180.0
+        && (zone_lat>90.0 || (latitude-zone_lat)*(latitude-zone_lat) + (longitude-zone_lon)*(longitude-zone_lon) > 2.5e-5)) {
 
       new_position=0;
+      zone_lat=latitude; zone_lon=longitude;
       fatfs_busy=1;   // map lookup + loadRulesSingle touch FATFS; block the eject-time check
       FIL mapfile;
       if (f_open(&mapfile, MAP_FILENAME, FA_READ) == FR_OK) {
