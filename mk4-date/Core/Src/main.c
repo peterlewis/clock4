@@ -361,6 +361,8 @@ static uint8_t segbal_depth(void){
 uint8_t inverted=0;
 uint8_t b1_held =0;
 uint8_t b2_held =0;
+uint8_t b1_chorded=0;    // this B1 press overlapped B2 at some point -> it's a chord, never emit a single for it
+uint8_t b2_chorded=0;
 uint16_t both_held =0;   // monotonic ticks both buttons have been down (chord timer)
 uint8_t  both_stage=0;   // 0 = no chord, else the last stage (1/2/3) emitted this hold
 
@@ -500,27 +502,39 @@ void TIM21_IRQHandler(void){
    //if (!latched) return; //don't intervene while waiting for latch
     //if (inverted)...
 
-#define btn_debounce 2
+    // A lone button must be held chord_grace ticks (~120ms at 50Hz) before it COMMITS a single press —
+    // long enough that a slightly-staggered second button turns the pair into a chord instead. A quick
+    // lone TAP (released before chord_grace) still fires on RELEASE below, so this window never drops a
+    // tap; it only widens how forgiving "press both together" is. Once the other button has overlapped
+    // (b*_chorded), the single is suppressed entirely, and a both-tapped-too-brief press emits nothing.
+#define chord_grace 6        // ticks both-simultaneity is tolerated within (was an unforgiving 2)
 #define btn_delay 42
 #define btn_repeat 10
 
-
     if ((LL_GPIO_ReadInputPort(GPIOB) & LL_GPIO_PIN_3)==0) {
-      if (++b1_held == btn_debounce || b1_held == btn_delay) {
-          if ( (USART2->ISR & USART_ISR_TXE) && b2_held==0 ) {
-            USART2->TDR = 0x91 + inverted;
-          }
-          if (b1_held==btn_delay) b1_held -= btn_repeat;
+      b1_held++;
+      if (b2_held) b1_chorded = 1;                                   // B2 overlapped -> chord, not a single
+      if ((b1_held == chord_grace || b1_held == btn_delay) && !b1_chorded) {
+        if (USART2->ISR & USART_ISR_TXE) USART2->TDR = 0x91 + inverted;
+        if (b1_held == btn_delay) b1_held -= btn_repeat;             // auto-repeat while held
       }
-    } else b1_held=0;
+    } else {
+      if (b1_held && b1_held < chord_grace && !b1_chorded &&         // released before the grace, alone:
+          (USART2->ISR & USART_ISR_TXE)) USART2->TDR = 0x91 + inverted;   // a quick tap -> fire it on release
+      b1_held = 0; b1_chorded = 0;
+    }
     if ((LL_GPIO_ReadInputPort(GPIOC) & LL_GPIO_PIN_13)==0) {
-      if (++b2_held == btn_debounce || b2_held == btn_delay) {
-          if ( (USART2->ISR & USART_ISR_TXE) && b1_held==0) {
-            USART2->TDR = 0x92 - inverted;
-          }
-          if (b2_held==btn_delay) b2_held -= btn_repeat;
+      b2_held++;
+      if (b1_held) b2_chorded = 1;
+      if ((b2_held == chord_grace || b2_held == btn_delay) && !b2_chorded) {
+        if (USART2->ISR & USART_ISR_TXE) USART2->TDR = 0x92 - inverted;
+        if (b2_held == btn_delay) b2_held -= btn_repeat;
       }
-    } else b2_held=0;
+    } else {
+      if (b2_held && b2_held < chord_grace && !b2_chorded &&
+          (USART2->ISR & USART_ISR_TXE)) USART2->TDR = 0x92 - inverted;
+      b2_held = 0; b2_chorded = 0;
+    }
 
     // Both buttons held: a rolling self-labeled chord for the time board's on-device menu. Cross a
     // stage every chord_step ticks after chord_s1, cycling 1/2/3, emitting 0x94/0x95/0x96 (the stage
