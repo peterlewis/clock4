@@ -4856,6 +4856,7 @@ static void menu_record_key(uint8_t key_id, int32_t v){
 // forget the RAM override store, then re-read config.txt so the clock returns to a config.txt-only
 // state immediately (no reboot). Serial-only + origin-guarded, like tc_reset. Serviced from the main
 // loop (flash erase stalls the CPU, and the config re-read touches the FAT + non-reentrant sendDate).
+static void menu_flash(const char *s);   // defined with the menu FSM below (transient date-row note)
 static void menu_reset_step(void){
   if (!menu_reset_pending) return;
   if (ee_avail && !settings_mapping_ok()) return;   // QSPI: never erase against a stale mapping; retry
@@ -4879,6 +4880,7 @@ static void menu_reset_step(void){
     ee_active = ee_page_a; ee_next = 0; ee_gen = 0;
   }
   delayedReadConfigFile = 1;             // re-apply config.txt with no overrides -> back to factory
+  if (menu_layer != L0_CLOCK) menu_flash("DONE");   // a destructive action must not return to an identical screen
 }
 
 // ================= On-device 2-button menu (receiving FSM) ======================================
@@ -4995,6 +4997,11 @@ static const MItem menu_items[] = {
   MODE_ROW(MODE_ADEV,SEC_DIAG,"ADEV"),            MODE_ROW(MODE_STAR,SEC_ASTRO,"STAR"),
   MODE_ROW(MODE_TEMPCOMP,SEC_DIAG,"TC DATA"),   // the model READOUT; "TEMPCOMP" beside it is the enable
   { KID_MODE_BASE+MODE_FIRMWARE_CRC_T, MIT_TOGGLE, "FW CRC", MODE_FIRMWARE_CRC_T,1,1, NULL, g_mode, s_fwcrc, SEC_DIAG },
+  // Read-only INFO rows (no editor, never persisted; .lo tags the readout). The everyday questions:
+  // "am I disciplined right now?" and "did my star catalogue actually load?" — the second would have
+  // surfaced a failed card a session earlier than the serial diagnostics did.
+  { 0, MIT_INFO, "PPS",   0,0,0, NULL, NULL, NULL, SEC_DIAG  },   // "PPS LOCK" / "HOLD <s>" / "PPS ----"
+  { 0, MIT_INFO, "STARS", 1,0,0, NULL, NULL, NULL, SEC_ASTRO },   // "STARS <n>" (card) / "STARS b<n>" (baked fallback)
 };
 static const char *const sect_name[NSEC] = { "CAL", "ASTRO", "DISP", "DIAG", "SYS" };
 #define MENU_N ((uint8_t)(sizeof(menu_items)/sizeof(menu_items[0])))
@@ -5023,6 +5030,19 @@ static void menu_render_item(void){
   const MItem *m=&menu_items[menu_idx];
   char buf[20];
   if (menu_layer==L2_ITEM){
+    if (m->type==MIT_INFO){                                                    // live read-only rows (no get/set hooks)
+      if (m->lo==0){                                                           // PPS discipline state
+        if (had_pps && (uint32_t)((uint32_t)currentTime - last_pps_time) <= 2u)
+          snprintf(buf,sizeof buf,"PPS LOCK");
+        else if (last_pps_time)
+          snprintf(buf,sizeof buf,"HOLD %lu",(unsigned long)((uint32_t)currentTime - last_pps_time));
+        else
+          snprintf(buf,sizeof buf,"PPS ----");
+      } else {                                                                 // star catalogue provenance + count
+        snprintf(buf,sizeof buf, star_from_card ? "STARS %u" : "STARS b%u", (unsigned)star_count);
+      }
+      menu_show(buf); return;
+    }
     // §3b never hide a NUMBER: STEP items get a compact unit form + label-trim (the value is the point).
     // ENUM/TOGGLE keep the LABEL recognisable (you scroll by label) — truncate the value, or label-only.
     char val[10]; int32_t v = m->get(m);
@@ -5061,6 +5081,7 @@ static void menu_render_item(void){
 // ---- L2 value editor (live-preview on the real digits) ----
 static void menu_enter_edit(void){
   const MItem *m=&menu_items[menu_idx];
+  if (m->type==MIT_INFO){ menu_render_item(); return; }   // nothing to edit — repaint the live readout
   menu_orig = m->get(m); menu_val = menu_orig; menu_run_dir=0; menu_run_len=0;
   if (m->key_id==KID_COLON_ALT) menu_acolx_orig = colonAltExplicit;   // s_acolon sets the flag on EVERY write incl. restores — snapshot so CANCEL/idle can put it back
   if (m->key_id==KID_COLON || m->key_id==KID_COLON_ALT){        // §3.5: begin previewing the choice under the cursor
@@ -5150,6 +5171,7 @@ static void menu_show_stage(void){
                        : (menu_layer==L2_ITEM)    ? chord_L2itm : chord_L3edt;
   const char *s = (menu_stage<=3)? t[menu_stage] : "";
   if (menu_layer==L0_CLOCK && menu_stage==3 && menu_cycle==0) s = "";  // REBOOT arms on the 2nd cycle only — never label what won't fire
+  if (menu_layer==L2_ITEM && menu_stage==1 && menu_items[menu_idx].type==MIT_INFO) s = "";  // read-only row: no EDIT to offer
   if (menu_layer==L3_EDIT && menu_items[menu_idx].type==MIT_TOGGLE && (menu_stage==1||menu_stage==2)) s = "DONE";  // a toggle exits-and-saves on either shallow release
   menu_show(s[0]? s : "----");
 }
