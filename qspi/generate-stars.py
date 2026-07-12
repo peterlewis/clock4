@@ -44,8 +44,23 @@ def clean_name(s):
     """Uppercase, keep A-Z0-9 only."""
     return "".join(c for c in s.upper() if c.isalnum())
 
+# Curated overrides (review-driven, famous-stars scope):
+#  - Mirach's natural stem "MIRA" IMPERSONATES Mira (omicron Ceti, itself famous and not on the card).
+#  - Markab (alpha Peg, Great Square corner) deserves "MARK"; obscure Markeb (kappa Vel) sorted one
+#    place earlier by magnitude and used to steal it, leaving Markab an unrecognizable "MARB".
+NAME_OVERRIDE = { 'Mirach': 'MRCH', 'Markab': 'MARK', 'Markeb': 'MARB' }
+# Asterism-completing showpieces admitted ABOVE the magnitude cut (famous-only scope intact):
+# Megrez (mag 3.3) is the 7th star of the Big Dipper — without it the most-pointed-at northern
+# asterism is forever one star short.
+ALWAYS_INCLUDE = { 'Megrez' }
+
 def abbrev(proper, bayer, con, used):
-    """A unique 4-char uppercase name. Prefer the proper name; fall back to Bayer(greek)+con."""
+    """A unique 4-char uppercase name. Curated override first; else prefer the proper name; fall back to Bayer(greek)+con."""
+    if proper in NAME_OVERRIDE:
+        nm = NAME_OVERRIDE[proper]
+        if nm in used:
+            raise RuntimeError(f"override collision: {proper} -> {nm}")
+        return nm
     GREEK = {  # HYG 3-letter Bayer prefix -> single display letter
         'Alp':'A','Bet':'B','Gam':'G','Del':'D','Eps':'E','Zet':'Z','Eta':'H','The':'T','Iot':'I',
         'Kap':'K','Lam':'L','Mu':'M','Nu':'N','Xi':'X','Omi':'O','Pi':'P','Rho':'R','Sig':'S',
@@ -79,7 +94,7 @@ def build():
     # position, so they'd transit at the same instant (e.g. Capella's mag-0.96 component, or Toliman
     # = alpha Cen B sitting on Rigil Kentaurus). Keep only the primary / single stars.
     rows = [r for r in rows if (not r['comp']) or r['comp'] == '1']
-    stars = [r for r in rows if float(r['mag']) <= MAG_CUT]
+    stars = [r for r in rows if float(r['mag']) <= MAG_CUT or r['proper'] in ALWAYS_INCLUDE]
     stars.sort(key=lambda r: float(r['mag']))          # brightest first -> firmware early-stop by mag
 
     used, out, report = set(), [], []
