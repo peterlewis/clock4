@@ -455,43 +455,11 @@ static void astro_update(void){
 // countdown on the date row. J2000 catalogue positions are precessed to date (first-order IAU) so
 // the timing stays good to the shown minute for decades. Compute is main-loop only (double trig).
 //
-// The catalogue is loaded at boot from /STARS.BIN on the SD card (generate-stars.py, HYG v4). The
-// hand-entered J2000 set below is only the FALLBACK when the card has no valid file — a compact bright
-// set so the feature still works cardless. The transit *maths* is verified in the emulator.
-static const struct { char nm[4]; float ra; float dec; } star_cat_default[] = {
-  {"SIR",  6.7525f, -16.7161f},  // Sirius        alpha CMa
-  {"CAN",  6.3992f, -52.6957f},  // Canopus       alpha Car
-  {"ARC", 14.2610f,  19.1824f},  // Arcturus      alpha Boo
-  {"VEG", 18.6156f,  38.7837f},  // Vega          alpha Lyr
-  {"CAP",  5.2782f,  45.9980f},  // Capella       alpha Aur
-  {"RIG",  5.2423f,  -8.2016f},  // Rigel         beta  Ori
-  {"PRO",  7.6550f,   5.2250f},  // Procyon       alpha CMi
-  {"BTL",  5.9195f,   7.4070f},  // Betelgeuse    alpha Ori
-  {"ACH",  1.6286f, -57.2367f},  // Achernar      alpha Eri
-  {"ALD",  4.5987f,  16.5093f},  // Aldebaran     alpha Tau
-  {"ANT", 16.4901f, -26.4319f},  // Antares       alpha Sco
-  {"SPI", 13.4199f, -11.1613f},  // Spica         alpha Vir
-  {"PLX",  7.7553f,  28.0262f},  // Pollux        beta  Gem
-  {"FOM", 22.9608f, -29.6222f},  // Fomalhaut     alpha PsA
-  {"DEN", 20.6905f,  45.2803f},  // Deneb         alpha Cyg
-  {"REG", 10.1395f,  11.9672f},  // Regulus       alpha Leo
-  {"ALT", 19.8464f,   8.8683f},  // Altair        alpha Aql
-  {"CTR",  7.5766f,  31.8883f},  // Castor        alpha Gem
-  {"POL",  2.5303f,  89.2641f},  // Polaris       alpha UMi
-  {"BEL",  5.4188f,   6.3497f},  // Bellatrix     gamma Ori
-  {"ELN",  5.4382f,  28.6075f},  // Elnath        beta  Tau
-  {"ALN",  5.6036f,  -1.2020f},  // Alnilam       eps   Ori
-  {"DUB", 11.0621f,  61.7510f},  // Dubhe         alpha UMa
-  {"ALK", 13.7923f,  49.3133f},  // Alkaid        eta   UMa
-  {"AHD",  9.4597f,  -8.6586f},  // Alphard       alpha Hya
-  {"DNB", 11.8177f,  14.5720f},  // Denebola      beta  Leo
-  {"MIR",  3.4054f,  49.8612f},  // Mirfak        alpha Per
-  {"HAM",  2.1195f,  23.4624f},  // Hamal         alpha Ari
-  {"ALC", 15.5781f,  26.7147f},  // Alphecca      alpha CrB
-  {"RAS", 17.5822f,  12.5600f},  // Rasalhague    alpha Oph
-};
-#define STAR_DEFAULT_N (sizeof star_cat_default / sizeof star_cat_default[0])
-#define STAR_MAX   128u            // RAM cap on the loaded catalogue (the SD file is clamped to this)
+// The catalogue is loaded at boot from /STARS.BIN on the CLOCK drive (the QSPI flash volume;
+// generate-stars.py, HYG v4). There is deliberately NO baked-in fallback: without a valid file the
+// mode honestly shows nothing ("STAr ----") rather than quietly substituting lookalike data. The
+// transit *maths* is verified in the emulator.
+#define STAR_MAX   128u            // RAM cap on the loaded catalogue (the STARS.BIN file is clamped to this)
 #define STAR_SHOW  8u              // cache the soonest 8 upcoming transits
 #define STAR_SIDSEC_PER_HR 3590.1704   // solar seconds the meridian takes to sweep one hour of RA
 typedef struct { char nm[4]; uint32_t epoch; int8_t alt; char dir; } star_entry_t;   // dir: culminates due (S)outh / (N)orth
@@ -503,16 +471,15 @@ static volatile uint8_t star_ncache;
 // math consumes. Loaded from the card or the baked default.
 static struct { char nm[4]; float ra; float dec; int16_t pmra, pmdec; float ra_now, dec_now; } star_buf[STAR_MAX];
 static uint16_t star_count = 0;
-static uint8_t  star_from_card = 0;    // provenance: 1 = /STARS.BIN loaded, 0 = baked fallback ($PMSTAR reports C/B — a failed card must not masquerade as success)
 static uint32_t star_apparent_at = 0;  // currentTime of the last apparent-place refresh (0 = never)
 volatile float star_max_mag = 6.0f;   // config "star_max_mag": only load stars brighter than this (file is mag-sorted -> early-stop). Default 6 = the whole file.
 
 // Load /STARS.BIN into star_buf, filtered to star_max_mag. The file is magnitude-sorted, so we stop at
-// the first star past the cut. Hardened like loadRules (PR#7): validate magic + fixed record length,
-// clamp the count BEFORE writing, byte-check every read, sanity-check RA/Dec. On ANY failure (no card,
-// bad header, torn read) fall back to the baked star_cat_default[] so the feature always works.
+// the first star past the cut. Hardened like loadRules (PR#7): validate magic + record length, clamp
+// the count BEFORE writing, byte-check every read, sanity-check RA/Dec, scrub name bytes. No file (or
+// an invalid one) leaves the catalogue EMPTY — MODE_STAR requires STARS.BIN on the CLOCK drive.
 static void loadStars(void){
-  star_count = 0; star_from_card = 0; star_apparent_at = 0;
+  star_count = 0; star_apparent_at = 0;
   FIL file;
   _Bool file_ok = 0;
   if (f_open(&file, STARS_FILENAME, FA_READ) == FR_OK){
@@ -545,18 +512,7 @@ static void loadStars(void){
     }
     f_close(&file);
   }
-  star_from_card = file_ok;
-  // Fall back to the baked set ONLY when there is no usable FILE. A valid card catalogue whose every
-  // record was trimmed by star_max_mag stays honestly EMPTY — the old star_count==0 test silently
-  // swapped in the baked set, making a failed/over-filtered card indistinguishable from success.
-  if (!file_ok && star_count == 0){
-    for (uint16_t s = 0; s < STAR_DEFAULT_N && s < STAR_MAX; s++){
-      memcpy(star_buf[s].nm, star_cat_default[s].nm, 4);
-      star_buf[s].ra = star_cat_default[s].ra; star_buf[s].dec = star_cat_default[s].dec;
-      star_buf[s].pmra = 0; star_buf[s].pmdec = 0;               // baked set: PM below the display's resolution for these bright stars (documented limitation)
-      star_count++;
-    }
-  }
+  (void)file_ok;   // no fallback by design: absent/invalid file -> star_count 0 -> "STAr ----"
 }
 
 // J2000 -> apparent place of date: linear proper motion, then RIGOROUS IAU-1976 precession (the
@@ -3324,7 +3280,7 @@ static void star_dump_step(void){
     star_update();                             // fresh transit list (never in an ISR)
     uint8_t n = star_ncache;
     char body[176];
-    int nb = snprintf(body, sizeof body, "PMSTAR,%u,%c", (unsigned)n, star_from_card ? 'C' : 'B');  // provenance: Card / Baked-fallback
+    int nb = snprintf(body, sizeof body, "PMSTAR,%u", (unsigned)n);
     if (nb < 0 || nb >= (int)sizeof body) { star_dump_pending = 0; return; }
     for (uint8_t k = 0; k < n; k++) {
       long rem = (long)star_cache[k].epoch - (long)currentTime; if (rem < 0) rem = 0;
