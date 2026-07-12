@@ -513,14 +513,16 @@ static void loadStars(void){
   if (f_open(&file, STARS_FILENAME, FA_READ) == FR_OK){
     unsigned int rc; uint8_t hdr[16];
     if (f_read(&file, hdr, 16, &rc) == FR_OK && rc == 16 && memcmp(hdr, "MST1", 4) == 0
-        && (uint16_t)(hdr[6] | (hdr[7]<<8)) == 10u){            // recordLength must equal our packed record
+        && (uint16_t)(hdr[6] | (hdr[7]<<8)) == 10u                // recordLength must equal our packed record
+        && (uint16_t)(hdr[8] | (hdr[9]<<8)) == 100u){             // mag_scale we decode against (mag*100); reject a file written to a different scale
       uint16_t count  = (uint16_t)(hdr[4] | (hdr[5]<<8));
-      int16_t  magcut = (int16_t)(star_max_mag * 100.0f);
+      float    mc = star_max_mag * 100.0f;                       // saturate: a huge star_max_mag means "load all", never wrap negative (out-of-range float->int16 is UB)
+      int16_t  magcut = mc > 32767.0f ? 32767 : (mc < -32768.0f ? -32768 : (int16_t)mc);
       for (uint16_t k = 0; k < count && star_count < STAR_MAX; k++){
         uint8_t rec[10];
         if (f_read(&file, rec, 10, &rc) != FR_OK || rc != 10) break;      // torn read -> keep what we have
         int16_t mag = (int16_t)(rec[4] | (rec[5]<<8));
-        if (mag > magcut) break;                                          // sorted brightest-first -> rest are fainter
+        if (mag > magcut) continue;                                       // filter per-record (don't trust the file to be mag-sorted); loop still bounded by EOF + STAR_MAX
         float ra  = (float)(uint16_t)(rec[0] | (rec[1]<<8)) / 65536.0f * 24.0f;
         float dec = (float)( int16_t)(rec[2] | (rec[3]<<8)) / 100.0f;
         if (ra < 0.0f || ra >= 24.0f || dec < -90.0f || dec > 90.0f) continue;   // reject garbage
