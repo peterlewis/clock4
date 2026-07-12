@@ -4885,12 +4885,14 @@ static void    s_pps   (const MItem*m,int32_t v){ (void)m; pps_ts_enabled=v?1:0;
 static int32_t g_nmea  (const MItem*m){ (void)m; return nmea_cdc_level; }
 static void    s_nmea  (const MItem*m,int32_t v){ (void)m; nmea_cdc_level=(uint8_t)v; }
 static int32_t g_matrix(const MItem*m){ (void)m; return (int32_t)matrix_freq_hz; }
-static void    s_matrix(const MItem*m,int32_t v){   // §4 live-preview: ARR every tap; throttle the blocking date-board UART
-  (void)m; if(v<1000)v=1000; if(v>100000)v=100000;              // hardware floor/ceiling (defensive)
-  static uint32_t last_tx=0;
-  if ((uint32_t)(uwTick-last_tx) >= 100u){ setDisplayFreq((uint32_t)v); last_tx=uwTick; }  // <=10 Hz UART to the date board
-  else { uint32_t a=(uint32_t)(16000000.0/(double)v)-1u; TIM1->ARR=a; TIM7->ARR=a; matrix_freq_hz=(uint32_t)v; }  // instant local ARR
-}
+static void    s_matrix(const MItem*m,int32_t v){   // §4: scrub the NUMBER only; the rate is applied ONCE
+  (void)m; if(v<1000)v=1000; if(v>100000)v=100000;   // on commit/cancel (setDisplayFreq there — see menu_commit_edit /
+  matrix_freq_hz=(uint32_t)v;                         // menu_cancel_edit), never live. Live-writing the scan timers
+}                                                     // TIM1/TIM7 — which clock the display DMA (TIM7 drives
+                                                      // buffer_c->GPIOC) — on every tap stalled the very display the
+                                                      // menu renders on: the digits corrupted then froze, needing an
+                                                      // unplug. The number still previews (the L3 render reads menu_val),
+                                                      // so nothing is lost — only the hardware apply is deferred to commit.
 // TEMPCOMP: one on-device toggle arms the whole self-learning compensator — learn (sample ppm-vs-die-
 // temp while GPS-locked) AND apply (steer SysTick from the model during GPS-loss holdover). config.txt
 // still exposes tc_learn / tc_apply separately for asymmetric setups; the menu treats them as a pair.
