@@ -87,6 +87,7 @@ extern _Bool resendDate;
 /* USER CODE BEGIN EC */
 
 #define RULES_FILENAME  "/TZRULES.BIN"
+#define STARS_FILENAME  "/STARS.BIN"
 #define MAP_FILENAME    "/TZMAP.BIN"
 #define CONFIG_FILENAME "/CONFIG.TXT"
 
