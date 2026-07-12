@@ -357,11 +357,14 @@ struct {
   float in;
   float out;
 } brightnessCurve[] = {
-    {0,    4095-0},
-    {1425, 4095-737},
-    {2566, 4095-1601},
-    {3396, 4095-2725},
-    {4095, 4095-4095},
+    // Measured VTT9812FH (R11 = 470K) response, baked in so the clock needs no config.txt BS lines.
+    // These are the same five stops as "BSn = in,out" (out is inverted, 4095-out, exactly as
+    // parseBrightness does); a config.txt BS line still overrides its stop at load.
+    {0,    4095-0},       // BS1 = 0,0
+    {131,  4095-365},     // BS2 = 131,365
+    {1076, 4095-1422},    // BS3 = 1076,1422
+    {2774, 4095-2665},    // BS4 = 2774,2665
+    {3849, 4095-4095},    // BS5 = 3849,4095
 };
 
 // memcpy() appears to move data by bytes, which doesn't work with the word-accessed backup registers
