@@ -152,7 +152,7 @@ extern _Bool resendDate;
 #define EVT_CHORD_S3    0x96
 #define MENU_IDLE_MS    15000u
 
-typedef enum { MIT_TOGGLE, MIT_ENUM, MIT_STEP } MItemType;
+typedef enum { MIT_TOGGLE, MIT_ENUM, MIT_STEP, MIT_ACTION } MItemType;   // MIT_ACTION: a one-shot command (e.g. factory reset) — EDIT opens a "SURE?" confirm, SAVE fires it
 // v2 sections: the setup ring is grouped; physical table order is UNCHANGED (menu_idx stays absolute,
 // persistence keys off key_id) — the FSM just walks rows whose .section matches the entered section.
 enum { SEC_CAL=0, SEC_ASTRO, SEC_DISP, SEC_DIAG, SEC_SYS, NSEC };
@@ -169,7 +169,7 @@ typedef struct MItem {
 // Stable key ids (append-only; mode rows use KID_MODE_BASE + MODE_* ordinal).
 enum { KID_BRIGHTNESS=1, KID_COLON=2, KID_COLON_ALT=3, KID_PAGE_MS=4,
        KID_SIG_FADE=5, KID_PPS=6, KID_NMEA=7, KID_MATRIX_FREQ=8, KID_TEMPCOMP=9,
-       KID_BALANCE=10, KID_MODE_BASE=64 };
+       KID_BALANCE=10, KID_RESET=11, KID_MODE_BASE=64 };   // KID_RESET: the SYS factory-reset action (never persisted)
 
 void menu_isr_event(uint8_t evt);   // called from the USART2 ISR — enqueue only, no work
 void menu_poll(void);               // main-loop FSM tick
