@@ -282,6 +282,7 @@ float tc_cfg_lse[3] = {NAN, NAN, NAN};     // absolute: ppm, ppm/°C, ppm/°C²
 volatile _Bool tc_dump_pending = 0;        // set by the serial parser, serviced in the main loop
 volatile _Bool tc_reset_pending = 0;
 volatile _Bool adev_dump_pending = 0;      // "adev_dump = on" over serial -> emit one $PMADEV sentence
+volatile _Bool hdev_dump_pending = 0;      // "hdev_dump = on" over serial -> emit one $PMHDEV sentence (Hadamard)
 
 // Validated coefficient parse: garbage/'----'/empty leaves the value untouched (a pasted-back
 // commented dump line must not freeze 0.0); an explicit "nan" parses and UNFREEZES the slot.
@@ -1933,6 +1934,8 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     if (from_serial && truthy(value)) tc_dump_pending = 1;
   } else if (strcasecmp(key, "adev_dump") == 0) {
     if (from_serial && truthy(value)) adev_dump_pending = 1;  // serial-only: emit one $PMADEV sentence
+  } else if (strcasecmp(key, "hdev_dump") == 0) {
+    if (from_serial && truthy(value)) hdev_dump_pending = 1;  // serial-only: emit one $PMHDEV sentence (drift-immune Hadamard)
   } else if (strcasecmp(key, "loop_diag") == 0) {
     loop_diag = truthy(value) ? 1 : 0;   // 1 Hz $PMLOOP main-loop latency diagnostic
   } else if (strcasecmp(key, "tc_reset") == 0) {
@@ -2276,6 +2279,32 @@ static void adev_display_update(void){
     adev_sigma_cache[k]=adev_sigma_for_m(1u<<(uint8_t)k);
   }
   __disable_irq(); adev_noct=noct; __enable_irq();
+}
+// Overlapping HADAMARD deviation for averaging factor m — the third-difference kernel cancels
+// LINEAR FREQUENCY DRIFT (temperature ramp / aging) that plain ADEV retains as a tau^+1 slope, so
+// the long-tau octaves report the oscillator, not the ramp. Serial-only ($PMHDEV): reuses the same
+// phase ring, no extra RAM, computed on demand. Same unsigned modulo arithmetic as the ADEV kernel.
+static float hdev_sigma_for_m(uint32_t m){
+  uint32_t N=adev_valid;
+  if (N < 3u*m+1u) return 0.0f;
+  uint16_t base=(adev_valid<ADEV_N)?0u:adev_widx;
+  uint32_t cnt=N-3u*m;
+  int64_t S=0;
+  for (uint32_t i=0;i<cnt;i++){
+    uint32_t a=(uint32_t)adev_x[(uint16_t)((base+i)%ADEV_N)];
+    uint32_t b=(uint32_t)adev_x[(uint16_t)((base+i+m)%ADEV_N)];
+    uint32_t c=(uint32_t)adev_x[(uint16_t)((base+i+2u*m)%ADEV_N)];
+    uint32_t d4=(uint32_t)adev_x[(uint16_t)((base+i+3u*m)%ADEV_N)];
+    int32_t d=(int32_t)(d4 - 3u*c + 3u*b - a);              // third difference, ticks
+    S += (int64_t)d*d;
+  }
+  double var=(double)S/(6.0*(double)cnt);
+  return (float)(sqrt(var)/((double)ADEV_FCPU*(double)m));
+}
+static uint8_t hdev_noct(void){                             // same 4m maturity gate as the ADEV publish path
+  uint8_t n=0;
+  for (uint8_t k=0;k<ADEV_OCT;k++){ if (adev_valid < 4u*(1u<<k)) break; n=(uint8_t)(k+1); }
+  return n;
 }
 // Display accessors — sendDate() is defined above the engine, so it reads through these.
 static uint8_t adev_disp_noct(void){ return adev_noct; }
@@ -2985,7 +3014,7 @@ static void tc_dump_step(void){
 static void adev_dump_step(void){
   static int      dn = -1;                    // formatted length; -1 = not built yet
   static uint16_t busy_ct = 0;
-  static char     dline[NMEA_BUF_SIZE];
+  static char     dline[160];                 // epoch+tau0 header + 11 octaves outgrow NMEA_BUF_SIZE
   if (!adev_dump_pending) return;
   if (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED) { adev_dump_pending = 0; dn = -1; return; }
 
@@ -2993,8 +3022,11 @@ static void adev_dump_step(void){
     adev_reduce();                            // fresh octave cache (never in an ISR)
     uint8_t  noct  = adev_noct;
     uint16_t valid = adev_valid;
-    char body[112];
-    int nb = snprintf(body, sizeof body, "PMADEV,%u,%u", (unsigned)valid, (unsigned)noct);
+    char body[128];
+    // Self-describing for machine consumers: epoch (unix s) + tau0 (s) lead the sentence, so tau_k =
+    // tau0 * 2^k needs no out-of-band spec and stale sentences are detectable.
+    int nb = snprintf(body, sizeof body, "PMADEV,%lu,1,%u,%u",
+                      (unsigned long)(uint32_t)currentTime, (unsigned)valid, (unsigned)noct);
     if (nb < 0 || nb >= (int)sizeof body) { adev_dump_pending = 0; return; }
     for (uint8_t k = 0; k < noct; k++) {
       int t = snprintf(body + nb, sizeof body - nb, ",%.2e", (double)adev_sigma_cache[k]);
@@ -3016,6 +3048,44 @@ static void adev_dump_step(void){
     return;
   }
   dn = -1; adev_dump_pending = 0;
+}
+
+// "hdev_dump = on": one $PMHDEV sentence — the Hadamard twin of $PMADEV (same shape: epoch, tau0,
+// valid, noct, sigmas), computed on demand from the shared phase ring. Same CDC/BUSY-retry contract.
+static void hdev_dump_step(void){
+  static int      dn = -1;
+  static uint16_t busy_ct = 0;
+  static char     dline[160];
+  if (!hdev_dump_pending) return;
+  if (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED) { hdev_dump_pending = 0; dn = -1; return; }
+
+  if (dn < 0) {
+    uint8_t  noct  = hdev_noct();
+    uint16_t valid = adev_valid;
+    char body[128];
+    int nb = snprintf(body, sizeof body, "PMHDEV,%lu,1,%u,%u",
+                      (unsigned long)(uint32_t)currentTime, (unsigned)valid, (unsigned)noct);
+    if (nb < 0 || nb >= (int)sizeof body) { hdev_dump_pending = 0; return; }
+    for (uint8_t k = 0; k < noct; k++) {
+      int t = snprintf(body + nb, sizeof body - nb, ",%.2e", (double)hdev_sigma_for_m(1u<<k));
+      if (t < 0 || t >= (int)(sizeof body - nb)) { hdev_dump_pending = 0; return; }
+      nb += t;
+    }
+    uint8_t cks = 0;
+    for (int i = 0; i < nb; i++) cks ^= (uint8_t)body[i];
+    int n = snprintf(dline, sizeof dline, "$%s*%02X\r\n", body, (unsigned)cks);
+    if (n <= 0 || n >= (int)sizeof dline) { hdev_dump_pending = 0; return; }
+    dn = n; busy_ct = 0;
+  }
+
+  __disable_irq();
+  uint8_t r = CDC_Copy_Transmit((uint8_t*)dline, (uint16_t)dn);
+  __enable_irq();
+  if (r == USBD_BUSY) {
+    if (++busy_ct > 5000) { hdev_dump_pending = 0; dn = -1; }
+    return;
+  }
+  dn = -1; hdev_dump_pending = 0;
 }
 
 // Main-loop entry point, called every pass. With every tc key at its default this reduces to
@@ -4169,6 +4239,7 @@ int main(void)
 
     tc_housekeeping();   // temp-comp learn/steer/dump; four flag checks when everything is off
     adev_dump_step();    // one-shot $PMADEV emit when adev_dump was set over serial (else 1 flag check)
+    hdev_dump_step();    // one-shot $PMHDEV (Hadamard) twin
 
     LP_MARK(7);
     if (displayMode == MODE_VBAT)
