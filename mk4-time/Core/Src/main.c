@@ -4706,6 +4706,10 @@ static void    s_bal   (const MItem*m,int32_t v){ (void)m;
 static int32_t g_mode  (const MItem*m){ return config.modes_enabled[m->lo]; }
 static void    s_mode  (const MItem*m,int32_t v){ menuSetMode((uint8_t)m->lo, v?1:0); }
 static void    s_fwcrc (const MItem*m,int32_t v){ (void)m; menuSetMode(MODE_FIRMWARE_CRC_T,v?1:0); config.modes_enabled[MODE_FIRMWARE_CRC_D]=v?1:0; }
+// Factory reset (MIT_ACTION): EDIT opens a "SURE?" confirm; SAVE fires it -> menu_reset_step erases the
+// on-device store and re-reads config.txt (back to defaults, no reboot). CANCEL / a zero commit is a no-op.
+static int32_t g_reset (const MItem*m){ (void)m; return 0; }
+static void    s_reset (const MItem*m,int32_t v){ (void)m; if (v) menu_reset_pending = 1; }
 
 static const char *const en_colon[] = {"SLOWFADE","HEARTBt","1PPS SAW","ALT SAW","TOGGLE","SOLID"};
 static const char *const en_nmea[]  = {"ALL","RMC","NONE"};
@@ -4722,6 +4726,7 @@ static const MItem menu_items[] = {
   { KID_PPS,        MIT_TOGGLE,"PPS OUT",  0,1,1,      NULL,     g_pps,    s_pps,    SEC_SYS  },
   { KID_NMEA,       MIT_ENUM,  "NMEA",     0,2,1,      en_nmea,  g_nmea,   s_nmea,   SEC_SYS  },
   { KID_MATRIX_FREQ,MIT_STEP,  "MATRIX",   8000,100000,1000,NULL,g_matrix, s_matrix, SEC_SYS  },   // menu floor 8000 (flicker); config MATRIX_FREQUENCY reaches the 1000 hw floor
+  { KID_RESET,      MIT_ACTION,"RESET",    0,0,0,       NULL,     g_reset,  s_reset,  SEC_SYS  },   // factory-reset the on-device settings (confirm required)
   { KID_TEMPCOMP,   MIT_TOGGLE,"TEMPCOMP", 0,1,1,      NULL,     g_tc,     s_tc,     SEC_DIAG },   // arms learn+apply; the TC VIEW mode below just displays the model
   MODE_ROW(MODE_ISO8601_STD,SEC_CAL,"ISO 8601"), MODE_ROW(MODE_ISO_ORDINAL,SEC_CAL,"ISO ORD"),
   MODE_ROW(MODE_ISO_WEEK,SEC_CAL,"ISO WEEK"),     MODE_ROW(MODE_UNIX,SEC_CAL,"UNIX"),
@@ -4780,6 +4785,8 @@ static void menu_render_item(void){
       int labcap = 10 - 1 - 2, ll = (int)strlen(m->label);
       if (ll > labcap) ll = labcap;
       snprintf(buf,sizeof buf,"%.*s %s", ll, m->label, st);
+    } else if (m->type==MIT_ACTION) {                                          // ACTION: just the label at L2 (the confirm lives at L3)
+      snprintf(buf,sizeof buf,"%.10s", m->label);
     } else {                                                                   // ENUM: keep the LABEL (you scroll by label), truncate the (long) value
       menu_fmt_val(m, v, val);
       if (snprintf(buf,sizeof buf,"%s %s",m->label,val) > 10){
@@ -4790,9 +4797,9 @@ static void menu_render_item(void){
     }
     menu_show(buf);
   } else {                       // L3_EDIT: show the value being scrubbed
-    if (m->key_id==KID_MATRIX_FREQ) snprintf(buf,sizeof buf,"%ld",(long)(menu_val/1000));  // kHz, matches the L2 form (the stored value stays Hz; step is 1000 Hz = 1 kHz)
-    else menu_fmt_val(m, menu_val, buf);
-    menu_show(buf);
+    if (m->type==MIT_ACTION)        menu_show("SURE?");                                     // action confirm: SAVE fires, CANCEL aborts
+    else if (m->key_id==KID_MATRIX_FREQ) { snprintf(buf,sizeof buf,"%ld",(long)(menu_val/1000)); menu_show(buf); }  // kHz, matches the L2 form (stored value stays Hz; step 1000 Hz = 1 kHz)
+    else { menu_fmt_val(m, menu_val, buf); menu_show(buf); }
   }
 }
 
@@ -4830,6 +4837,7 @@ static int32_t menu_accel_inc(const MItem*m,int dir){
 static void menu_edit_step(int dir){
   const MItem *m=&menu_items[menu_idx];
   int32_t want;
+  if (m->type==MIT_ACTION) return;                                   // confirm screen ("SURE?") — nothing to scrub
   if (m->type==MIT_ENUM){ want=menu_val+dir; if(want>m->hi)want=0; if(want<0)want=m->hi; }
   else if (m->type==MIT_TOGGLE){ want=!menu_val; }
   else { int32_t d=menu_accel_inc(m,dir), inc=d<0?-d:d;    // MIT_STEP: accelerated increment
@@ -4854,14 +4862,17 @@ static void menu_cancel_edit(void){
 }
 static void menu_commit_edit(void){
   const MItem *m=&menu_items[menu_idx];
+  if (m->type==MIT_ACTION) { m->set(m, 1); }   // fire the one-shot action (e.g. factory reset) — nothing to persist
+  else {
   menu_record_key(m->key_id, menu_val);   // record for flash (value already applied live)
   if (m->key_id==KID_MATRIX_FREQ) setDisplayFreq(matrix_freq_hz);  // §4: authoritative final sync past the UART throttle
+  }
   menu_colon_preview_end();                                        // §3.5: back to the context colon
   menu_layer=L2_ITEM; menu_render_item();
 }
 
 // ---- rolling self-labeled chord stages (read the label, release on the one you want) ----
-static const char *const chord_L0[4]    = { "", "SETUP", "",       "RESET" };
+static const char *const chord_L0[4]    = { "", "SETUP", "",       "REBOOT" };   // stage 3 (deep hold, ~2s) reboots (NVIC reset); factory reset is the SYS>RESET menu item
 static const char *const chord_L1sec[4] = { "", "ENTER", "EXIT",   ""      };  // L1_SECTION
 static const char *const chord_L2itm[4] = { "", "EDIT",  "BACK",   ""      };  // L2_ITEM
 static const char *const chord_L3edt[4] = { "", "SAVE",  "CANCEL", ""      };  // L3_EDIT
@@ -4876,7 +4887,7 @@ static void menu_fire_stage(void){
   if (!menu_chord) return;
   if (menu_layer==L0_CLOCK){
     if (menu_stage==1){ menu_layer=L1_SECTION; menu_render_item(); }   // SETUP -> section ring (resumes menu_section)
-    else if (menu_stage>=3){ buttonsBothHeld(); }                      // deepest labeled hold = reset (L0 ONLY)
+    else if (menu_stage>=3){ buttonsBothHeld(); }                      // deepest labeled hold ("REBOOT", ~2s) = NVIC reset (L0 ONLY). Factory reset is SYS>RESET.
   } else if (menu_layer==L1_SECTION){
     if (menu_stage==1){                                                // ENTER -> item ring of this section
       if (menu_items[menu_idx].section != menu_section) menu_idx = menu_first_in_section(menu_section);
