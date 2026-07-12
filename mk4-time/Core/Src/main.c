@@ -249,14 +249,15 @@ void menu_isr_event(uint8_t evt){
 static struct {
   _Bool    valid;
   uint16_t stamp_fdate, stamp_ftime;   // config.txt mtime when the override was made
-  uint16_t simple_mask;                // bit per KID 1..9 (u16: KID_MATRIX_FREQ=8 / KID_TEMPCOMP=9 overflow a u8)
+  uint16_t simple_mask;                // bit per KID 1..10 (u16: KID_MATRIX_FREQ=8..KID_BALANCE=10 overflow a u8)
   int16_t  brightness; uint8_t colon, alt_colon; uint16_t page_ms;
   uint8_t  sig_fade, pps, nmea;
   uint32_t matrix_freq;                // KID_MATRIX_FREQ (u32: 100000 > u16)
   uint8_t  tc;                         // KID_TEMPCOMP: 1 = learn+apply armed
+  uint8_t  bal;                        // KID_BALANCE: 1 = seg+colon balance AUTO
   uint32_t modes_mask, modes_val;      // bit per MODE_* ordinal
 } ovr;
-static uint16_t cfg_simple_defined;    // bit per KID 1..9 set by config.txt this load
+static uint16_t cfg_simple_defined;    // bit per KID 1..10 set by config.txt this load
 static uint32_t cfg_modes_defined;     // bit per MODE_* ordinal set by config.txt this load
 static _Bool    menu_dirty = 0;        // a menu edit is awaiting flash commit
 
@@ -2157,12 +2158,14 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     // fixed manual strength (<=100 linear blend, >100 power-law) for tuning experiments.
     int v = truthy(value) ? 1 : atoi(value);
     seg_balance = (uint16_t)(v < 0 ? 0 : (v > 300 ? 300 : v));
+    if (!from_serial) cfg_simple_defined |= (1u<<KID_BALANCE);   // menu BALANCE toggle bundles seg+colon
   } else if (strcasecmp(key, "colon_balance") == 0) {
     // Dim the colons with the rail (see colon_balance_poll). "on"/1 = AUTO curve; a numeric 2..256
     // pins a fixed scale (of 256) for eyeball calibration. The main-loop poll re-applies it.
     int v = truthy(value) ? 1 : (falsey(value) ? 0 : atoi(value));
     colon_balance = (uint16_t)(v < 0 ? 0 : (v > 256 ? 256 : v));
     colonForce = 1;                   // land an explicit sweep step even if within the hysteresis band
+    if (!from_serial) cfg_simple_defined |= (1u<<KID_BALANCE);
   } else if (strcasecmp(key, "colon_full_at") == 0) {
     // Per-hardware anchor: the dac (0..4095) at/below which AUTO colons run at full scale. Overrides
     // the baked default. Kept below full-scale so 4095-colon_full_at stays a positive span.
@@ -4257,9 +4260,10 @@ static uint16_t ee_crc16(const uint8_t*p, uint32_t n){   // CRC-16-CCITT (poly 0
 }
 // Record byte layout: 0 magic u32 | 4 gen u32 | 8 schema u16 | 10 fdate u16 | 12 ftime u16 |
 // 14 simple_mask u16 | 16 modes_mask u32 | 20 modes_val u32 | 24 brightness i16 | 26 colon u8 |
-// 27 alt_colon u8 | 28 page_ms u16 | 30 sig_fade u8 | 31 pps u8 | 32 nmea u8 | 33 matrix_freq u32 | 37 tc u8 | 38..61 rsvd | 62 crc16.
-// (bytes 15, 33..36 and 37 were zeroed padding in every prior record, so widening simple_mask u8->u16
-//  and adding matrix_freq u32 + tc u8 round-trip old records with those fields clear; EE_SCHEMA stays 1.)
+// 27 alt_colon u8 | 28 page_ms u16 | 30 sig_fade u8 | 31 pps u8 | 32 nmea u8 | 33 matrix_freq u32 | 37 tc u8 | 38 bal u8 | 39..61 rsvd | 62 crc16.
+// (bytes 15, 33..36, 37 and 38 were zeroed padding in every prior record, so widening simple_mask
+//  u8->u16 and adding matrix_freq u32 + tc u8 + bal u8 round-trip old records with those fields clear;
+//  EE_SCHEMA stays 1.)
 static void ee_pack(uint8_t*r, uint32_t gen){
   memset(r,0,EE_REC_SZ);
   uint32_t mg=EE_MAGIC; memcpy(r+0,&mg,4); memcpy(r+4,&gen,4);
@@ -4269,7 +4273,7 @@ static void ee_pack(uint8_t*r, uint32_t gen){
   memcpy(r+16,&ovr.modes_mask,4); memcpy(r+20,&ovr.modes_val,4);
   memcpy(r+24,&ovr.brightness,2); r[26]=ovr.colon; r[27]=ovr.alt_colon;
   memcpy(r+28,&ovr.page_ms,2); r[30]=ovr.sig_fade; r[31]=ovr.pps; r[32]=ovr.nmea;
-  memcpy(r+33,&ovr.matrix_freq,4); r[37]=ovr.tc;
+  memcpy(r+33,&ovr.matrix_freq,4); r[37]=ovr.tc; r[38]=ovr.bal;
   uint16_t crc=ee_crc16(r,62); memcpy(r+62,&crc,2);
 }
 static void ee_unpack(const uint8_t*r){
@@ -4278,7 +4282,7 @@ static void ee_unpack(const uint8_t*r){
   memcpy(&ovr.modes_mask,r+16,4); memcpy(&ovr.modes_val,r+20,4);
   memcpy(&ovr.brightness,r+24,2); ovr.colon=r[26]; ovr.alt_colon=r[27];
   memcpy(&ovr.page_ms,r+28,2); ovr.sig_fade=r[30]; ovr.pps=r[31]; ovr.nmea=r[32];
-  memcpy(&ovr.matrix_freq,r+33,4); ovr.tc=r[37];
+  memcpy(&ovr.matrix_freq,r+33,4); ovr.tc=r[37]; ovr.bal=r[38];
   ovr.valid=1;
 }
 static void ee_init_base(void){
@@ -4564,6 +4568,7 @@ void menu_apply_overrides(void){
   OVR_S(KID_NMEA,       nmea_cdc_level=ovr.nmea)
   OVR_S(KID_MATRIX_FREQ,setDisplayFreq(ovr.matrix_freq))   // clamping setter (never ARR-direct) -> a bad stored value can't brick
   OVR_S(KID_TEMPCOMP,   tc_learn=tc_apply=ovr.tc?1:0)
+  OVR_S(KID_BALANCE,    { seg_balance=colon_balance=ovr.bal?1:0; colonForce=1; })
   #undef OVR_S
   for (uint8_t m=0;m<NUM_DISPLAY_MODES;m++)
     if ((ovr.modes_mask&(1u<<m)) && (!(cfg_modes_defined&(1u<<m))||stamp_ok))
@@ -4593,6 +4598,7 @@ static void menu_record_key(uint8_t key_id, int32_t v){
     case KID_NMEA:       ovr.nmea=(uint8_t)v; break;
     case KID_MATRIX_FREQ:ovr.matrix_freq=(uint32_t)v; break;
     case KID_TEMPCOMP:   ovr.tc=(uint8_t)(v?1:0); break;
+    case KID_BALANCE:    ovr.bal=(uint8_t)(v?1:0); break;
   }
 }
 
@@ -4680,6 +4686,11 @@ static void    s_matrix(const MItem*m,int32_t v){   // §4 live-preview: ARR eve
 // still exposes tc_learn / tc_apply separately for asymmetric setups; the menu treats them as a pair.
 static int32_t g_tc    (const MItem*m){ (void)m; return (tc_learn && tc_apply) ? 1 : 0; }
 static void    s_tc    (const MItem*m,int32_t v){ (void)m; tc_learn = tc_apply = v?1:0; }
+// BALANCE: one DISP toggle arms BOTH brightness-uniformity systems at their baked AUTO curves —
+// per-segment duty equalisation (seg_balance) AND rail-tied colon dimming (colon_balance). config.txt
+// keeps the finer seg_balance / colon_balance keys (incl. manual strengths) for calibration.
+static int32_t g_bal   (const MItem*m){ (void)m; return (seg_balance && colon_balance) ? 1 : 0; }
+static void    s_bal   (const MItem*m,int32_t v){ (void)m; seg_balance = colon_balance = v?1:0; colonForce = 1; }
 static int32_t g_mode  (const MItem*m){ return config.modes_enabled[m->lo]; }
 static void    s_mode  (const MItem*m,int32_t v){ menuSetMode((uint8_t)m->lo, v?1:0); }
 static void    s_fwcrc (const MItem*m,int32_t v){ (void)m; menuSetMode(MODE_FIRMWARE_CRC_T,v?1:0); config.modes_enabled[MODE_FIRMWARE_CRC_D]=v?1:0; }
@@ -4691,6 +4702,7 @@ static const char *const en_nmea[]  = {"ALL","RMC","NONE"};
 // Physical order UNCHANGED (menu_idx absolute, persistence keys off key_id); .section groups the ring.
 static const MItem menu_items[] = {
   { KID_BRIGHTNESS, MIT_STEP,  "BRIGHT",  -1,4095,256, NULL,     g_bright, s_bright, SEC_DISP },
+  { KID_BALANCE,    MIT_TOGGLE,"BALANCE",  0,1,1,       NULL,     g_bal,    s_bal,    SEC_DISP },   // per-segment + colon brightness uniformity (baked AUTO curves)
   { KID_COLON,      MIT_ENUM,  "COLON",    0,5,1,      en_colon, g_colon,  s_colon,  SEC_DISP },
   { KID_COLON_ALT,  MIT_ENUM,  "ALTCOLON", 0,5,1,      en_colon, g_acolon, s_acolon, SEC_DISP },
   { KID_PAGE_MS,    MIT_STEP,  "PAGE MS",  250,60000,250,NULL,   g_page,   s_page,   SEC_DISP },
