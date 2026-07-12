@@ -1,7 +1,7 @@
 
 # Matrix refresh rate, in Hz. Min 1000, max 100000
 # This number is only a target, exact frequency will be a division of processor clock speed.
-# Note the display is split into four matrices of 5 digits each. The number given here is the 
+# Note the display is split into four matrices of 5 digits each. The number given here is the
 # refresh rate of the display - the clock frequency of the matrix will be five times this number.
 MATRIX_FREQUENCY = 20000
 
@@ -76,6 +76,10 @@ Tolerance_time_100ms = 100000
 
 # For paranoia, set the 1ms tolerance to 1, which will disable the last digit as soon as GPS fix is lost.
 # To turn off the tolerance feature, set all tolerances to 0.
+# Or replace the fixed ladder with measured uncertainty: with significance_fade on, each digit
+# is dashed when the live 3-sigma holdover error passes its place value (uses the calibration +
+# the learned temperature model), instead of at the fixed times above.
+significance_fade = off
 
 
 # nonlinear brightness curve, five stops of input->output, use brightness-curve.htm for a GUI.
@@ -155,7 +159,7 @@ tc_persist = off
 #tc_seed_lo = 26
 #tc_seed_hi = 36
 
-# show die temp / model offsets / sample count on the date row (four pages, 5.5 s each)
+# show die temp / model offsets / sample count on the date row (pages like the astro modes)
 mode_tempcomp = 0
 
 # model centre (deg C) and safety limits; paste frozen coefficients from tc_dump below.
@@ -178,7 +182,6 @@ mode_tempcomp = 0
 # tc_seed = on
 # tc_seed_lo =
 # tc_seed_hi =
-
 
 
 ## astro modes (GPS-derived)

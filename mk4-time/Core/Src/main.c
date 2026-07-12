@@ -402,9 +402,9 @@ volatile _Bool   tc_seed = 0;                 // config: warm-start from the see
 volatile int16_t tc_seed_lo = 0, tc_seed_hi = 0;   // seed coverage (die °C): bounds the prior — never extrapolated
 uint8_t tc_hse_prior = 0, tc_lse_prior = 0;   // seed model order still held (0 = handed over to real data)
 _Bool tc_seed_done = 0;                        // one-shot: seed once per power-on (BSS-cleared at reset)
-// Serial "tc_seed = on" arms this in the USB ISR; tc_housekeeping consumes it in the MAIN LOOP.
-// The learned-state contract ("main-loop only") holds: the ISR only ever touches this one flag
-// (plus the already-accepted single-word tc_cfg_*/tc_seed slots) — never the model itself.
+// Serial "tc_seed = on" arms this (ISR-side single-word write); tc_housekeeping consumes it in the
+// MAIN LOOP, so the learned-state contract ("main-loop only") holds and a paste seeds exactly once,
+// after all its coefficient lines have parsed (send "tc_seed = on" last — the order tc_dump prints).
 volatile _Bool tc_seed_pending = 0;
 static void tc_seed_apply(void);              // defined by the tempcomp block; called after the config load
 void tc_seed_from_flash(void);                // retained-model auto-seed; runs just before tc_seed_apply
@@ -433,7 +433,7 @@ struct {
   time_t countdown_to;
   float brightness_override;
   volatile _Bool zone_override;
-  uint16_t page_ms;             // sub-screen dwell, ms, for every mode that pages its date row on uwTick / page_ms()
+  uint16_t page_ms;       // paged astro modes (SUN/LATLON): sub-screen dwell, ms
   _Bool modes_enabled[NUM_DISPLAY_MODES];
 
 } config = {0};
@@ -468,9 +468,9 @@ void memcpyword(volatile uint32_t *dest, volatile uint32_t *src, size_t n){
 static _Bool astro_pos_ok(float lat, float lon){
   return lat >= -90.0f && lat <= 90.0f && lon >= -180.0f && lon <= 180.0f;
 }
-// Sub-screen dwell (ms) for every mode that pages its date row. Unset -> 5500 ms, a
-// subjectively-tuned cadence found by feel. Floored at 250 ms so a tiny value can't
-// flood the date-board UART.
+// Sub-screen dwell (ms) for the paged astro modes (SUN, LATLON). Unset -> 5500 ms,
+// a subjectively-tuned cadence, found by feel. Floored at 250 ms so a tiny value
+// can't flood the date-board UART.
 static uint32_t page_ms(void){ uint32_t m = config.page_ms; return m == 0 ? 5500 : (m < 250 ? 250 : m); }
 // Decimal UTC hour (sun_times may return <0 or >24) -> local minutes-of-day [0,1440).
 static int astro_local_minutes(double utc_h){
@@ -1017,7 +1017,7 @@ void sendDate( _Bool now ){
   //     leaving the time row as the running clock (SATVIEW-style). --------------
   case MODE_SUN: {
     if (!astro.have_pos || !astro.epoch) { i = sprintf((char*)&uart2_tx_buffer[1], "RISE  ----"); break; }
-    int page = (uwTick / page_ms()) % 3;               // rise -> set -> solar noon, page_ms each
+    int page = (uwTick / page_ms()) % 3;              // rise -> set -> solar noon, page_ms each
     // labels padded to 4 chars in the literal ("SET "/"SOL ") so the time digits
     // line up under RISE without relying on the nano printf honouring "%-4s"
     const char *lbl = page == 0 ? "RISE" : page == 1 ? "SET " : "SOL ";
@@ -1044,11 +1044,12 @@ void sendDate( _Bool now ){
   case MODE_LATLON:
     // RISE/SET-style layout: label, separator space, a sign slot (space when positive), then
     // the digits — numbers align whether signed or not, and short values keep clear space at
-    // the row's end. A 3-digit longitude can't fit both the separator and the sign slot in
-    // 10 chars, so the separator is dropped just for that case ("LON 179.99" / "LON-179.99").
+    // the row's end: "LAT  51.48" / "LAT -51.48". A 3-digit longitude can't fit both the
+    // separator and the sign slot in 10 chars, so the separator is dropped just for that case
+    // ("LON 179.99" / "LON-179.99").
     if (!astro.have_pos || !astro.epoch) { i = sprintf((char*)&uart2_tx_buffer[1], "LAT  ----"); }
     else {
-      _Bool lat = (uwTick / page_ms()) % 2 == 0;       // page latitude / longitude, page_ms each
+      _Bool lat = (uwTick / page_ms()) % 2 == 0;      // page latitude / longitude, page_ms each
       double v = lat ? astro.lat_show : astro.lon_show;
       long h = (long)(v * 100.0 + (v < 0 ? -0.5 : 0.5));  // hundredths, rounded
       long a2 = h < 0 ? -h : h;
@@ -1167,9 +1168,6 @@ void setNextCountdown(time_t nextTime){
   next7seg.c = cLut[seconds % 10];
 }
 
-// Store UTC on RTC
-// need to also write zone into backup registers
-// Only called at the start of a second, don't attempt to write subseconds.
 // --- Alternate timebase (MODE_LST / MODE_SOLAR) ------------------------------------------
 // The TIME ROW ticks Local Sidereal Time or apparent solar time. Heavy double
 // math runs in THREAD context once per second (alt_update), staging the reading for the
@@ -1283,6 +1281,9 @@ void alt_update(void){
   __enable_irq();
 }
 
+// Store UTC on RTC
+// need to also write zone into backup registers
+// Only called at the start of a second, don't attempt to write subseconds.
 void write_rtc(void){
 
   RTC_DateTypeDef sdatestructure;
@@ -2199,10 +2200,7 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
   } else if (strcasecmp(key, "tc_lse_c") == 0) { tc_parse_coeff(value, &tc_cfg_lse[2]);
   } else if (strcasecmp(key, "tc_seed") == 0) {
     tc_seed = truthy(value);          // load the coefficients above as an EVOLVING prior, not a freeze
-    // Over serial, the "tc_seed = on" line is the TRIGGER: it arms a main-loop apply, so a paste
-    // seeds exactly once, after all its coefficient lines have parsed (send it last — the order
-    // tc_dump prints). ISR-safe by design: the apply itself always runs from tc_housekeeping.
-    if (from_serial && tc_seed) tc_seed_pending = 1;
+    if (from_serial && tc_seed) tc_seed_pending = 1;   // serial trigger: apply from the main loop
     if (!from_serial) cfg_tc_defined |= CFG_TC_SEED;   // config.txt supplies its own seed -> flash seed stands down
   } else if (strcasecmp(key, "tc_seed_lo") == 0) {
     tc_seed_lo = (int16_t)atoi(value);   // seed coverage low edge (die °C) — the prior is not extrapolated
@@ -2257,7 +2255,7 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
 }
 
 void postConfigCleanup(void){
-  // Keep the alternate-timebase colon distinct unless the user EXPLICITLY matched them.
+  // Keep the sidereal colon distinct unless the user EXPLICITLY matched the two.
   if (!colonAltExplicit && colonModeAlt == colonModeCivil) {
     colonModeAlt = (colonModeCivil != COLON_MODE_ALT_SAWTOOTH) ? COLON_MODE_ALT_SAWTOOTH
                  : COLON_MODE_TOGGLE;
@@ -3484,11 +3482,9 @@ static void computeHoldoverFade(void){
 void tc_housekeeping(void){
   if (!tc_nom_load) tc_nom_load = SysTick->LOAD;       // capture the nominal period once
 
-  // Serial warm-start, deferred out of the USB ISR: "tc_seed = on" armed the flag; apply here,
-  // serialized with tc_fit/tc_governor (the learned state stays main-loop-only). With the seed
-  // already applied, the same call is the freeze guard — it just re-NANs any tc_hse_*/tc_lse_*
-  // coefficients a later serial line reparsed, so the frozen path can't reactivate over the
-  // evolving model.
+  // Serial warm-start (armed by the "tc_seed = on" line) + the evolving seed's freeze guard: with
+  // the seed applied, the same call just re-NANs any tc_hse_*/tc_lse_* coefficients a serial line
+  // reparsed, so the frozen path can't silently reactivate over the evolving model.
   if (tc_seed_pending) { tc_seed_pending = 0; tc_seed_apply(); }
   else if (tc_seed_done) tc_seed_apply();
 
@@ -4199,7 +4195,7 @@ void nextMode(_Bool reverse){
       latchSegments();
     }
   }
-  applyColonForMode();   // idempotent: alt colon on entry, civil colon on exit
+  applyColonForMode();   // idempotent: sidereal colon on entry, civil colon on exit
   sendDate(1);
 }
 void button1pressed(void){
@@ -5628,6 +5624,8 @@ int main(void)
     if (delayedPostConfigCleanup) {
       delayedPostConfigCleanup=0;
       postConfigCleanup();
+      // tempcomp seeding/freeze-guard runs from tc_housekeeping (same pass), keyed by
+      // tc_seed_pending / tc_seed_done — one place, serialized with tc_fit/tc_governor.
     }
 
     fatfs_busy=1;   // FATFS_remount + readConfigFile + checkDelayedLoadRules touch FATFS
@@ -5672,11 +5670,12 @@ int main(void)
     if (displayMode == MODE_SUN  || displayMode == MODE_SUN_AZEL || displayMode == MODE_MOON
         || displayMode == MODE_GRID || displayMode == MODE_LATLON || displayMode == MODE_DARK) {
       astro_update();
-      // honour the ms page dwell: the date row otherwise only repaints at 1 Hz, so repaint
-      // the moment a paged mode flips sub-screen. Only with a fix (no-fix shows a
-      // page-independent "----"), and never in the last decisecond -- there the SysTick ISR
-      // runs its own (non-reentrant, shared-UART) sendDate(0), so we'd race it. Same
-      // decisec!=9 guard the existing main-loop sendDate(1) calls use.
+      // honour the ms page dwell: the date row otherwise only repaints at 1 Hz, so
+      // repaint the moment a paged mode flips sub-screen. Only with a fix (no-fix shows
+      // a page-independent "----"), and never in the last decisecond -- there the SysTick
+      // ISR runs its own (non-reentrant, shared-UART) sendDate(0), so we'd race it. Same
+      // decisec!=9 guard the existing main-loop sendDate(1) calls use. last_pg is left
+      // unchanged when skipped, so the flip just shows on the next loop (<=100 ms later).
       LP_MARK(8);
     if ((displayMode == MODE_SUN || displayMode == MODE_LATLON || displayMode == MODE_DARK) && astro.have_pos && astro.epoch) {
         static uint32_t last_pg = 0;
@@ -5714,7 +5713,6 @@ int main(void)
     // (thread-context doubles; no-op in every other mode)
     LP_MARK(9);
     alt_update();
-
 
     /* USER CODE END WHILE */
 
