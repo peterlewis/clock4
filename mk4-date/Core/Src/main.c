@@ -316,12 +316,22 @@ uint8_t segbal_duty_a[5] = {16,16,16,16,16};   // lit cycles (of 16) per column,
 uint8_t segbal_duty_b[5] = {16,16,16,16,16};
 uint8_t segbal_cycle = 0;                // advances once per 5-column sweep, wraps at the depth
 
-// rank(c) for D=16 (bit-reversed c); for D=8/4 shift right by 1/2. Cycle c is lit iff rank < s:
-// NESTED van-der-Corput order, so when a digit's duty steps (its segment count changed — every
-// date change, and every table update) the lit set gains or loses exactly one cycle instead of
-// reshuffling. A reshuffling spread — e.g. (c*s) % D < s — re-phases the digit's light at each
-// step, hardware-observed on the time board as a visible once-per-second tick in the ghost bleed.
+// rank(c) for D=16 (bit-reversed c); for D=8/4 shift right by 1/2. A digit is lit on the cycles
+// whose rank falls in ITS OWN window of size s: (rank + phase) mod D < s, phase fixed per digit
+// (port x column). Two properties, both hardware-proven the hard way:
+//  - NESTED: when a duty steps (segment count changed, duty table re-forwarded) the lit set
+//    gains/loses exactly one cycle instead of reshuffling — a reshuffling spread (e.g.
+//    (c*s) % D < s, the first ship) visibly re-phases the light at each step.
+//  - DECORRELATED: distinct phases keep the digits' lit cycles spread across the period. With
+//    one shared window (no rotation — the second ship) every digit lit the same low-rank cycles:
+//    high-rank cycles went ALL-dark (whole-row 200 Hz comb), the shared rail saw a sawtooth that
+//    stepped with the time board's content, and the row blipped at 1 Hz with per-digit brightness
+//    off calibration.
+// A rotated rank window bit-reverses to a van-der-Corput run, so spacing stays near-even at
+// every s. Identity (duty 16 = s = D) lights every cycle regardless of phase = stock-identical.
 static const uint8_t SEGBAL_REV16[16] = {0,8,4,12,2,10,6,14,1,9,5,13,3,11,7,15};
+static const uint8_t SEGBAL_PH_A[5] = {0, 6, 12, 2, 8};    // idx*3 mod 16, idx = col*2 + port —
+static const uint8_t SEGBAL_PH_B[5] = {3, 9, 15, 5, 11};   // all 10 digit phases distinct
 
 static uint8_t segbal_pop(uint16_t v){
   uint8_t n = 0;
@@ -464,8 +474,8 @@ void TIM2_IRQHandler(void)
     if (segbal_duty_a[buffer_idx] && !sa) sa = 1;
     if (segbal_duty_b[buffer_idx] && !sb) sb = 1;
     uint8_t r = (uint8_t)(SEGBAL_REV16[segbal_cycle % D] >> ((D == 16u) ? 0 : (D == 8u) ? 1 : 2));
-    if (r >= sa) wa &= (uint16_t)~SEGBAL_MASK_A;
-    if (r >= sb) wb &= (uint16_t)~SEGBAL_MASK_B;
+    if (((uint8_t)(r + SEGBAL_PH_A[buffer_idx]) & (D - 1u)) >= sa) wa &= (uint16_t)~SEGBAL_MASK_A;
+    if (((uint8_t)(r + SEGBAL_PH_B[buffer_idx]) & (D - 1u)) >= sb) wb &= (uint16_t)~SEGBAL_MASK_B;
 
     GPIOA->ODR = wa;
     GPIOB->ODR = wb;
