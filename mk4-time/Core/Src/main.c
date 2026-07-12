@@ -4774,8 +4774,10 @@ void menu_poll(void){
   }
   // Flush a pending edit to flash only back at the clock, with the display UART idle and no PPS
   // timestamp waiting to emit — a page erase stalls the CPU ~20 ms and mustn't delay a $PMTXTS.
+  // NB: guard on pps_emit_pending() (a REAL pending $PMTXTS emit), not pps_record_pending alone —
+  // that flag latches high on any GPS-locked clock with PPS-out off, and would wedge the gate forever.
   if (menu_dirty && menu_layer==L0_CLOCK && !waitingForLatch &&
-      huart2.gState==HAL_UART_STATE_READY && !pps_record_pending){
+      huart2.gState==HAL_UART_STATE_READY && !pps_emit_pending()){
     if (ee_commit()) menu_dirty=0;
   }
 }
