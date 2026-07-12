@@ -1261,9 +1261,16 @@ void displayOn(void){
 //     s = 16 - strength * (16 - 2 * popcount(segments)) / 100
 // so at full strength s = 2N and every lit segment averages the same duty-per-segment product:
 // (1/N) * (2N/16) = 1/8, uniform across the display (an 8-segment '8.' keeps 16/16 — sparse
-// digits dim DOWN to its level, dense digits are untouched). The cycle mask ((k*s) % 16 < s)
-// spreads the s lit cycles evenly (worst refresh ~7.8 kHz — far above flicker) and always lights
-// cycle 0 — the master slot — so masters are never rewritten and count toward the duty exactly.
+// digits dim DOWN to its level, dense digits are untouched). The cycle mask (rank(k) < s, with
+// rank = bit-reversed k) picks the s lit cycles in NESTED van-der-Corput order: near-evenly
+// spread at every s (worst case — s = 1 — identical to any spread, far above flicker) and always
+// lighting cycle 0 — the master slot — so masters are never rewritten and count toward the duty
+// exactly. Nested is the load-bearing property: s changes whenever a digit's segment count does
+// (at every second boundary, at least), and a spread that RESHUFFLES its lit set on s±1 — e.g.
+// (k*s) % 16 < s — re-phases the whole column's light at that instant. Hardware-observed as a
+// once-per-second step in the ghost bleed of unlit segments and a beat on the sub-second digits.
+// In nested order the lit set for s+1 is the lit set for s plus exactly one cycle: a duty step
+// moves only the light it must.
 //
 // Above 100 the map turns into a power law, s = 16*(N/8)^(strength/100) — continuous at 100
 // (gamma 1 = the linear map). Near the LED forward-voltage knee (low rail) segment current is
@@ -1284,6 +1291,10 @@ volatile uint16_t seg_balance = 0;     // 0 = off (stock) · 1/on = AUTO (calibr
 
 #define SEGBAL_BSEG_MASK 0x01FCu       // GPIOB word: bits 2..8 are segments; everything else
                                        // (bCat column selects etc.) passes through unmasked
+
+// rank(k) for D=16 (bit-reversed k). For D=8/4 shift right by 1/2 — dropping the low bits of the
+// reversal is exactly the 3-/2-bit reversal, so one table serves every depth.
+static const uint8_t SEGBAL_REV16[16] = {0,8,4,12,2,10,6,14,1,9,5,13,3,11,7,15};
 
 // Lit cycles (of 16) for a digit with n lit segments at effective strength `eff` (0..300).
 // n <= 8 always (7 segments + DP). Returns 16 (always lit) .. 1 (floor for any lit digit).
@@ -1383,6 +1394,7 @@ void segbal_poll(void){
   if (ms == last_ms && display_scan_len == want_len) return;
   last_ms = ms;
 
+  uint32_t revsh = (D == 16u) ? 0u : (D == 8u) ? 1u : 2u;  // SEGBAL_REV16 shift for this depth
   for (uint32_t col = 0; col < 5; col++) {
     uint16_t mb = buffer_b[col];
     uint8_t  ml = buffer_c[col].low, mh = buffer_c[col].high;
@@ -1413,11 +1425,10 @@ void segbal_poll(void){
     uint8_t  csel = mh & (uint8_t)~cSegDP;                 // GPIOC column select + enables
     for (uint32_t k = 1; k < D; k++) {
       uint32_t i = col + 5u*k;
-      uint32_t litc  = ((k*sc)  % D < sc);
-      uint32_t litdp = ((k*sdp) % D < sdp);
-      buffer_b[i]      = ((k*sb) % D < sb) ? mb : cat;     // column select stays in every slot
-      buffer_c[i].low  = litc ? ml : 0;
-      buffer_c[i].high = csel | (litdp ? (mh & cSegDP) : 0);
+      uint32_t r = (uint32_t)(SEGBAL_REV16[k] >> revsh);   // nested rank: see block comment above
+      buffer_b[i]      = (r < sb) ? mb : cat;              // column select stays in every slot
+      buffer_c[i].low  = (r < sc) ? ml : 0;
+      buffer_c[i].high = csel | ((r < sdp) ? (mh & cSegDP) : 0);
     }
   }
   if (display_scan_len != want_len) setDisplayPWM(want_len);   // extend to the D-cycle scan
