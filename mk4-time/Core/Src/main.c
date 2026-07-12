@@ -498,9 +498,13 @@ typedef struct { char nm[4]; uint32_t epoch; int8_t alt; } star_entry_t;
 static star_entry_t star_cache[STAR_SHOW];
 static volatile uint8_t star_ncache;
 
-// The live catalogue in RAM (J2000 RA hours / Dec degrees), loaded from the card or the baked default.
-static struct { char nm[4]; float ra; float dec; } star_buf[STAR_MAX];
+// The live catalogue in RAM: J2000 RA hours / Dec degrees + proper motion (mas/yr; mu_alpha* incl.
+// cos-dec), plus the cached APPARENT place of date (ra_now/dec_now, refreshed daily) the transit
+// math consumes. Loaded from the card or the baked default.
+static struct { char nm[4]; float ra; float dec; int16_t pmra, pmdec; float ra_now, dec_now; } star_buf[STAR_MAX];
 static uint16_t star_count = 0;
+static uint8_t  star_from_card = 0;    // provenance: 1 = /STARS.BIN loaded, 0 = baked fallback ($PMSTAR reports C/B — a failed card must not masquerade as success)
+static uint32_t star_apparent_at = 0;  // currentTime of the last apparent-place refresh (0 = never)
 volatile float star_max_mag = 6.0f;   // config "star_max_mag": only load stars brighter than this (file is mag-sorted -> early-stop). Default 6 = the whole file.
 
 // Load /STARS.BIN into star_buf, filtered to star_max_mag. The file is magnitude-sorted, so we stop at
@@ -508,58 +512,100 @@ volatile float star_max_mag = 6.0f;   // config "star_max_mag": only load stars 
 // clamp the count BEFORE writing, byte-check every read, sanity-check RA/Dec. On ANY failure (no card,
 // bad header, torn read) fall back to the baked star_cat_default[] so the feature always works.
 static void loadStars(void){
-  star_count = 0;
+  star_count = 0; star_from_card = 0; star_apparent_at = 0;
   FIL file;
+  _Bool file_ok = 0;
   if (f_open(&file, STARS_FILENAME, FA_READ) == FR_OK){
     unsigned int rc; uint8_t hdr[16];
+    uint16_t rl = 0;
     if (f_read(&file, hdr, 16, &rc) == FR_OK && rc == 16 && memcmp(hdr, "MST1", 4) == 0
-        && (uint16_t)(hdr[6] | (hdr[7]<<8)) == 10u                // recordLength must equal our packed record
+        && ((rl = (uint16_t)(hdr[6] | (hdr[7]<<8))) == 10u || rl == 14u)  // v1 (no PM) or v2 (+pmra/pmdec i16)
         && (uint16_t)(hdr[8] | (hdr[9]<<8)) == 100u){             // mag_scale we decode against (mag*100); reject a file written to a different scale
+      file_ok = 1;
       uint16_t count  = (uint16_t)(hdr[4] | (hdr[5]<<8));
       float    mc = star_max_mag * 100.0f;                       // saturate: a huge star_max_mag means "load all", never wrap negative (out-of-range float->int16 is UB)
       int16_t  magcut = mc > 32767.0f ? 32767 : (mc < -32768.0f ? -32768 : (int16_t)mc);
       for (uint16_t k = 0; k < count && star_count < STAR_MAX; k++){
-        uint8_t rec[10];
-        if (f_read(&file, rec, 10, &rc) != FR_OK || rc != 10) break;      // torn read -> keep what we have
+        uint8_t rec[14];
+        if (f_read(&file, rec, rl, &rc) != FR_OK || rc != rl) break;      // torn read -> keep what we have
         int16_t mag = (int16_t)(rec[4] | (rec[5]<<8));
         if (mag > magcut) continue;                                       // filter per-record (don't trust the file to be mag-sorted); loop still bounded by EOF + STAR_MAX
         float ra  = (float)(uint16_t)(rec[0] | (rec[1]<<8)) / 65536.0f * 24.0f;
         float dec = (float)( int16_t)(rec[2] | (rec[3]<<8)) / 100.0f;
         if (ra < 0.0f || ra >= 24.0f || dec < -90.0f || dec > 90.0f) continue;   // reject garbage
-        memcpy(star_buf[star_count].nm, rec + 6, 4);
+        for (int b = 0; b < 4; b++){                                      // sanitize: name bytes go raw to the date-board UART — never forward control/high-bit bytes from a hostile file
+          uint8_t c = rec[6 + b];
+          star_buf[star_count].nm[b] = (c < 0x20 || c > 0x7E) ? ' ' : (char)c;
+        }
         star_buf[star_count].ra = ra; star_buf[star_count].dec = dec;
+        star_buf[star_count].pmra  = (rl == 14u) ? (int16_t)(rec[10] | (rec[11]<<8)) : 0;
+        star_buf[star_count].pmdec = (rl == 14u) ? (int16_t)(rec[12] | (rec[13]<<8)) : 0;
         star_count++;
       }
     }
     f_close(&file);
   }
-  if (star_count == 0){                                                   // no card / bad file -> baked bright set
+  star_from_card = file_ok;
+  // Fall back to the baked set ONLY when there is no usable FILE. A valid card catalogue whose every
+  // record was trimmed by star_max_mag stays honestly EMPTY — the old star_count==0 test silently
+  // swapped in the baked set, making a failed/over-filtered card indistinguishable from success.
+  if (!file_ok && star_count == 0){
     for (uint16_t s = 0; s < STAR_DEFAULT_N && s < STAR_MAX; s++){
       memcpy(star_buf[s].nm, star_cat_default[s].nm, 4);
       star_buf[s].ra = star_cat_default[s].ra; star_buf[s].dec = star_cat_default[s].dec;
+      star_buf[s].pmra = 0; star_buf[s].pmdec = 0;               // baked set: PM below the display's resolution for these bright stars (documented limitation)
       star_count++;
     }
   }
 }
 
+// J2000 -> apparent place of date: linear proper motion, then RIGOROUS IAU-1976 precession (the
+// zeta/z/theta rotation). The previous first-order formula carried a tan(dec) term that diverges
+// near the pole — Polaris's transit countdown was ~5 minutes wrong by 2026 and growing. The exact
+// rotation has no singularity; it costs ~6 double-trig per star, so it runs at LOW cadence (daily —
+// precession moves ~0.14 arcsec/day) and the per-second star_update just consumes the cache.
+static void star_refresh_apparent(void){
+  const double D2R = 0.017453292519943295;
+  double yrs = ((double)currentTime - 946728000.0) / 31557600.0;   // Julian years since J2000.0
+  double T = yrs / 100.0;                                          // Julian centuries
+  double zeta  = (2306.2181*T + 0.30188*T*T + 0.017998*T*T*T) * (D2R / 3600.0);
+  double zz    = (2306.2181*T + 1.09468*T*T + 0.018203*T*T*T) * (D2R / 3600.0);
+  double theta = (2004.3109*T - 0.42665*T*T - 0.041833*T*T*T) * (D2R / 3600.0);
+  double st = sin(theta), ct = cos(theta);
+  for (uint16_t s = 0; s < star_count; s++){
+    double d0 = (double)star_buf[s].dec;
+    double cd = cos(d0 * D2R); if (cd < 1e-6) cd = 1e-6;           // pole guard for the mu/cos(dec) term
+    double a0 = (double)star_buf[s].ra
+              + ((double)star_buf[s].pmra / cd) * yrs / (3600000.0 * 15.0);  // mas/yr (mu_alpha*) -> hours
+    d0       +=  (double)star_buf[s].pmdec       * yrs /  3600000.0;         // mas/yr -> degrees
+    double ar = a0 * 15.0 * D2R + zeta, dr = d0 * D2R;
+    double ca = cos(ar), sa = sin(ar), cdd = cos(dr), sd = sin(dr);
+    double A = cdd * sa;
+    double B = ct * cdd * ca - st * sd;
+    double C = st * cdd * ca + ct * sd;
+    double a_now = (atan2(A, B) + zz) / (D2R * 15.0);              // hours
+    a_now = fmod(a_now, 24.0); if (a_now < 0.0) a_now += 24.0;
+    if (C >  1.0) C =  1.0;
+    if (C < -1.0) C = -1.0;
+    star_buf[s].ra_now  = (float)a_now;
+    star_buf[s].dec_now = (float)(asin(C) / D2R);
+  }
+  star_apparent_at = (uint32_t)currentTime;
+}
+
 static void star_update(void){
   float lat = latitude, lon = longitude;                       // one snapshot of the fix
   if (!astro_pos_ok(lat, lon)) { star_ncache = 0; return; }
-  const double D2R = 0.017453292519943295;
+  if (star_apparent_at == 0 || (uint32_t)((uint32_t)currentTime - star_apparent_at) > 86400u)
+    star_refresh_apparent();                                   // daily is plenty (~0.14 arcsec/day)
   double lst = local_sidereal_time((double)currentTime, (double)lon);      // hours [0,24)
-  double yrs = ((double)currentTime - 946728000.0) / 31557600.0;           // years since J2000.0
 
   // Single pass: keep the soonest STAR_SHOW visible stars in a small array sorted ascending by
   // sidereal-hours-to-transit. No per-star scratch (star_count can be the whole SD catalogue), so the
   // stack stays bounded regardless of catalogue size.
   struct { float dt; int8_t alt; char nm[4]; } top[STAR_SHOW]; uint8_t n = 0;
   for (uint16_t s = 0; s < star_count; s++) {
-    double a = star_buf[s].ra, d = star_buf[s].dec;
-    double ar = a * 15.0 * D2R, dr = d * D2R;
-    double dra  = (3.07496 + 1.33621 * sin(ar) * tan(dr)) * yrs;           // precession, sec of time
-    double ddec = (20.0431 * cos(ar) * yrs) / 3600.0;                      // precession, degrees
-    double a_now = a + dra / 3600.0;                                       // RA to date, hours
-    double d_now = d + ddec;                                               // Dec to date, degrees
+    double a_now = (double)star_buf[s].ra_now, d_now = (double)star_buf[s].dec_now;  // apparent of date (cached)
     double alt = 90.0 - fabs((double)lat - d_now);                         // upper-transit altitude
     if (alt <= 0.0) continue;                                             // never clears the horizon
     double dt = fmod(a_now - lst, 24.0); if (dt < 0.0) dt += 24.0;         // sidereal hours to transit
@@ -2093,7 +2139,8 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
   } else if (strcasecmp(key, "star_dump") == 0) {
     if (from_serial && truthy(value)) star_dump_pending = 1;  // serial-only: emit one $PMSTAR sentence
   } else if (strcasecmp(key, "star_max_mag") == 0) {
-    star_max_mag = (float)atof(value);   // trim the transit catalogue to stars brighter than this (applied at boot in loadStars)
+    float smm = (float)atof(value);      // trim the transit catalogue to stars brighter than this (applied at boot in loadStars)
+    if (isfinite(smm)) star_max_mag = smm;   // atof("nan") is a real NaN -> the float->int16 magcut cast would be UB
   } else if (strcasecmp(key, "loop_diag") == 0) {
     loop_diag = truthy(value) ? 1 : 0;   // 1 Hz $PMLOOP main-loop latency diagnostic
   } else if (strcasecmp(key, "tc_reset") == 0) {
@@ -3259,12 +3306,12 @@ static void star_dump_step(void){
   if (dn < 0) {
     star_update();                             // fresh transit list (never in an ISR)
     uint8_t n = star_ncache;
-    char body[120];
-    int nb = snprintf(body, sizeof body, "PMSTAR,%u", (unsigned)n);
+    char body[132];
+    int nb = snprintf(body, sizeof body, "PMSTAR,%u,%c", (unsigned)n, star_from_card ? 'C' : 'B');  // provenance: Card / Baked-fallback
     if (nb < 0 || nb >= (int)sizeof body) { star_dump_pending = 0; return; }
     for (uint8_t k = 0; k < n; k++) {
       long rem = (long)star_cache[k].epoch - (long)currentTime; if (rem < 0) rem = 0;
-      int t = snprintf(body + nb, sizeof body - nb, ",%.3s,%ld,%d",
+      int t = snprintf(body + nb, sizeof body - nb, ",%.4s,%ld,%d",
                        star_cache[k].nm, rem, (int)star_cache[k].alt);
       if (t < 0 || t >= (int)(sizeof body - nb)) { star_dump_pending = 0; return; }
       nb += t;
