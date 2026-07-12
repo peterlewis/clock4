@@ -4478,7 +4478,12 @@ static void menu_render_item(void){
         int labcap = 10 - 1 - (int)strlen(val);
         snprintf(buf,sizeof buf,"%.*s %s", labcap<0?0:labcap, m->label, val);
       }
-    } else {                                                                   // ENUM / TOGGLE
+    } else if (m->type==MIT_TOGGLE) {                                          // TOGGLE: it's one-press now, so the STATE must always be visible — keep a compact "ON"/"OF", trim the label if the row is tight (labels stay recognisable; you scrolled to it).
+      const char *st = v ? "ON" : "OF";
+      int labcap = 10 - 1 - 2, ll = (int)strlen(m->label);
+      if (ll > labcap) ll = labcap;
+      snprintf(buf,sizeof buf,"%.*s %s", ll, m->label, st);
+    } else {                                                                   // ENUM: keep the LABEL (you scroll by label), truncate the (long) value
       menu_fmt_val(m, v, val);
       if (snprintf(buf,sizeof buf,"%s %s",m->label,val) > 10){
         int valcap = 10 - (int)strlen(m->label) - 1;
@@ -4581,7 +4586,14 @@ static void menu_fire_stage(void){
       menu_layer=L2_ITEM; menu_render_item();     // land directly on the first item (resumes last item if still in-section) — no separate section banner
     } else if (menu_stage==2) menu_to_L0();                            // EXIT -> clock
   } else if (menu_layer==L2_ITEM){
-    if (menu_stage==1) menu_enter_edit();                              // EDIT (item is always visible now — no banner to reveal first)
+    if (menu_stage==1){                                                // EDIT
+      const MItem *m=&menu_items[menu_idx];
+      if (m->type==MIT_TOGGLE){                                        // simple on/off: flip AND persist in one press — no editor, no separate SAVE
+        int32_t want=!m->get(m); m->set(m, want);
+        if (m->get(m)!=want) menu_flash("LASt");                       // refused (e.g. turning off the last enabled mode)
+        else { menu_record_key(m->key_id, m->get(m)); menu_render_item(); }   // recorded -> the commit gate writes it to flash
+      } else menu_enter_edit();                                        // values (BRIGHT/PAGE MS/MATRIX) + enums (COLON/NMEA) keep the editor + SAVE/CANCEL
+    }
     else if (menu_stage==2){ menu_layer=L1_SECTION; menu_render_item(); } // BACK -> section ring
   } else { /* L3_EDIT */
     if (menu_stage==1) menu_commit_edit();                             // SAVE
