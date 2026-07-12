@@ -4788,16 +4788,19 @@ static void tc_persist_step(void){
 // learned model is untouched — a full cold start is tc_reset + tc_forget). Serviced from the main loop.
 static void tc_forget_step(void){
   if (!tc_forget_pending) return;
+  if (ee2_avail && !settings_mapping_ok()) return;   // QSPI: never erase against a stale mapping; retry next pass
   tc_forget_pending = 0;
   tc2.valid = 0; tc_model_dirty = 0;
   if (!ee2_avail) return;
+  fatfs_busy = 1;
 #ifndef __EMSCRIPTEN__
-  HAL_FLASH_Unlock(); __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
+  if (ee_backing == EE_BK_INTERNAL){ HAL_FLASH_Unlock(); __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS); }
 #endif
   ee_erase(ee2_page_a); ee_erase(ee2_page_b);
 #ifndef __EMSCRIPTEN__
-  HAL_FLASH_Lock();
+  if (ee_backing == EE_BK_INTERNAL) HAL_FLASH_Lock();
 #endif
+  fatfs_busy = 0;
   ee2_active = ee2_page_a; ee2_next = 0; ee2_gen = 0;
 }
 
@@ -4879,6 +4882,11 @@ static void menu_reset_step(void){
     fatfs_busy = 0;
     ee_active = ee_page_a; ee_next = 0; ee_gen = 0;
   }
+  // Factory means EVERYTHING learned goes too: wipe the retained tempcomp model (store) and the live
+  // learned state. The config.txt re-read below then re-seeds from the file's tc_* block — the clock
+  // returns to exactly what the file says, compensation included.
+  tc_forget_pending = 1;
+  tc_reset_pending  = 1;
   delayedReadConfigFile = 1;             // re-apply config.txt with no overrides -> back to factory
   if (menu_layer != L0_CLOCK) menu_flash("DONE");   // a destructive action must not return to an identical screen
 }
@@ -5039,8 +5047,8 @@ static void menu_render_item(void){
           snprintf(buf,sizeof buf,"HOLD %lu",(unsigned long)((uint32_t)currentTime - last_pps_time));
         else
           snprintf(buf,sizeof buf,"PPS ----");
-      } else {                                                                 // star catalogue provenance + count
-        snprintf(buf,sizeof buf, star_from_card ? "STARS %u" : "STARS b%u", (unsigned)star_count);
+      } else {                                                                 // star catalogue count (0 = no/invalid STARS.BIN)
+        snprintf(buf,sizeof buf,"STARS %u",(unsigned)star_count);
       }
       menu_show(buf); return;
     }
