@@ -208,7 +208,7 @@ uint8_t displayMode = 0, countMode = 0, colonMode = 0;
 // MODE_LST/MODE_SOLAR can never masquerade as civil time.
 uint8_t colonModeCivil = 0;
 uint8_t colonModeAlt = COLON_MODE_ALT_SAWTOOTH;
-_Bool colonAltExplicit = 0;    // user explicitly set alt_colon_mode
+_Bool colonAltExplicit = 0;    // user explicitly set colon_alt_mode
 uint8_t requestMode = 255;
 uint8_t nmea_cdc_level=0;
 int debug_rtc_val = 0;
@@ -1392,9 +1392,9 @@ void parseConfigString(char *key, char *value) {
 
     colonModeCivil = parseColonName(value);
 
-  } else if (strcasecmp(key, "alt_colon_mode") == 0) {
+  } else if (strcasecmp(key, "colon_alt_mode") == 0) {
 
-    colonModeAlt = parseColonName(value);   // shared by MODE_LST and MODE_SOLAR
+    colonModeAlt = parseColonName(value);   // shared by MODE_LST and MODE_SOLAR ("COLONALT" in the menu)
     colonAltExplicit = 1;
 
   } else if (strcasecmp(key, "nmea") == 0) {
