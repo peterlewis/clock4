@@ -1261,16 +1261,22 @@ void displayOn(void){
 //     s = 16 - strength * (16 - 2 * popcount(segments)) / 100
 // so at full strength s = 2N and every lit segment averages the same duty-per-segment product:
 // (1/N) * (2N/16) = 1/8, uniform across the display (an 8-segment '8.' keeps 16/16 — sparse
-// digits dim DOWN to its level, dense digits are untouched). The cycle mask (rank(k) < s, with
-// rank = bit-reversed k) picks the s lit cycles in NESTED van-der-Corput order: near-evenly
-// spread at every s (worst case — s = 1 — identical to any spread, far above flicker) and always
-// lighting cycle 0 — the master slot — so masters are never rewritten and count toward the duty
-// exactly. Nested is the load-bearing property: s changes whenever a digit's segment count does
-// (at every second boundary, at least), and a spread that RESHUFFLES its lit set on s±1 — e.g.
-// (k*s) % 16 < s — re-phases the whole column's light at that instant. Hardware-observed as a
-// once-per-second step in the ghost bleed of unlit segments and a beat on the sub-second digits.
-// In nested order the lit set for s+1 is the lit set for s plus exactly one cycle: a duty step
-// moves only the light it must.
+// digits dim DOWN to its level, dense digits are untouched). The cycle mask picks each digit's s
+// lit cycles as a NESTED rank window: rank = bit-reversed k rotated by a fixed per-digit phase
+// (cycle 0 — the master slot — pinned at rank 0, so masters are never rewritten and count toward
+// the duty exactly). Two properties are load-bearing, and each was a hardware-visible artefact
+// when missing:
+//  - NESTED (s+1's lit set = s's plus exactly one cycle): s changes whenever a digit's segment
+//    count does — every second boundary at least — and a spread that RESHUFFLES on s±1 (e.g.
+//    (k*s) % 16 < s, the first ship) re-phases the whole column's light at that instant: a
+//    once-per-second step in the ghost bleed of unlit segments + a beat on the sub-second digits.
+//  - DECORRELATED (distinct phase per digit): un-rotated nested ranks light every digit on the
+//    SAME low-rank cycles, so the shared rail sees a sawtooth (all-on cycles vs sparse cycles,
+//    per-cycle load variance ~14 vs ~1.4 rotated in sim) whose shape steps with the time content
+//    — the whole DATE row blipped at 1 Hz and per-digit brightness left calibration (the K curve
+//    was eyeballed against decorrelated patterns).
+// Positions stay near-evenly spread at every s (a rotated rank window bit-reverses to a van-der-
+// Corput run; worst case s = 1 is the master alone, unchanged from stock 5-slot timing).
 //
 // Above 100 the map turns into a power law, s = 16*(N/8)^(strength/100) — continuous at 100
 // (gamma 1 = the linear map). Near the LED forward-voltage knee (low rail) segment current is
@@ -1295,6 +1301,12 @@ volatile uint16_t seg_balance = 0;     // 0 = off (stock) · 1/on = AUTO (calibr
 // rank(k) for D=16 (bit-reversed k). For D=8/4 shift right by 1/2 — dropping the low bits of the
 // reversal is exactly the 3-/2-bit reversal, so one table serves every depth.
 static const uint8_t SEGBAL_REV16[16] = {0,8,4,12,2,10,6,14,1,9,5,13,3,11,7,15};
+// Per-digit phases for the mirror ranks (col x bank; DP rides its digit's phase so its cycles
+// stay a subset of the digit's). Rank 0 = the master slot is pinned; the phase rotates ranks
+// 1..D-1 among themselves (mod D-1), so every digit still lights the master and its mirrors sit
+// in a distinct rank window. Values are spread over the 15-ring (idx*4 mod 15, all distinct).
+static const uint8_t SEGBAL_PH_B[5] = {0, 4, 8, 12, 1};
+static const uint8_t SEGBAL_PH_C[5] = {5, 9, 13, 2, 6};
 
 // Lit cycles (of 16) for a digit with n lit segments at effective strength `eff` (0..300).
 // n <= 8 always (7 segments + DP). Returns 16 (always lit) .. 1 (floor for any lit digit).
@@ -1423,12 +1435,17 @@ void segbal_poll(void){
     }
     uint16_t cat = mb & (uint16_t)~SEGBAL_BSEG_MASK;
     uint8_t  csel = mh & (uint8_t)~cSegDP;                 // GPIOC column select + enables
+    uint32_t ring = D - 1u;                                // mirror ranks 1..D-1 rotate mod D-1
+    uint32_t pb = SEGBAL_PH_B[col] % ring;
+    uint32_t pc = SEGBAL_PH_C[col] % ring;
     for (uint32_t k = 1; k < D; k++) {
       uint32_t i = col + 5u*k;
-      uint32_t r = (uint32_t)(SEGBAL_REV16[k] >> revsh);   // nested rank: see block comment above
-      buffer_b[i]      = (r < sb) ? mb : cat;              // column select stays in every slot
-      buffer_c[i].low  = (r < sc) ? ml : 0;
-      buffer_c[i].high = csel | ((r < sdp) ? (mh & cSegDP) : 0);
+      uint32_t r = (uint32_t)(SEGBAL_REV16[k] >> revsh);   // 1..D-1 for k >= 1
+      uint32_t rb = r - 1u + pb; if (rb >= ring) rb -= ring;
+      uint32_t rc = r - 1u + pc; if (rc >= ring) rc -= ring;
+      buffer_b[i]      = (rb + 1u < sb) ? mb : cat;        // column select stays in every slot
+      buffer_c[i].low  = (rc + 1u < sc) ? ml : 0;
+      buffer_c[i].high = csel | ((rc + 1u < sdp) ? (mh & cSegDP) : 0);
     }
   }
   if (display_scan_len != want_len) setDisplayPWM(want_len);   // extend to the D-cycle scan
