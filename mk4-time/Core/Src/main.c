@@ -4584,6 +4584,7 @@ static void menu_show_stage(void){
                        : (menu_layer==L1_SECTION) ? chord_L1sec
                        : (menu_layer==L2_ITEM)    ? chord_L2itm : chord_L3edt;
   const char *s = (menu_stage<=3)? t[menu_stage] : "";
+  if (menu_layer==L3_EDIT && menu_items[menu_idx].type==MIT_TOGGLE && (menu_stage==1||menu_stage==2)) s = "DONE";  // a toggle exits-and-saves on either release
   menu_show(s[0]? s : "----");
 }
 static void menu_fire_stage(void){
@@ -4597,17 +4598,11 @@ static void menu_fire_stage(void){
       menu_layer=L2_ITEM; menu_render_item();     // land directly on the first item (resumes last item if still in-section) — no separate section banner
     } else if (menu_stage==2) menu_to_L0();                            // EXIT -> clock
   } else if (menu_layer==L2_ITEM){
-    if (menu_stage==1){                                                // EDIT
-      const MItem *m=&menu_items[menu_idx];
-      if (m->type==MIT_TOGGLE){                                        // simple on/off: flip AND persist in one press — no editor, no separate SAVE
-        int32_t want=!m->get(m); m->set(m, want);
-        if (m->get(m)!=want) menu_flash("LASt");                       // refused (e.g. turning off the last enabled mode)
-        else { menu_record_key(m->key_id, m->get(m)); menu_render_item(); }   // recorded -> the commit gate writes it to flash
-      } else menu_enter_edit();                                        // values (BRIGHT/PAGE MS/MATRIX) + enums (COLON/NMEA) keep the editor + SAVE/CANCEL
-    }
+    if (menu_stage==1) menu_enter_edit();                              // EDIT -> open the item (enter, change, exit)
     else if (menu_stage==2){ menu_layer=L1_SECTION; menu_render_item(); } // BACK -> section ring
   } else { /* L3_EDIT */
-    if (menu_stage==1) menu_commit_edit();                             // SAVE
+    if (menu_items[menu_idx].type==MIT_TOGGLE) menu_commit_edit();     // toggle: exit = SAVE either way (enter, toggle, exit); idle still abandons
+    else if (menu_stage==1) menu_commit_edit();                        // SAVE
     else if (menu_stage==2) menu_cancel_edit();                        // CANCEL
   }
   menu_chord=0; menu_stage=0;
