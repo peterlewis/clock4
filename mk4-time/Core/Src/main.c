@@ -4867,6 +4867,7 @@ static const MItem menu_items[] = {
   MODE_ROW(MODE_ADEV,SEC_DIAG,"ADEV"),            MODE_ROW(MODE_STAR,SEC_ASTRO,"STAR"),
   MODE_ROW(MODE_TEMPCOMP,SEC_DIAG,"TC DATA"),   // the model READOUT; "TEMPCOMP" beside it is the enable
   { KID_MODE_BASE+MODE_FIRMWARE_CRC_T, MIT_TOGGLE, "FW CRC", MODE_FIRMWARE_CRC_T,1,1, NULL, g_mode, s_fwcrc, SEC_DIAG },
+  MODE_ROW(MODE_VBAT, SEC_DIAG, "VBAT"),      // coin-cell health belongs beside the diagnostics (was config-only)
   // Read-only INFO rows (no editor, never persisted; .lo tags the readout). The everyday questions:
   // "am I disciplined right now?" and "did my star catalogue actually load?" — the second would have
   // surfaced a failed card a session earlier than the serial diagnostics did.
@@ -5110,6 +5111,28 @@ void menu_poll(void){
   if (menu_layer!=L0_CLOCK && (uint32_t)(uwTick-menu_last_ms) >= MENU_IDLE_MS) {
     if (menu_layer==L3_EDIT) menu_cancel_edit();   // idle-out mid-edit == abandon: revert the live scrub + flush the final MATRIX rate to the date board, exactly like CANCEL (menu_to_L0 alone did neither)
     menu_to_L0();
+  }
+  // §7A display refinement (spec: mechanism A — time-board only, works on a stock date board):
+  //  - EDITOR BLINK: a resting editor value blinks at 1 Hz (the digital-watch "you are setting
+  //    this" idiom); it stays SOLID while actively scrubbing (any event in the last 600 ms) so the
+  //    number never flickers under your thumb. ACTION confirms stay steady.
+  //  - IDLE WARNING: ~3 s before the 15 s idle-abandon strikes, the whole row flickers once
+  //    (300 ms) — "act or lose the edit". Any button press resets the clock on both behaviours.
+  // Chord stage labels always win (menu_chord suppresses both).
+  {
+    static uint8_t menu_blanked = 0;
+    uint8_t want = 0;
+    if (menu_layer != L0_CLOCK && !menu_chord){
+      uint32_t since = (uint32_t)(uwTick - menu_last_ms);
+      if (since >= MENU_IDLE_MS - 3000u && since < MENU_IDLE_MS - 2700u) want = 1;   // the T-3 s flicker
+      else if (menu_layer == L3_EDIT && menu_items[menu_idx].type != MIT_ACTION
+               && since > 600u && (((since - 600u) / 500u) & 1u)) want = 1;          // resting blink (visible phase first)
+    }
+    if (want != menu_blanked){
+      menu_blanked = want;
+      if (want) menu_show(" ");            // blank the row (menu still owns it — a bare space pads to 10)
+      else if (menu_layer != L0_CLOCK) menu_render_item();
+    }
   }
   if (decisec==9) return;
   while (menu_ev_t != menu_ev_h){
