@@ -511,10 +511,10 @@ static void astro_update(void){
 // countdown on the date row. J2000 catalogue positions are precessed to date (first-order IAU) so
 // the timing stays good to the shown minute for decades. Compute is main-loop only (double trig).
 //
-// NOTE: the catalogue coordinates below are hand-entered J2000 (RA hours, Dec degrees) for the
-// bright, recognisable stars; they want a pass against an authoritative source (SIMBAD/Hipparcos)
-// before this ships upstream. The transit *maths* is verified in the emulator independently.
-static const struct { char nm[4]; float ra; float dec; } star_cat[] = {
+// The catalogue is loaded at boot from /STARS.BIN on the SD card (generate-stars.py, HYG v4). The
+// hand-entered J2000 set below is only the FALLBACK when the card has no valid file — a compact bright
+// set so the feature still works cardless. The transit *maths* is verified in the emulator.
+static const struct { char nm[4]; float ra; float dec; } star_cat_default[] = {
   {"SIR",  6.7525f, -16.7161f},  // Sirius        alpha CMa
   {"CAN",  6.3992f, -52.6957f},  // Canopus       alpha Car
   {"ARC", 14.2610f,  19.1824f},  // Arcturus      alpha Boo
@@ -546,12 +546,55 @@ static const struct { char nm[4]; float ra; float dec; } star_cat[] = {
   {"ALC", 15.5781f,  26.7147f},  // Alphecca      alpha CrB
   {"RAS", 17.5822f,  12.5600f},  // Rasalhague    alpha Oph
 };
-#define STAR_N     (sizeof star_cat / sizeof star_cat[0])
+#define STAR_DEFAULT_N (sizeof star_cat_default / sizeof star_cat_default[0])
+#define STAR_MAX   128u            // RAM cap on the loaded catalogue (the SD file is clamped to this)
 #define STAR_SHOW  8u              // cache the soonest 8 upcoming transits
 #define STAR_SIDSEC_PER_HR 3590.1704   // solar seconds the meridian takes to sweep one hour of RA
 typedef struct { char nm[4]; uint32_t epoch; int8_t alt; } star_entry_t;
 static star_entry_t star_cache[STAR_SHOW];
 static volatile uint8_t star_ncache;
+
+// The live catalogue in RAM (J2000 RA hours / Dec degrees), loaded from the card or the baked default.
+static struct { char nm[4]; float ra; float dec; } star_buf[STAR_MAX];
+static uint16_t star_count = 0;
+volatile float star_max_mag = 6.0f;   // config "star_max_mag": only load stars brighter than this (file is mag-sorted -> early-stop). Default 6 = the whole file.
+
+// Load /STARS.BIN into star_buf, filtered to star_max_mag. The file is magnitude-sorted, so we stop at
+// the first star past the cut. Hardened like loadRules (PR#7): validate magic + fixed record length,
+// clamp the count BEFORE writing, byte-check every read, sanity-check RA/Dec. On ANY failure (no card,
+// bad header, torn read) fall back to the baked star_cat_default[] so the feature always works.
+static void loadStars(void){
+  star_count = 0;
+  FIL file;
+  if (f_open(&file, STARS_FILENAME, FA_READ) == FR_OK){
+    unsigned int rc; uint8_t hdr[16];
+    if (f_read(&file, hdr, 16, &rc) == FR_OK && rc == 16 && memcmp(hdr, "MST1", 4) == 0
+        && (uint16_t)(hdr[6] | (hdr[7]<<8)) == 10u){            // recordLength must equal our packed record
+      uint16_t count  = (uint16_t)(hdr[4] | (hdr[5]<<8));
+      int16_t  magcut = (int16_t)(star_max_mag * 100.0f);
+      for (uint16_t k = 0; k < count && star_count < STAR_MAX; k++){
+        uint8_t rec[10];
+        if (f_read(&file, rec, 10, &rc) != FR_OK || rc != 10) break;      // torn read -> keep what we have
+        int16_t mag = (int16_t)(rec[4] | (rec[5]<<8));
+        if (mag > magcut) break;                                          // sorted brightest-first -> rest are fainter
+        float ra  = (float)(uint16_t)(rec[0] | (rec[1]<<8)) / 65536.0f * 24.0f;
+        float dec = (float)( int16_t)(rec[2] | (rec[3]<<8)) / 100.0f;
+        if (ra < 0.0f || ra >= 24.0f || dec < -90.0f || dec > 90.0f) continue;   // reject garbage
+        memcpy(star_buf[star_count].nm, rec + 6, 4);
+        star_buf[star_count].ra = ra; star_buf[star_count].dec = dec;
+        star_count++;
+      }
+    }
+    f_close(&file);
+  }
+  if (star_count == 0){                                                   // no card / bad file -> baked bright set
+    for (uint16_t s = 0; s < STAR_DEFAULT_N && s < STAR_MAX; s++){
+      memcpy(star_buf[s].nm, star_cat_default[s].nm, 4);
+      star_buf[s].ra = star_cat_default[s].ra; star_buf[s].dec = star_cat_default[s].dec;
+      star_count++;
+    }
+  }
+}
 
 static void star_update(void){
   float lat = latitude, lon = longitude;                       // one snapshot of the fix
@@ -560,33 +603,34 @@ static void star_update(void){
   double lst = local_sidereal_time((double)currentTime, (double)lon);      // hours [0,24)
   double yrs = ((double)currentTime - 946728000.0) / 31557600.0;           // years since J2000.0
 
-  float dth[STAR_N]; int8_t altd[STAR_N]; uint8_t vis[STAR_N];             // per-star scratch
-  for (uint8_t s = 0; s < STAR_N; s++) {
-    double a = star_cat[s].ra, d = star_cat[s].dec;
+  // Single pass: keep the soonest STAR_SHOW visible stars in a small array sorted ascending by
+  // sidereal-hours-to-transit. No per-star scratch (star_count can be the whole SD catalogue), so the
+  // stack stays bounded regardless of catalogue size.
+  struct { float dt; int8_t alt; char nm[4]; } top[STAR_SHOW]; uint8_t n = 0;
+  for (uint16_t s = 0; s < star_count; s++) {
+    double a = star_buf[s].ra, d = star_buf[s].dec;
     double ar = a * 15.0 * D2R, dr = d * D2R;
     double dra  = (3.07496 + 1.33621 * sin(ar) * tan(dr)) * yrs;           // precession, sec of time
     double ddec = (20.0431 * cos(ar) * yrs) / 3600.0;                      // precession, degrees
     double a_now = a + dra / 3600.0;                                       // RA to date, hours
     double d_now = d + ddec;                                               // Dec to date, degrees
     double alt = 90.0 - fabs((double)lat - d_now);                         // upper-transit altitude
-    if (alt <= 0.0) { vis[s] = 0; continue; }                             // never clears the horizon
+    if (alt <= 0.0) continue;                                             // never clears the horizon
     double dt = fmod(a_now - lst, 24.0); if (dt < 0.0) dt += 24.0;         // sidereal hours to transit
-    dth[s] = (float)dt; altd[s] = (int8_t)(alt + 0.5); vis[s] = 1;
-  }
-  // Selection-pick the soonest STAR_SHOW visible stars (STAR_N is small; O(SHOW*N)).
-  star_entry_t tmp[STAR_SHOW];
-  uint8_t n = 0;
-  for (; n < STAR_SHOW; n++) {
-    int best = -1; float bestdt = 1e30f;
-    for (uint8_t s = 0; s < STAR_N; s++) if (vis[s] == 1 && dth[s] < bestdt) { bestdt = dth[s]; best = s; }
-    if (best < 0) break;                                                   // no more visible stars
-    vis[best] = 2;
-    memcpy(tmp[n].nm, star_cat[best].nm, 4);
-    tmp[n].epoch = (uint32_t)currentTime + (uint32_t)((double)dth[best] * STAR_SIDSEC_PER_HR + 0.5);
-    tmp[n].alt = altd[best];
+    float dtf = (float)dt;
+    if (n < STAR_SHOW || dtf < top[n-1].dt) {                             // insertion-sort into the top-N
+      uint8_t pos = (n < STAR_SHOW) ? n : (uint8_t)(STAR_SHOW - 1);
+      if (n < STAR_SHOW) n++;
+      while (pos > 0 && top[pos-1].dt > dtf) { top[pos] = top[pos-1]; pos--; }
+      top[pos].dt = dtf; top[pos].alt = (int8_t)(alt + 0.5); memcpy(top[pos].nm, star_buf[s].nm, 4);
+    }
   }
   __disable_irq();
-  for (uint8_t i = 0; i < n; i++) star_cache[i] = tmp[i];
+  for (uint8_t i = 0; i < n; i++) {
+    memcpy(star_cache[i].nm, top[i].nm, 4);
+    star_cache[i].epoch = (uint32_t)currentTime + (uint32_t)((double)top[i].dt * STAR_SIDSEC_PER_HR + 0.5);
+    star_cache[i].alt = top[i].alt;
+  }
   star_ncache = n;
   __enable_irq();
 }
@@ -816,9 +860,9 @@ void sendDate( _Bool now ){
     // ("<name>  1 35"); an hour or more switches to hours-'h'-minutes ("<name>  2h15") so a far
     // transit can't masquerade as 2 min 15 s and the field still fits the row.
     if (rem < 3600)
-      i = sprintf((char*)&uart2_tx_buffer[1], "%-3.3s %2ld %02ld", star_cache[p].nm, rem / 60, rem % 60);
+      i = sprintf((char*)&uart2_tx_buffer[1], "%-4.4s %2ld %02ld", star_cache[p].nm, rem / 60, rem % 60);
     else
-      i = sprintf((char*)&uart2_tx_buffer[1], "%-3.3s %2ldh%02ld", star_cache[p].nm, rem / 3600, (rem / 60) % 60);
+      i = sprintf((char*)&uart2_tx_buffer[1], "%-4.4s %2ldh%02ld", star_cache[p].nm, rem / 3600, (rem / 60) % 60);
     break;
   }
   case MODE_STANDBY:
@@ -2003,6 +2047,8 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     if (from_serial && truthy(value)) adev_dump_pending = 1;  // serial-only: emit one $PMADEV sentence
   } else if (strcasecmp(key, "star_dump") == 0) {
     if (from_serial && truthy(value)) star_dump_pending = 1;  // serial-only: emit one $PMSTAR sentence
+  } else if (strcasecmp(key, "star_max_mag") == 0) {
+    star_max_mag = (float)atof(value);   // trim the transit catalogue to stars brighter than this (applied at boot in loadStars)
   } else if (strcasecmp(key, "menu_reset") == 0) {
     if (from_serial && truthy(value)) menu_reset_pending = 1; // serial-only: wipe stored menu overrides
   } else if (strcasecmp(key, "tc_reset") == 0) {
@@ -4776,6 +4822,7 @@ int main(void)
   ee2_load();         // scan the retained tempco model (separate 2-page store); readConfigFile picks it up as a seed
   readConfigFile();
   checkDelayedLoadRules();
+  loadStars();          // scan /STARS.BIN into the transit catalogue (star_max_mag is known now); falls back to the baked bright set
 
   measure_vbat();
 
