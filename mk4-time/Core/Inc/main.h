@@ -77,6 +77,7 @@ extern uint16_t buffer_b[];
 extern _Bool delayedReadConfigFile;
 extern _Bool delayedCheckOnEject;
 extern volatile uint8_t fatfs_busy;
+extern volatile uint32_t settings_map_gen;   // bumped by STORAGE_Write_FS: host wrote the QSPI chip
 
 extern _Bool waitingForLatch;
 extern _Bool resendDate;
