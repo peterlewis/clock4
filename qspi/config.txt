@@ -123,6 +123,16 @@ tc_learn = off
 tc_apply = off
 tc_rtc = off
 
+# Auto-persist the learned model to a dedicated 2-page flash store (separate from config.txt and the
+# menu store), so the very first holdover after a power-up is already temperature-compensated instead
+# of waiting to re-learn. With tc_persist on, a well-supported model is saved at most once every 30
+# minutes (and only when it has moved meaningfully) — a handful of writes a day, so the flash lasts
+# for decades. On the next boot it loads as an EVOLVING seed (like tc_seed, but sourced from flash);
+# config.txt still wins per-key, so a tc_seed/coefficient/tc_t0 line here overrides the stored model.
+# "tc_forget = on" over USB serial erases the stored copy (live learning is untouched); "tc_reset = on"
+# clears the live model AND the stored copy. Both are ignored inside this file.
+tc_persist = off
+
 # show die temp / model offsets / sample count on the date row (four pages, 5.5 s each)
 mode_tempcomp = 0
 

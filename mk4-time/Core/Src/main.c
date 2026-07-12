@@ -353,6 +353,29 @@ uint32_t tc_n_hse = 0, tc_n_lse = 0;       // lifetime sample counts (display + 
 // — how far the temperature model actually is from the measured data, not a guess.
 float tc_hse_resid = 0, tc_lse_resid = 0;
 
+// ---- Auto-persist the learned model to flash retained memory (opt-in: tc_persist = on) ----------
+// The record stores exactly what tc_dump prints and tc_seed re-loads (ppm-domain coefficients), so
+// boot warm-starts through the UNCHANGED tc_seed_apply path — auto-persist = "auto tc_dump into
+// flash", auto-seed = "auto paste + tc_seed = on". tc2 is both the RAM shadow of the winning flash
+// record AND the "last persisted model" the change-detector compares against.
+volatile _Bool tc_persist = 0;              // config master opt-in (default off = stock behaviour)
+volatile _Bool tc_forget_pending = 0;       // "tc_forget = on" over serial -> erase the tempcomp store
+static   _Bool tc_model_dirty = 0;          // live model has moved beyond threshold since last persist
+static uint32_t tc_last_commit_ms = 0;      // uwTick at last commit (MONOTONIC — never GPS wall time)
+static _Bool   tc_persist_seeded = 0;       // a flash record seeded the model this boot (one-shot guard)
+static struct {
+  _Bool valid, hse_valid, lse_valid;
+  int16_t t0, lo, hi;
+  float hse_b, hse_c, lse_a, lse_b, lse_c, hse_resid, lse_resid;
+  uint32_t n_hse, n_lse;
+} tc2;
+// config.txt "which tempcomp keys were set this load" — for the auto-seed precedence (config wins).
+#define CFG_TC_SEED 1u
+#define CFG_TC_T0   2u
+#define CFG_TC_LO   4u
+#define CFG_TC_HI   8u
+static uint8_t cfg_tc_defined = 0;
+
 // Warm-start (seed-and-evolve). A previously-learned model — the last tc_dump, written back into
 // config.txt by the host (the firmware never writes the filesystem; the QSPI drive is host-owned) —
 // is reloaded at boot as an evolving PRIOR rather than a hard freeze. The clock is temperature-
@@ -369,6 +392,9 @@ _Bool tc_seed_done = 0;                        // one-shot: seed once per power-
 // (plus the already-accepted single-word tc_cfg_*/tc_seed slots) — never the model itself.
 volatile _Bool tc_seed_pending = 0;
 static void tc_seed_apply(void);              // defined by the tempcomp block; called after the config load
+void tc_seed_from_flash(void);                // retained-model auto-seed; runs just before tc_seed_apply
+void tc_persist_after_seed(void);             // caps prior order + restores counts; runs just after it
+static void tc_model_check(void);             // change detector; called after tc_fit in tc_housekeeping
 
 // Display cache for MODE_TEMPCOMP. Written by the governor (main loop); read by sendDate,
 // which ALSO runs from the SysTick ISRs — each field is a single 32-bit (atomic) access, so
@@ -2135,6 +2161,7 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     tc_rtc = truthy(value);           // additionally trim RTC->CALR while GPS is absent
   } else if (strcasecmp(key, "tc_t0") == 0) {
     int v = atoi(value); tc_t0 = v < -30 ? -30 : (v > 80 ? 80 : v);
+    if (!from_serial) cfg_tc_defined |= CFG_TC_T0;   // config.txt pins the centre -> a stale flash seed must not override
   } else if (strcasecmp(key, "tc_engage_s") == 0) {
     // Floor of 2: currentTime pre-increments at the modelled .900 mark, so "fresh" reads 1
     // for the last 100 ms of every LOCKED second — a floor of 1 would engage during lock.
@@ -2152,10 +2179,17 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     // seeds exactly once, after all its coefficient lines have parsed (send it last — the order
     // tc_dump prints). ISR-safe by design: the apply itself always runs from tc_housekeeping.
     if (from_serial && tc_seed) tc_seed_pending = 1;
+    if (!from_serial) cfg_tc_defined |= CFG_TC_SEED;   // config.txt supplies its own seed -> flash seed stands down
   } else if (strcasecmp(key, "tc_seed_lo") == 0) {
     tc_seed_lo = (int16_t)atoi(value);   // seed coverage low edge (die °C) — the prior is not extrapolated
+    if (!from_serial) cfg_tc_defined |= CFG_TC_LO;
   } else if (strcasecmp(key, "tc_seed_hi") == 0) {
     tc_seed_hi = (int16_t)atoi(value);
+    if (!from_serial) cfg_tc_defined |= CFG_TC_HI;
+  } else if (strcasecmp(key, "tc_persist") == 0) {
+    tc_persist = truthy(value);       // opt-in: auto-save the learned model to its retained flash store
+  } else if (strcasecmp(key, "tc_forget") == 0) {
+    if (from_serial && truthy(value)) tc_forget_pending = 1;   // serial-only: erase the retained model (keeps live learning)
   } else if (strcasecmp(key, "tc_dump") == 0) {
     // Serial-only trigger: print the learned model as paste-ready config lines. A stray
     // tc_dump left in config.txt must not fire on every (re)load, hence the origin guard.
@@ -2308,7 +2342,7 @@ void readConfigFile(void){
   colonModeCivil = 0;
   colonModeAlt = COLON_MODE_ALT_SAWTOOTH;
   colonAltExplicit = 0;
-  cfg_simple_defined = 0; cfg_modes_defined = 0;   // rebuilt below as config.txt keys are parsed
+  cfg_simple_defined = 0; cfg_modes_defined = 0; cfg_tc_defined = 0;   // rebuilt below as config.txt keys are parsed
 
   FIL file;
 
@@ -2361,7 +2395,9 @@ void readConfigFile(void){
    else requestMode=255;
 
    postConfigCleanup();
+   tc_seed_from_flash();   // if tc_persist is on, load the retained learned model as this boot's seed (config.txt still wins per-key)
    tc_seed_apply();   // warm-start the tempco model from a persisted seed (tc_seed = on), else no-op
+   tc_persist_after_seed();   // cap prior order + restore sample counts; no-op unless a flash model seeded this boot
 }
 
 void calibrateRTC(void){
@@ -3431,6 +3467,7 @@ void tc_housekeeping(void){
     tc_n_hse = tc_n_lse = 0;
     tc_e0_set = 0; tc_ema = 0;                // new origin rebase with the next sample
     tc_reset_pending = 0;
+    if (tc_persist) tc_forget_pending = 1;    // a reset also wipes the retained model from flash
   }
 
   if (tc_learn) {
@@ -3438,7 +3475,7 @@ void tc_housekeeping(void){
     tc_lse_learn();
     static uint32_t last_fit = 0;
     uint32_t now = (uint32_t)currentTime;
-    if (now - last_fit >= 300) { last_fit = now; tc_fit(); }   // refit at most every 5 min
+    if (now - last_fit >= 300) { last_fit = now; tc_fit(); tc_model_check(); }   // refit at most every 5 min, then check whether to re-persist
   }
 
   // tc_steer_on in the gate: the governor owns DISENGAGE, so it must stay reachable even if
@@ -4157,20 +4194,32 @@ void buttonsBothHeld(void){
 // the flash-size register: on the 1 MB RG they land in bank 2 (read-while-write -> no CPU stall) and
 // ABOVE the app-CRC region; on the 256 KB RC there is no room above the app, so persistence DISABLES
 // itself (settings stay RAM-only) rather than write into the CRC-covered app and brick the boot.
-#define EE_MAGIC   0x4D4B3445u        // "MK4E"
+#define EE_MAGIC   0x4D4B3445u        // "MK4E"  (menu store)
 #define EE_SCHEMA  1u
 #define EE_REC_SZ  64u                // 8 doublewords; CRC16 lives in DW7 so it programs last
 #define EE_SLOTS   (FLASH_PAGE_SIZE / EE_REC_SZ)
+#define EE2_MAGIC  0x4D4B3454u        // "MK4T"  (tempcomp store — distinct magic so the two never alias)
+#define EE2_SCHEMA 1u
 static uint32_t ee_page_a=0, ee_page_b=0, ee_active=0, ee_gen=0;
 static uint16_t ee_next=0;            // next free slot in the active page
 static _Bool    ee_avail=0;
+// SECOND, independent store for the self-learning tempcomp model — its OWN page pair, so its write
+// wear budget is fully disjoint from the menu store's (see the tempcomp-persist block far below).
+static uint32_t ee2_page_a=0, ee2_page_b=0, ee2_active=0, ee2_gen=0;
+static uint16_t ee2_next=0;
+static _Bool    ee2_avail=0;
 
 #ifdef __EMSCRIPTEN__
-static uint8_t ee_emu[2*FLASH_PAGE_SIZE];   // emu: back the two flash pages with RAM (0xFF = erased)
-static uint32_t ee_rd32(uint32_t a){ uint32_t v; memcpy(&v,&ee_emu[a-ee_page_a],4); return v; }
-static void ee_rd(uint32_t a, void*d, uint32_t n){ memcpy(d,&ee_emu[a-ee_page_a],n); }
-static void ee_erase(uint32_t a){ memset(&ee_emu[a-ee_page_a],0xFF,FLASH_PAGE_SIZE); }
-static void ee_prog_dw(uint32_t a, uint64_t v){ memcpy(&ee_emu[a-ee_page_a],&v,8); }
+static uint8_t ee_emu [2*FLASH_PAGE_SIZE];  // emu: menu store pages (0xFF = erased)
+static uint8_t ee2_emu[2*FLASH_PAGE_SIZE];  // emu: tempcomp store pages
+static uint8_t* ee_emu_ptr(uint32_t a){     // resolve an absolute flash address to its RAM-backed pair
+  if (a >= ee2_page_a && a < ee2_page_a + 2u*FLASH_PAGE_SIZE) return &ee2_emu[a - ee2_page_a];
+  return &ee_emu[a - ee_page_a];
+}
+static uint32_t ee_rd32(uint32_t a){ uint32_t v; memcpy(&v, ee_emu_ptr(a), 4); return v; }
+static void ee_rd(uint32_t a, void*d, uint32_t n){ memcpy(d, ee_emu_ptr(a), n); }
+static void ee_erase(uint32_t a){ memset(ee_emu_ptr(a), 0xFF, FLASH_PAGE_SIZE); }
+static void ee_prog_dw(uint32_t a, uint64_t v){ memcpy(ee_emu_ptr(a), &v, 8); }
 #else
 static uint32_t ee_rd32(uint32_t a){ return *(volatile uint32_t*)a; }
 static void ee_rd(uint32_t a, void*d, uint32_t n){ memcpy(d,(const void*)a,n); }
@@ -4270,6 +4319,208 @@ static _Bool ee_commit(void){
 #endif
   return 1;
 }
+
+// =============== Tempcomp store (ee2): auto-persist the learned model to its own page pair =========
+// Parallel to the menu store, reusing its address helpers (ee_rd32/ee_rd/ee_erase/ee_prog_dw/ee_crc16)
+// and framing (magic @0, gen @4, CRC @62 -> programs last -> torn write fails CRC -> prior gen wins).
+// Record byte layout: 0 magic | 4 gen | 8 schema | 10 flags(b0 hse,b1 lse) | 12 t0 i16 | 14 hse_b f32 |
+// 18 hse_c f32 | 22 lse_a f32 | 26 lse_b f32 | 30 lse_c f32 | 34 lo i16 | 36 hi i16 | 38 hse_resid f32 |
+// 42 lse_resid f32 | 46 n_hse u32 | 50 n_lse u32 | 54..61 rsvd | 62 crc16.
+static void ee2_init_base(void){
+#ifdef __EMSCRIPTEN__
+  ee2_page_a = 0x08040000u - 2u*FLASH_PAGE_SIZE;   // emu: the contiguous pair just below the menu store
+  ee2_page_b = ee2_page_a + FLASH_PAGE_SIZE; ee2_avail = 1;   // pages adjacent -> the resolver window covers both
+#else
+  // The pair just below the menu store (runtime-derived from the die). MUST land in bank 2 on the RG so
+  // a ~20 ms erase runs read-while-write (code executes from bank 1) and never stalls PPS/SysTick.
+  ee2_page_b = ee_page_a - FLASH_PAGE_SIZE;
+  ee2_page_a = ee_page_a - 2u*FLASH_PAGE_SIZE;
+  uint32_t bank2_base = FLASH_BASE + FLASH_BANK_SIZE;                  // RG: 0x08080000
+  ee2_avail = (ee2_page_a >= 0x08040000u) && (ee2_page_a >= bank2_base);   // above app-CRC AND in bank 2
+#endif
+}
+static void tc_pack(uint8_t*r, uint32_t gen){
+  memset(r,0,EE_REC_SZ);
+  uint32_t mg=EE2_MAGIC; memcpy(r+0,&mg,4); memcpy(r+4,&gen,4);
+  uint16_t sc=EE2_SCHEMA; memcpy(r+8,&sc,2);
+  float tpp = (float)tc_tpp(); if (tpp<=0.0f) tpp = 80.0f;
+  r[10] = (uint8_t)((tc_hse_valid?1:0) | (tc_lse_valid?2:0));
+  int16_t t0=tc_t0; memcpy(r+12,&t0,2);
+  float hb = tc_hse_valid? tc_hse_m[1]/tpp : 0.0f, hc = tc_hse_valid? tc_hse_m[2]/tpp : 0.0f;
+  memcpy(r+14,&hb,4); memcpy(r+18,&hc,4);
+  float la=tc_lse_valid?tc_lse_m[0]:0.0f, lb=tc_lse_valid?tc_lse_m[1]:0.0f, lc=tc_lse_valid?tc_lse_m[2]:0.0f;
+  memcpy(r+22,&la,4); memcpy(r+26,&lb,4); memcpy(r+30,&lc,4);
+  int16_t lo = tc_hse_valid? tc_hse_tmin : tc_lse_tmin;                // union coverage (like tc_dump case 9)
+  int16_t hi = tc_hse_valid? tc_hse_tmax : tc_lse_tmax;
+  if (tc_lse_valid){ if (tc_lse_tmin<lo) lo=tc_lse_tmin; if (tc_lse_tmax>hi) hi=tc_lse_tmax; }
+  memcpy(r+34,&lo,2); memcpy(r+36,&hi,2);
+  memcpy(r+38,&tc_hse_resid,4); memcpy(r+42,&tc_lse_resid,4);
+  memcpy(r+46,&tc_n_hse,4); memcpy(r+50,&tc_n_lse,4);
+  uint16_t crc=ee_crc16(r,62); memcpy(r+62,&crc,2);
+}
+static void tc_unpack(const uint8_t*r){
+  uint8_t fl=r[10]; tc2.hse_valid=(fl&1)!=0; tc2.lse_valid=(fl&2)!=0;
+  memcpy(&tc2.t0,r+12,2);
+  memcpy(&tc2.hse_b,r+14,4); memcpy(&tc2.hse_c,r+18,4);
+  memcpy(&tc2.lse_a,r+22,4); memcpy(&tc2.lse_b,r+26,4); memcpy(&tc2.lse_c,r+30,4);
+  memcpy(&tc2.lo,r+34,2); memcpy(&tc2.hi,r+36,2);
+  memcpy(&tc2.hse_resid,r+38,4); memcpy(&tc2.lse_resid,r+42,4);
+  memcpy(&tc2.n_hse,r+46,4); memcpy(&tc2.n_lse,r+50,4);
+  tc2.valid=1;
+}
+void ee2_load(void){
+  ee2_init_base();
+  tc2.valid=0; ee2_active=ee2_page_a; ee2_next=0; ee2_gen=0;
+  if (!ee2_avail) return;
+  uint8_t rec[EE_REC_SZ];
+  int found=0; uint32_t best_gen=0, best_page=ee2_page_a; uint16_t best_slot=0;
+  for (int pg=0; pg<2; pg++){
+    uint32_t base = pg? ee2_page_b : ee2_page_a;
+    for (uint16_t s=0; s<EE_SLOTS; s++){
+      uint32_t addr = base + (uint32_t)s*EE_REC_SZ;
+      if (ee_rd32(addr) != EE2_MAGIC) continue;
+      ee_rd(addr, rec, EE_REC_SZ);
+      uint16_t sc; memcpy(&sc,rec+8,2); if (sc!=EE2_SCHEMA) continue;
+      uint16_t crc; memcpy(&crc,rec+62,2); if (ee_crc16(rec,62)!=crc) continue;
+      uint32_t gen; memcpy(&gen,rec+4,4);
+      if (!found || gen>best_gen){ found=1; best_gen=gen; best_page=base; best_slot=s; }
+    }
+  }
+  if (found){
+    ee_rd(best_page + (uint32_t)best_slot*EE_REC_SZ, rec, EE_REC_SZ); tc_unpack(rec);
+    ee2_active=best_page; ee2_gen=best_gen; ee2_next=(uint16_t)(best_slot+1);
+  }
+}
+// Never write a zero/invalid record; update the shadow to what we just wrote (rebaselines the detector).
+static _Bool ee2_commit(void){
+  if (!ee2_avail || !(tc_hse_valid || tc_lse_valid)) return 0;
+  uint8_t rec[EE_REC_SZ];
+#ifndef __EMSCRIPTEN__
+  HAL_FLASH_Unlock(); __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
+#endif
+  if (ee2_next >= EE_SLOTS){
+    uint32_t other = (ee2_active==ee2_page_a)? ee2_page_b : ee2_page_a;
+    ee_erase(other); ee2_active=other; ee2_next=0;
+  }
+  uint32_t addr = ee2_active + (uint32_t)ee2_next*EE_REC_SZ;
+  tc_pack(rec, ee2_gen+1);
+  for (uint32_t o=0;o<EE_REC_SZ;o+=8){ uint64_t dw; memcpy(&dw, rec+o, 8); ee_prog_dw(addr+o, dw); }
+  ee2_gen++; ee2_next++;
+#ifndef __EMSCRIPTEN__
+  HAL_FLASH_Lock();
+#endif
+  tc_unpack(rec);          // shadow := just-persisted model
+  return 1;
+}
+// PRE-MORTEM FIX (load sanity): reject a retained model with non-finite or physically-implausible
+// coefficients before it can ever seed the timebase. Bounds are generous — they catch corruption, not
+// legitimate fits (a real crystal's tempco is far smaller than these).
+static _Bool tc2_sane(void){
+  if (tc2.lo < -50 || tc2.hi > 100 || tc2.hi <= tc2.lo) return 0;
+  if (tc2.t0 < -40 || tc2.t0 > 85) return 0;
+  if (tc2.hse_valid){
+    if (!isfinite(tc2.hse_b) || !isfinite(tc2.hse_c)) return 0;
+    if (fabsf(tc2.hse_b) > 10.0f || fabsf(tc2.hse_c) > 2.0f) return 0;      // ppm/°C, ppm/°C²
+  }
+  if (tc2.lse_valid){
+    if (!isfinite(tc2.lse_a) || !isfinite(tc2.lse_b) || !isfinite(tc2.lse_c)) return 0;
+    if (fabsf(tc2.lse_a) > 200.0f || fabsf(tc2.lse_b) > 20.0f || fabsf(tc2.lse_c) > 5.0f) return 0;
+  }
+  return tc2.hse_valid || tc2.lse_valid;
+}
+// Boot: seed the learned model from flash THROUGH the existing tc_seed path (config.txt still wins).
+void tc_seed_from_flash(void){
+  if (!tc_persist) return;                                   // opt-in (default off)
+  if (tc_seed_done) return;                                  // first boot pass only (live-reload = no-op)
+  if (!ee2_avail || !tc2.valid) return;
+  if (!tc2_sane()) { tc2.valid = 0; return; }                // reject implausible/corrupt model
+  _Bool cfg_froze = !isnan(tc_cfg_hse[1]) || !isnan(tc_cfg_hse[2]) ||
+                    !isnan(tc_cfg_lse[0]) || !isnan(tc_cfg_lse[1]) || !isnan(tc_cfg_lse[2]);
+  if ((cfg_tc_defined & CFG_TC_SEED) && !tc_seed) return;    // tc_seed = off in config -> ignore flash
+  if (cfg_froze && !tc_seed) return;                         // frozen config coeffs, no evolve -> config wins
+  if (isnan(tc_cfg_hse[1]) && isnan(tc_cfg_hse[2]) && tc2.hse_valid){ tc_cfg_hse[1]=tc2.hse_b; tc_cfg_hse[2]=tc2.hse_c; }
+  if (isnan(tc_cfg_lse[0]) && isnan(tc_cfg_lse[1]) && isnan(tc_cfg_lse[2]) && tc2.lse_valid){
+    tc_cfg_lse[0]=tc2.lse_a; tc_cfg_lse[1]=tc2.lse_b; tc_cfg_lse[2]=tc2.lse_c; }
+  if (!(cfg_tc_defined & CFG_TC_LO)) tc_seed_lo = tc2.lo;
+  if (!(cfg_tc_defined & CFG_TC_HI)) tc_seed_hi = tc2.hi;
+  if (!(cfg_tc_defined & CFG_TC_T0)) tc_t0 = tc2.t0;
+  tc_seed = 1;
+  tc_persist_seeded = 1;
+}
+// Runs immediately AFTER tc_seed_apply on the boot pass. PRE-MORTEM FIX (break the permanent-hold trap):
+// cap the seeded prior order at 2 so the first genuine linear fit can supersede the seed — a stored
+// quadratic can never lock the model for the life of a thermally-narrow deployment. Also restore the
+// real sample counts + residual for display + holdover-fade honesty, and stamp the commit clock so the
+// clock does not immediately rewrite the record it just loaded.
+void tc_persist_after_seed(void){
+  if (!tc_persist_seeded) return;
+  if (tc_hse_prior > 2) tc_hse_prior = 2;
+  if (tc_lse_prior > 2) tc_lse_prior = 2;
+  if (tc2.n_hse) tc_n_hse = tc2.n_hse;
+  if (tc2.n_lse) tc_n_lse = tc2.n_lse;
+  if (tc2.hse_valid) tc_hse_resid = tc2.hse_resid;
+  if (tc2.lse_valid) tc_lse_resid = tc2.lse_resid;
+  tc_last_commit_ms = uwTick;
+}
+// PRE-MORTEM FIX (persist gate): only a WELL-SUPPORTED model may reach flash — enough samples, real
+// temperature coverage, and a believable fit residual. A shaky fit is never persisted, so it can never
+// auto-seed a bad steer on the next boot.
+static _Bool tc_model_supported(void){
+  _Bool hse_ok = tc_hse_valid && tc_n_hse >= 300u && (tc_hse_tmax - tc_hse_tmin) >= 4
+                 && tc_hse_resid < 5.0f*(float)tc_tpp();
+  _Bool lse_ok = tc_lse_valid && tc_n_lse >= 60u  && (tc_lse_tmax - tc_lse_tmin) >= 4
+                 && tc_lse_resid < 5.0f;
+  return hse_ok || lse_ok;
+}
+// Change detector: set dirty when the live model has moved meaningfully vs the last-persisted shadow.
+// Called after tc_fit(). "Meaningful" = validity gained, coverage expanded, or the modelled ppm at
+// {lo, mid, hi} moved beyond a threshold (handles the quadratic term correctly).
+static void tc_model_check(void){
+  if (!tc_persist || !ee2_avail || tc_model_dirty) return;
+  float tpp=(float)tc_tpp(); if (tpp<=0.0f) tpp=80.0f;
+  if ((tc_hse_valid && !tc2.hse_valid) || (tc_lse_valid && !tc2.lse_valid)) { tc_model_dirty=1; return; }
+  if (tc_hse_valid && (tc_hse_tmin < tc2.lo || tc_hse_tmax > tc2.hi)) { tc_model_dirty=1; return; }
+  if (tc_lse_valid && (tc_lse_tmin < tc2.lo || tc_lse_tmax > tc2.hi)) { tc_model_dirty=1; return; }
+  if (tc_hse_valid && tc2.hse_valid){
+    int16_t T[3]={tc_hse_tmin,(int16_t)((tc_hse_tmin+tc_hse_tmax)/2),tc_hse_tmax};
+    for (int i=0;i<3;i++){ float x=(float)(T[i]-tc_t0);
+      float d=fabsf(((tc_hse_m[1]/tpp)*x+(tc_hse_m[2]/tpp)*x*x) - (tc2.hse_b*x+tc2.hse_c*x*x));
+      if (d>0.5f){ tc_model_dirty=1; return; } }
+  }
+  if (tc_lse_valid && tc2.lse_valid){
+    int16_t T[3]={tc_lse_tmin,(int16_t)((tc_lse_tmin+tc_lse_tmax)/2),tc_lse_tmax};
+    for (int i=0;i<3;i++){ float x=(float)(T[i]-tc_t0);
+      float d=fabsf((tc_lse_m[0]+tc_lse_m[1]*x+tc_lse_m[2]*x*x) - (tc2.lse_a+tc2.lse_b*x+tc2.lse_c*x*x));
+      if (d>0.2f){ tc_model_dirty=1; return; } }
+  }
+}
+// Main-loop: persist the model when dirty AND well-supported, throttled to >=30 min on a MONOTONIC
+// clock (uwTick, never GPS wall time), on the menu commit's PPS-safe / UART-idle / L0 gate.
+static void tc_persist_step(void){
+  if (tc_model_dirty && tc_persist && ee2_avail && tc_model_supported() &&
+      menu_layer==L0_CLOCK && !waitingForLatch &&
+      huart2.gState==HAL_UART_STATE_READY && !pps_record_pending && !tc_dump_pending &&
+      (uint32_t)(uwTick - tc_last_commit_ms) >= 1800000u){     // >= 30 min, wrap-safe
+    if (ee2_commit()){ tc_model_dirty = 0; tc_last_commit_ms = uwTick; }
+  }
+}
+// "tc_forget = on" over serial: erase the tempcomp store (drop the PERSISTED copy only; the live
+// learned model is untouched — a full cold start is tc_reset + tc_forget). Serviced from the main loop.
+static void tc_forget_step(void){
+  if (!tc_forget_pending) return;
+  tc_forget_pending = 0;
+  tc2.valid = 0; tc_model_dirty = 0;
+  if (!ee2_avail) return;
+#ifndef __EMSCRIPTEN__
+  HAL_FLASH_Unlock(); __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
+#endif
+  ee_erase(ee2_page_a); ee_erase(ee2_page_b);
+#ifndef __EMSCRIPTEN__
+  HAL_FLASH_Lock();
+#endif
+  ee2_active = ee2_page_a; ee2_next = 0; ee2_gen = 0;
+}
+
 // Boot merge: apply an override to a key iff config.txt didn't define it OR the stored mtime matches
 // the current config.txt mtime. A zero mtime never matches (an RTC-less host writes 0/0), so a real
 // config.txt edit on such a host always wins over a stored override.
@@ -4707,6 +4958,7 @@ int main(void)
   displayOn();
 
   ee_load();          // scan the emulated-EEPROM into the override store before config.txt is read
+  ee2_load();         // scan the retained tempco model (separate 2-page store); readConfigFile picks it up as a seed
   readConfigFile();
   checkDelayedLoadRules();
   loadStars();          // scan /STARS.BIN into the transit catalogue (star_max_mag is known now); falls back to the baked bright set
@@ -4893,6 +5145,8 @@ int main(void)
     hdev_dump_step();    // one-shot $PMHDEV (Hadamard) twin
     star_dump_step();    // one-shot $PMSTAR emit when star_dump was set over serial (else 1 flag check)
     menu_reset_step();   // one-shot menu factory-reset when menu_reset was set over serial
+    tc_persist_step();   // gated commit of the learned tempco model to its retained flash store
+    tc_forget_step();    // one-shot erase of the retained model when tc_reset/tc_forget fired
 
     LP_MARK(7);
     if (displayMode == MODE_VBAT)
