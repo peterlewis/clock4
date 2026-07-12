@@ -10,11 +10,14 @@ knob. Names are 4-char, uppercase (the mk4-date 7-seg font is uppercase-only and
 letter; I/O/S/Z read as 1/0/5/2 and K/M/Q/V/W/X are rough approximations — flagged, not excluded).
 
 FILE FORMAT (little-endian):
-  header 16 B:  magic "MST1" (4) | count u16 | recordLength u16 (=10) | mag_scale u16 (=100) | 6 B zero
-  record 10 B:  ra u16  (= round(ra_hours/24 * 65536))     -> firmware: ra_h = ra/65536*24
+  header 16 B:  magic "MST1" (4) | count u16 | recordLength u16 (=14) | mag_scale u16 (=100) | 6 B zero
+  record 14 B:  ra u16  (= round(ra_hours/24 * 65536))     -> firmware: ra_h = ra/65536*24
                 dec i16  (= round(dec_deg * 100))            -> firmware: dec  = dec/100
                 mag i16  (= round(mag * 100), load-filter)   -> dropped from RAM after the cut
                 nm  char[4] (uppercase, space-padded, unique)
+                pmra  i16 (mas/yr, mu_alpha* incl. cos-dec)  -> proper motion (alpha Cen drifts ~14 s
+                pmdec i16 (mas/yr)                              of transit time by 2028 without it)
+  (The firmware also accepts legacy 10-byte records — proper motion treated as zero.)
 """
 import csv, os, struct, sys, urllib.request
 
@@ -24,7 +27,7 @@ CACHE   = os.path.join(HERE, "hyg_v41.csv")          # gitignored build cache
 OUT     = os.path.join(HERE, "output", "stars.bin")
 MAG_CUT = float(os.environ.get("STAR_MAG_CUT", "2.5"))
 MAGIC   = b"MST1"
-REC_LEN = 10
+REC_LEN = 14
 MAG_SCALE = 100
 
 # --- 7-seg legibility (mk4-date lut_7seg is uppercase-only; every letter renders) ---
@@ -87,21 +90,24 @@ def build():
         ra_u = round(ra_h / 24.0 * 65536.0) & 0xFFFF
         dec_i = max(-9000, min(9000, round(float(r['dec']) * 100)))
         mag_i = round(float(r['mag']) * MAG_SCALE)
-        out.append((ra_u, dec_i, mag_i, nm))
+        pmra  = max(-32768, min(32767, round(float(r['pmra']  or 0))))   # mas/yr (HYG: mu_alpha*)
+        pmdec = max(-32768, min(32767, round(float(r['pmdec'] or 0))))
+        out.append((ra_u, dec_i, mag_i, nm, pmra, pmdec))
         flags = ''.join(sorted(set(nm) & (AMBIG | ROUGH)))
         report.append((r['proper'] or ('*' + (r['bayer'] or '')), nm, float(r['mag']), flags))
 
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     with open(OUT, "wb") as f:
         f.write(MAGIC + struct.pack("<HHH6x", len(out), REC_LEN, MAG_SCALE))
-        for ra_u, dec_i, mag_i, nm in out:
-            f.write(struct.pack("<HhH", ra_u, dec_i, mag_i & 0xFFFF) + nm.encode('ascii').ljust(4, b' '))
+        for ra_u, dec_i, mag_i, nm, pmra, pmdec in out:
+            f.write(struct.pack("<HhH", ra_u, dec_i, mag_i & 0xFFFF) + nm.encode('ascii').ljust(4, b' ')
+                    + struct.pack("<hh", pmra, pmdec))
 
     # --- self-verify: sizes, uniqueness, round-trip a couple of records ---
     size = os.path.getsize(OUT)
     assert size == 16 + len(out) * REC_LEN, f"size {size} != header+records"
-    assert len({n for *_, n in out}) == len(out), "duplicate names!"
-    for nm in (n for *_, n in out):
+    assert len({rec[3] for rec in out}) == len(out), "duplicate names!"
+    for nm in (rec[3] for rec in out):
         assert 1 <= len(nm) <= 4, f"bad name {nm!r}"
     sys.stderr.write(f"OK  stars.bin: {len(out)} stars, {size} B (mag<={MAG_CUT})\n")
 
