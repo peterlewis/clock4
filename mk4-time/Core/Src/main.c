@@ -4889,6 +4889,10 @@ static void menu_reset_step(void){
 // emit the 0x94/95/96 chord protocol for the menu to be reachable — until then this stays dormant and
 // a bare 0x93 keeps its legacy reset. See EVT_* in main.h.
 static int32_t menu_orig = 0;   // value captured on entering L2, for CANCEL
+static uint8_t  menu_acolx_orig = 0;   // colonAltExplicit snapshot: CANCEL/idle must not leak the explicit flag (s_acolon sets it on every restore-write)
+static uint8_t  menu_l0_snap_mode = 0; // displayMode before an L0 single tap fired nextMode...
+static uint32_t menu_l0_snap_ms = 0;   // ...so a staggered both-press (tap leaked, then SETUP fires) can undo the accidental mode change
+static uint8_t  menu_l0_snap_valid = 0;
 
 // ---- date-row ownership + rendering ----
 static void menu_show(const char *s){
@@ -4955,13 +4959,13 @@ static void    s_bal   (const MItem*m,int32_t v){ (void)m;
 }
 static int32_t g_mode  (const MItem*m){ return config.modes_enabled[m->lo]; }
 static void    s_mode  (const MItem*m,int32_t v){ menuSetMode((uint8_t)m->lo, v?1:0); }
-static void    s_fwcrc (const MItem*m,int32_t v){ (void)m; menuSetMode(MODE_FIRMWARE_CRC_T,v?1:0); config.modes_enabled[MODE_FIRMWARE_CRC_D]=v?1:0; }
+static void    s_fwcrc (const MItem*m,int32_t v){ (void)m; menuSetMode(MODE_FIRMWARE_CRC_T,v?1:0); config.modes_enabled[MODE_FIRMWARE_CRC_D]=v?1:0; if (!config.modes_enabled[displayMode]) nextMode(0); }  // mirror menuSetMode's guard: never strand the view on a just-disabled mode
 // Factory reset (MIT_ACTION): EDIT opens a "SURE?" confirm; SAVE fires it -> menu_reset_step erases the
 // on-device store and re-reads config.txt (back to defaults, no reboot). CANCEL / a zero commit is a no-op.
 static int32_t g_reset (const MItem*m){ (void)m; return 0; }
 static void    s_reset (const MItem*m,int32_t v){ (void)m; if (v) menu_reset_pending = 1; }
 
-static const char *const en_colon[] = {"SLOWFADE","HEARTBt","1PPS SAW","ALT SAW","TOGGLE","SOLID"};
+static const char *const en_colon[] = {"SLOWFADE","HEARTBt","1PPS SAW","ALT SAW","TOGGLE","FULL"};    // FULL not SOLID: S/O/I read as 5/0/1 on 7-seg
 static const char *const en_nmea[]  = {"ALL","RMC","NONE"};
 
 #define MODE_ROW(mo,sec,lab) { KID_MODE_BASE+(mo), MIT_TOGGLE, lab, (mo),1,1, NULL, g_mode, s_mode, (sec) }
@@ -4970,10 +4974,10 @@ static const MItem menu_items[] = {
   { KID_BRIGHTNESS, MIT_STEP,  "BRIGHT",  -1,4095,256, NULL,     g_bright, s_bright, SEC_DISP },
   { KID_BALANCE,    MIT_TOGGLE,"BALANCE",  0,1,1,       NULL,     g_bal,    s_bal,    SEC_DISP },   // per-segment + colon brightness uniformity (baked AUTO curves)
   { KID_COLON,      MIT_ENUM,  "COLON",    0,5,1,      en_colon, g_colon,  s_colon,  SEC_DISP },
-  { KID_COLON_ALT,  MIT_ENUM,  "COLONALT", 0,5,1,      en_colon, g_acolon, s_acolon, SEC_DISP },
-  { KID_PAGE_MS,    MIT_STEP,  "PAGE MS",  250,60000,250,NULL,   g_page,   s_page,   SEC_DISP },
+  { KID_COLON_ALT,  MIT_ENUM,  "ACOLON",   0,5,1,      en_colon, g_acolon, s_acolon, SEC_DISP },   // 6-char label leaves room for the value at L2 (COLONALT hid it)
+  { KID_PAGE_MS,    MIT_STEP,  "PAGE",     250,60000,250,NULL,   g_page,   s_page,   SEC_DISP },   // shows seconds; "MS"/unit-S both misread on 7-seg
   { KID_SIG_FADE,   MIT_TOGGLE,"SIG FADE", 0,1,1,      NULL,     g_sig,    s_sig,    SEC_DISP },
-  { KID_PPS,        MIT_TOGGLE,"PPS OUT",  0,1,1,      NULL,     g_pps,    s_pps,    SEC_SYS  },
+  { KID_PPS,        MIT_TOGGLE,"PPS MSG",  0,1,1,      NULL,     g_pps,    s_pps,    SEC_SYS  },   // the $PMTXTS timestamp sentence, NOT a 1PPS hardware output
   { KID_NMEA,       MIT_ENUM,  "NMEA",     0,2,1,      en_nmea,  g_nmea,   s_nmea,   SEC_SYS  },
   { KID_MATRIX_FREQ,MIT_STEP,  "MATRIX",   8000,100000,1000,NULL,g_matrix, s_matrix, SEC_SYS  },   // menu floor 8000 (flicker); config MATRIX_FREQUENCY reaches the 1000 hw floor
   { KID_RESET,      MIT_ACTION,"RESET",    0,0,0,       NULL,     g_reset,  s_reset,  SEC_SYS  },   // factory-reset the on-device settings (confirm required)
@@ -4989,7 +4993,7 @@ static const MItem menu_items[] = {
   MODE_ROW(MODE_GRID,SEC_ASTRO,"GRID"),           MODE_ROW(MODE_LATLON,SEC_ASTRO,"LAT LON"),
   MODE_ROW(MODE_LST,SEC_ASTRO,"LST"),             MODE_ROW(MODE_SOLAR,SEC_ASTRO,"SOLAR"),
   MODE_ROW(MODE_ADEV,SEC_DIAG,"ADEV"),            MODE_ROW(MODE_STAR,SEC_ASTRO,"STAR"),
-  MODE_ROW(MODE_TEMPCOMP,SEC_DIAG,"TC VIEW"),
+  MODE_ROW(MODE_TEMPCOMP,SEC_DIAG,"TC DATA"),   // the model READOUT; "TEMPCOMP" beside it is the enable
   { KID_MODE_BASE+MODE_FIRMWARE_CRC_T, MIT_TOGGLE, "FW CRC", MODE_FIRMWARE_CRC_T,1,1, NULL, g_mode, s_fwcrc, SEC_DIAG },
 };
 static const char *const sect_name[NSEC] = { "CAL", "ASTRO", "DISP", "DIAG", "SYS" };
@@ -5023,16 +5027,16 @@ static void menu_render_item(void){
     // ENUM/TOGGLE keep the LABEL recognisable (you scroll by label) — truncate the value, or label-only.
     char val[10]; int32_t v = m->get(m);
     if (m->type==MIT_STEP){
-      if      (m->key_id==KID_PAGE_MS)     snprintf(val,sizeof val,"%ld.%ldS",(long)(v/1000),(long)((v%1000)/100)); // 5.5S
+      if      (m->key_id==KID_PAGE_MS)     snprintf(val,sizeof val,"%ld.%ld",(long)(v/1000),(long)((v%1000)/100)); // seconds, NO unit-S ('S' == the '5' glyph; "5.5S" read as 5.55)
       else if (m->key_id==KID_MATRIX_FREQ) snprintf(val,sizeof val,"%ld",(long)(v/1000));                          // 20 (kHz; K/Z have no 7-seg glyph, the MATRIX label carries the unit) -> "MATRIX 20"
       else                                 menu_fmt_val(m, v, val);            // BRIGHT etc.
       if (snprintf(buf,sizeof buf,"%s %s",m->label,val) > 10){                 // overflow -> keep the value, trim the label
         int labcap = 10 - 1 - (int)strlen(val);
         snprintf(buf,sizeof buf,"%.*s %s", labcap<0?0:labcap, m->label, val);
       }
-    } else if (m->type==MIT_TOGGLE) {                                          // TOGGLE: it's one-press now, so the STATE must always be visible — keep a compact "ON"/"OF", trim the label if the row is tight (labels stay recognisable; you scrolled to it).
-      const char *st = v ? "ON" : "OF";
-      int labcap = 10 - 1 - 2, ll = (int)strlen(m->label);
+    } else if (m->type==MIT_TOGGLE) {                                          // TOGGLE: the STATE must always be visible — full "ON"/"OFF" ("OF" rendered "0F" and read as the word of), trim the label if the row is tight (labels stay recognisable; you scrolled to it).
+      const char *st = v ? "ON" : "OFF";
+      int labcap = 10 - 1 - (int)strlen(st), ll = (int)strlen(m->label);
       if (ll > labcap) ll = labcap;
       snprintf(buf,sizeof buf,"%.*s %s", ll, m->label, st);
     } else if (m->type==MIT_ACTION) {                                          // ACTION: just the label at L2 (the confirm lives at L3)
@@ -5047,8 +5051,9 @@ static void menu_render_item(void){
     }
     menu_show(buf);
   } else {                       // L3_EDIT: show the value being scrubbed
-    if (m->type==MIT_ACTION)        menu_show("SURE?");                                     // action confirm: SAVE fires, CANCEL aborts
+    if (m->type==MIT_ACTION)        menu_show("DELETE ALL");                                // action confirm ('?' has no 7-seg glyph — "SURE?" rendered "5URE-"); APPLY fires, CANCEL aborts
     else if (m->key_id==KID_MATRIX_FREQ) { snprintf(buf,sizeof buf,"%ld",(long)(menu_val/1000)); menu_show(buf); }  // kHz, matches the L2 form (stored value stays Hz; step 1000 Hz = 1 kHz)
+    else if (m->key_id==KID_PAGE_MS) { snprintf(buf,sizeof buf,"%ld.%ld",(long)(menu_val/1000),(long)((menu_val%1000)/100)); menu_show(buf); }  // seconds in the editor too (was raw ms: "5500")
     else { menu_fmt_val(m, menu_val, buf); menu_show(buf); }
   }
 }
@@ -5057,6 +5062,7 @@ static void menu_render_item(void){
 static void menu_enter_edit(void){
   const MItem *m=&menu_items[menu_idx];
   menu_orig = m->get(m); menu_val = menu_orig; menu_run_dir=0; menu_run_len=0;
+  if (m->key_id==KID_COLON_ALT) menu_acolx_orig = colonAltExplicit;   // s_acolon sets the flag on EVERY write incl. restores — snapshot so CANCEL/idle can put it back
   if (m->key_id==KID_COLON || m->key_id==KID_COLON_ALT){        // §3.5: begin previewing the choice under the cursor
     colon_preview = (uint8_t)menu_orig; applyColonForMode();
   }
@@ -5106,6 +5112,7 @@ static void menu_colon_preview_end(void){
 static void menu_cancel_edit(void){
   const MItem *m=&menu_items[menu_idx];
   m->set(m, menu_orig);                                            // restore pre-edit value
+  if (m->key_id==KID_COLON_ALT) colonAltExplicit = menu_acolx_orig; // the restore-write just re-set the explicit flag — an abandoned edit must not defeat the auto-distinguish on the next config load
   if (m->key_id==KID_MATRIX_FREQ) setDisplayFreq(matrix_freq_hz);  // §4: force the last rate to the date board (set-hook throttles)
   menu_colon_preview_end();                                        // §3.5: back to the context colon
   menu_layer=L2_ITEM; menu_render_item();
@@ -5113,55 +5120,83 @@ static void menu_cancel_edit(void){
 static void menu_commit_edit(void){
   const MItem *m=&menu_items[menu_idx];
   if (m->type==MIT_ACTION) { m->set(m, 1); }   // fire the one-shot action (e.g. factory reset) — nothing to persist
-  else {
-  menu_record_key(m->key_id, menu_val);   // record for flash (value already applied live)
-  if (m->key_id==KID_MATRIX_FREQ) setDisplayFreq(matrix_freq_hz);  // §4: authoritative final sync past the UART throttle
+  else if (menu_val != menu_orig) {
+    menu_record_key(m->key_id, menu_val);   // record for flash (value already applied live)
+    if (m->key_id==KID_MATRIX_FREQ) setDisplayFreq(matrix_freq_hz);  // §4: authoritative final sync past the UART throttle
+  } else {
+    // no-op visit (or a LASt-refused tap that bounced back): nothing changed — don't burn a flash
+    // record on it, and don't let the visit's live writes leak the COLONALT explicit flag either.
+    if (m->key_id==KID_COLON_ALT) colonAltExplicit = menu_acolx_orig;
+    if (m->key_id==KID_MATRIX_FREQ) setDisplayFreq(matrix_freq_hz);
   }
   menu_colon_preview_end();                                        // §3.5: back to the context colon
   menu_layer=L2_ITEM; menu_render_item();
 }
 
 // ---- rolling self-labeled chord stages (read the label, release on the one you want) ----
-static const char *const chord_L0[4]    = { "", "SETUP", "",       "REBOOT" };   // stage 3 (deep hold, ~2s) reboots (NVIC reset); factory reset is the SYS>RESET menu item
-static const char *const chord_L1sec[4] = { "", "ENTER", "EXIT",   ""      };  // L1_SECTION
-static const char *const chord_L2itm[4] = { "", "EDIT",  "BACK",   ""      };  // L2_ITEM
-static const char *const chord_L3edt[4] = { "", "SAVE",  "CANCEL", ""      };  // L3_EDIT
+// Stage map (review-refined): APPLY and CANCEL are separated by the harmless "----" buffer stage so
+// overshooting a commit can never silently discard the edit; the deep hold (stage 3) is a consistent
+// "bail out" everywhere — CLOCK at L1/L2, CANCEL in editors — and at L0 arms REBOOT only on the
+// SECOND stage cycle (~4.3 s: watch SETUP > ---- > ---- > SETUP > ---- > REBOOT) so an exploratory
+// over-hold of the menu-entry gesture can't reset the clock.
+static const char *const chord_L0[4]    = { "", "SETUP", "",       "REBOOT" };   // stage-3 label gated on the 2nd cycle (see menu_show_stage)
+static const char *const chord_L1sec[4] = { "", "ENTER", "EXIT",   "CLOCK" };  // L1_SECTION
+static const char *const chord_L2itm[4] = { "", "EDIT",  "BACK",   "CLOCK" };  // L2_ITEM
+static const char *const chord_L3edt[4] = { "", "APPLY", "",       "CANCEL" };  // L3_EDIT ("SAVE" rendered "5A?E"; buffer stage between commit and discard)
+static uint8_t menu_cycle = 0;          // completed 1-2-3 stage cycles within ONE chord hold (REBOOT arming)
 static void menu_show_stage(void){
   const char *const *t = (menu_layer==L0_CLOCK)   ? chord_L0
                        : (menu_layer==L1_SECTION) ? chord_L1sec
                        : (menu_layer==L2_ITEM)    ? chord_L2itm : chord_L3edt;
   const char *s = (menu_stage<=3)? t[menu_stage] : "";
-  if (menu_layer==L3_EDIT && menu_items[menu_idx].type==MIT_TOGGLE && (menu_stage==1||menu_stage==2)) s = "DONE";  // a toggle exits-and-saves on either release
+  if (menu_layer==L0_CLOCK && menu_stage==3 && menu_cycle==0) s = "";  // REBOOT arms on the 2nd cycle only — never label what won't fire
+  if (menu_layer==L3_EDIT && menu_items[menu_idx].type==MIT_TOGGLE && (menu_stage==1||menu_stage==2)) s = "DONE";  // a toggle exits-and-saves on either shallow release
   menu_show(s[0]? s : "----");
 }
 static void menu_fire_stage(void){
   if (!menu_chord) return;
   if (menu_layer==L0_CLOCK){
-    if (menu_stage==1){ menu_layer=L1_SECTION; menu_render_item(); }   // SETUP -> section ring (resumes menu_section)
-    else if (menu_stage>=3){ buttonsBothHeld(); }                      // deepest labeled hold ("REBOOT", ~2s) = NVIC reset (L0 ONLY). Factory reset is SYS>RESET.
+    if (menu_stage==1){                                                // SETUP -> section ring (resumes menu_section)
+      if (menu_l0_snap_valid && (uint32_t)(uwTick - menu_l0_snap_ms) < 2500u)
+        displayMode = menu_l0_snap_mode;                               // a staggered both-press leaked a single tap first (nextMode fired) — undo it, the user was reaching for the menu
+      menu_layer=L1_SECTION; menu_render_item();
+    }
+    else if (menu_stage==3 && menu_cycle>=1){ buttonsBothHeld(); }     // REBOOT (2nd cycle, ~4.3s) = NVIC reset (L0 ONLY). Factory reset is SYS>RESET.
+    else menu_to_L0();                                                 // released on an unlabeled stage: restore the clock row (was: stuck showing "----")
   } else if (menu_layer==L1_SECTION){
     if (menu_stage==1){                                                // ENTER -> item ring of this section
       if (menu_items[menu_idx].section != menu_section) menu_idx = menu_first_in_section(menu_section);
       menu_layer=L2_ITEM; menu_render_item();     // land directly on the first item (resumes last item if still in-section) — no separate section banner
-    } else if (menu_stage==2) menu_to_L0();                            // EXIT -> clock
+    } else menu_to_L0();                                               // EXIT (2) / CLOCK (3) -> clock
   } else if (menu_layer==L2_ITEM){
     if (menu_stage==1) menu_enter_edit();                              // EDIT -> open the item (enter, change, exit)
     else if (menu_stage==2){ menu_layer=L1_SECTION; menu_render_item(); } // BACK -> section ring
+    else menu_to_L0();                                                 // CLOCK (deep hold) -> bail to the clock from anywhere
   } else { /* L3_EDIT */
-    if (menu_items[menu_idx].type==MIT_TOGGLE) menu_commit_edit();     // toggle: exit = SAVE either way (enter, toggle, exit); idle still abandons
-    else if (menu_stage==1) menu_commit_edit();                        // SAVE
-    else if (menu_stage==2) menu_cancel_edit();                        // CANCEL
+    const MItem *mi = &menu_items[menu_idx];
+    if (mi->type==MIT_TOGGLE){
+      if (menu_stage<=2) menu_commit_edit();                           // DONE: exit = save on either shallow release (enter, toggle, exit)
+      else menu_cancel_edit();                                         // deep hold = CANCEL, consistent with the value editors (stage-3 label says so)
+    }
+    else if (menu_stage==1) menu_commit_edit();                        // APPLY
+    else if (menu_stage==3) menu_cancel_edit();                        // CANCEL (buffered one stage past APPLY)
+    else menu_render_item();                                           // "----" buffer stage: no-op, but repaint the editor (the stage label took the row)
   }
-  menu_chord=0; menu_stage=0;
+  menu_chord=0; menu_stage=0; menu_cycle=0; menu_l0_snap_valid=0;
 }
 static void menu_dispatch(uint8_t e){
-  if (e>=EVT_CHORD_S1 && e<=EVT_CHORD_S3){ menu_chord=1; menu_stage=(uint8_t)(e-EVT_CHORD_S1+1); menu_show_stage(); return; }
+  if (e>=EVT_CHORD_S1 && e<=EVT_CHORD_S3){
+    if (!menu_chord) menu_cycle=0;
+    else if (e==EVT_CHORD_S1 && menu_stage==3) menu_cycle++;   // stages wrapped 3->1: one full cycle held through
+    menu_chord=1; menu_stage=(uint8_t)(e-EVT_CHORD_S1+1); menu_show_stage(); return;
+  }
   if (e==EVT_CHORD_REL){
     if (menu_chord) menu_fire_stage();
     else if (menu_layer==L0_CLOCK) buttonsBothHeld();    // BACKWARD COMPAT: stock date board 0x93 = reset
     return;
   }
   if (menu_layer==L0_CLOCK){
+    menu_l0_snap_mode = displayMode; menu_l0_snap_ms = uwTick; menu_l0_snap_valid = 1;  // if this tap turns out to be a staggered half of the SETUP chord, fire_stage undoes the mode change
     if (e==EVT_BTN1) button1pressed(); else if (e==EVT_BTN2) button2pressed();
   } else if (menu_layer==L1_SECTION){
     if (e==EVT_BTN1) menu_section=(uint8_t)((menu_section+1)%NSEC);
