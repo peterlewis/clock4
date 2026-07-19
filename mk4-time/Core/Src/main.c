@@ -329,7 +329,7 @@ volatile _Bool tc_dump_pending = 0;        // set by the serial parser, serviced
 volatile _Bool tc_reset_pending = 0;
 volatile _Bool adev_dump_pending = 0;      // "adev_dump = on" over serial -> emit one $PMADEV sentence
 volatile _Bool hdev_dump_pending = 0;      // "hdev_dump = on" over serial -> emit one $PMHDEV sentence (Hadamard)
-volatile _Bool menu_reset_pending = 0;     // "menu_reset = on" over serial -> factory-reset the menu store
+volatile _Bool factory_reset_pending = 0;     // "factory_reset = on" over serial -> factory-reset the menu store
 volatile _Bool star_dump_pending = 0;      // "star_dump = on" over serial -> emit one $PMSTAR sentence
 volatile _Bool menu_dump_pending = 0;      // "menu_dump = on" over serial -> emit the store-persistence diagnostic
 
@@ -2173,8 +2173,8 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     loop_diag = truthy(value) ? 1 : 0;   // 1 Hz $PMLOOP main-loop latency diagnostic
   } else if (strcasecmp(key, "menu_dump") == 0) {
     if (from_serial && truthy(value)) menu_dump_pending = 1;  // serial-only: report whether the store is flash-backed or RAM-only
-  } else if (strcasecmp(key, "menu_reset") == 0) {
-    if (from_serial && truthy(value)) menu_reset_pending = 1; // serial-only: wipe stored menu overrides
+  } else if (strcasecmp(key, "factory_reset") == 0) {
+    if (from_serial && truthy(value)) factory_reset_pending = 1; // serial-only: wipe stored menu overrides
   } else if (strcasecmp(key, "tc_reset") == 0) {
     if (from_serial && truthy(value)) tc_reset_pending = 1;   // serial-only, same guard
 
@@ -4795,15 +4795,15 @@ static void menu_record_key(uint8_t key_id, int32_t v){
   }
 }
 
-// "menu_reset = on" over serial: factory-reset the on-device menu. Erase both emulated-EEPROM pages,
+// "factory_reset = on" over serial: factory-reset the on-device menu. Erase both emulated-EEPROM pages,
 // forget the RAM override store, then re-read config.txt so the clock returns to a config.txt-only
 // state immediately (no reboot). Serial-only + origin-guarded, like tc_reset. Serviced from the main
 // loop (flash erase stalls the CPU, and the config re-read touches the FAT + non-reentrant sendDate).
 static void menu_flash(const char *s);   // defined with the menu FSM below (transient date-row note)
-static void menu_reset_step(void){
-  if (!menu_reset_pending) return;
+static void factory_reset_step(void){
+  if (!factory_reset_pending) return;
   if (ee_avail && !settings_mapping_ok()) return;   // QSPI: never erase against a stale mapping; retry
-  menu_reset_pending = 0;
+  factory_reset_pending = 0;
   memset(&ovr, 0, sizeof ovr);          // drop the RAM override store (also handles the RC no-flash case)
   menu_dirty = 0;
   if (ee_avail){
@@ -4912,10 +4912,10 @@ static void    s_bal   (const MItem*m,int32_t v){ (void)m;
 static int32_t g_mode  (const MItem*m){ return config.modes_enabled[m->lo]; }
 static void    s_mode  (const MItem*m,int32_t v){ menuSetMode((uint8_t)m->lo, v?1:0); }
 static void    s_fwcrc (const MItem*m,int32_t v){ (void)m; menuSetMode(MODE_FIRMWARE_CRC_T,v?1:0); config.modes_enabled[MODE_FIRMWARE_CRC_D]=v?1:0; if (!config.modes_enabled[displayMode]) nextMode(0); }  // mirror menuSetMode's guard: never strand the view on a just-disabled mode
-// Factory reset (MIT_ACTION): EDIT opens a "SURE?" confirm; SAVE fires it -> menu_reset_step erases the
+// Factory reset (MIT_ACTION): EDIT opens a "SURE?" confirm; SAVE fires it -> factory_reset_step erases the
 // on-device store and re-reads config.txt (back to defaults, no reboot). CANCEL / a zero commit is a no-op.
 static int32_t g_reset (const MItem*m){ (void)m; return 0; }
-static void    s_reset (const MItem*m,int32_t v){ (void)m; if (v) menu_reset_pending = 1; }
+static void    s_reset (const MItem*m,int32_t v){ (void)m; if (v) factory_reset_pending = 1; }
 
 static const char *const en_colon[] = {"SLOWFADE","HEARTBt","1PPS SAW","ALT SAW","TOGGLE","FULL"};    // FULL not SOLID: S/O/I read as 5/0/1 on 7-seg
 static const char *const en_nmea[]  = {"ALL","RMC","NONE"};
@@ -5604,7 +5604,7 @@ int main(void)
     adev_dump_step();    // one-shot $PMADEV emit when adev_dump was set over serial (else 1 flag check)
     hdev_dump_step();    // one-shot $PMHDEV (Hadamard) twin
     star_dump_step();    // one-shot $PMSTAR emit when star_dump was set over serial (else 1 flag check)
-    menu_reset_step();   // one-shot menu factory-reset when menu_reset was set over serial
+    factory_reset_step();   // one-shot menu factory-reset when factory_reset was set over serial
     tc_persist_step();   // gated commit of the learned tempco model to its retained flash store
     tc_forget_step();    // one-shot erase of the retained model when tc_reset/tc_forget fired
 
