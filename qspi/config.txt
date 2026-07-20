@@ -279,6 +279,19 @@ page_ms = 5500
 
 # Factory reset: send "factory_reset = on" over USB serial (ignored in this file) to erase every
 # setting you changed with the two-button menu AND the learned temperature-compensation model,
-# returning the clock to exactly this config.txt. The on-device equivalent is the menu's SYS > RESET row; the REBOOT chord only
-# restarts the clock and keeps your menu settings.
+# returning the clock to exactly this config.txt. Note the on-device RESET chord only REBOOTS —
+# it keeps your menu settings.
+
+
+## cuckoo (CUCKOO_SPEC.md)
+
+# Scheduled display flourishes on the TIME row (the date row is never touched). The cadence is
+# intrinsic: a fixed small gesture (the nod) on each quarter-hour, and the piece named here on
+# the hour. off (the default) disables both. There is no interval knob.
+#   trust — a relight wave showing how much the instrument knows right now, per digit
+# (carry / heartbeat / pendulum are parked pending visual rework — see CUCKOO_SPEC.md.)
+# Also on the on-device menu (DISP > CUCKOO) — each value PERFORMS as you select it.
+# To preview over USB serial without waiting for a boundary (ignored in this file):
+#   cuckoo_preview = trust     (or "nod", or "on" for the configured piece)
+#cuckoo = trust
 
