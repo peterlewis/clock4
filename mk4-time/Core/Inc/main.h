@@ -167,11 +167,10 @@ typedef struct MItem {
   void      (*set)(const struct MItem *m, int32_t v);   // write global + apply live effect
   uint8_t     section;         // SEC_* — which setup section this row lives in
 } MItem;
-// Stable key ids (append-only; mode rows use KID_MODE_BASE + MODE_* ordinal). 12 is KID_CUCKOO, next in
-// the stack, so a store written by either build reads the same.
+// Stable key ids (append-only; mode rows use KID_MODE_BASE + MODE_* ordinal).
 enum { KID_BRIGHTNESS=1, KID_COLON=2, KID_COLON_ALT=3, KID_PAGE_MS=4,
        KID_SIG_FADE=5, KID_PPS=6, KID_NMEA=7, KID_MATRIX_FREQ=8, KID_TEMPCOMP=9,
-       KID_BALANCE=10, KID_RESET=11, KID_BRIT=13, KID_MODE_BASE=64 };   // KID_RESET: the SYS factory-reset action (never persisted)
+       KID_BALANCE=10, KID_RESET=11, KID_CUCKOO=12, KID_BRIT=13, KID_MODE_BASE=64 };   // KID_RESET: the SYS factory-reset action (never persisted)
 
 void menu_isr_event(uint8_t evt);   // called from the USART2 ISR — enqueue only, no work
 void menu_poll(void);               // main-loop FSM tick
