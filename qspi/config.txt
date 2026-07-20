@@ -275,5 +275,8 @@ seg_balance = on
 #   pendulum  — six digit-pendulums chirp-converge onto the true PPS edge (nod stands in
 #               during holdover — no PPS, no performance)
 #   trust     — a relight wave showing how much the instrument knows right now, per digit
+# Also on the on-device menu (DISP > CUCKOO) — each value PERFORMS as you select it.
+# To preview over USB serial without waiting for a boundary (ignored in this file):
+#   cuckoo_preview = carry     (any piece name, "nod", or "on" for the configured piece)
 #cuckoo = heartbeat
 

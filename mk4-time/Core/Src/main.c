@@ -253,6 +253,7 @@ static struct {
   uint32_t matrix_freq;                // KID_MATRIX_FREQ (u32: 100000 > u16)
   uint8_t  tc;                         // KID_TEMPCOMP: 1 = learn+apply+persist armed
   uint8_t  bal;                        // KID_BALANCE: 1 = seg+colon balance AUTO
+  uint8_t  cuckoo;                     // KID_CUCKOO: the hourly piece (CK_OFF..CK_TRUST)
   uint32_t modes_mask, modes_val;      // bit per MODE_* ordinal
 } ovr;
 static uint16_t cfg_simple_defined;    // bit per KID 1..10 set by config.txt this load
@@ -1776,6 +1777,7 @@ void segbal_isr_refresh(void){
 enum { CK_OFF = 0, CK_CARRY, CK_HEARTBEAT, CK_PENDULUM, CK_TRUST, CK_PIECES };
 #define CK_NOD 0xFE
 volatile uint8_t cuckoo = CK_OFF;      // the one config key: off, or the hourly piece
+static uint8_t ck_menu_prev = 0;       // the menu's CUCKOO editor is open and previewing choices
 
 // element rows: 0..4 = port-B big-digit categories (10h h 10m m 10s), 5 = seconds units
 // (port-C column 0), 6..8 = ds/cs/ms (port-C columns 1..3). Left-to-right = rows 0..5.
@@ -1981,6 +1983,22 @@ static void ck_trust_tick(void){
 
 static _Bool ck_pps_fresh(void){
   return had_pps && ((uint32_t)currentTime - last_pps_time) < 3u;
+}
+
+// ---- preview: play a piece NOW, outside the schedule ---------------------------------------
+// Serves the menu editor (each value performs as it is selected) and the serial
+// `cuckoo_preview` key. A preview PREEMPTS a running preview — a tap-through of the menu ring
+// must respond per tap — which is a deliberate user act, not a scheduler exception. The
+// honesty gates hold: pendulum without a fresh PPS previews as the NOD (the same stand-in the
+// hour would get), and standby/text modes refuse exactly as the scheduler does.
+static void ck_preview(uint8_t piece){
+  cuckoo_abort();
+  if (displayMode == MODE_STANDBY || countMode != COUNT_NORMAL) return;
+  if (piece == CK_NOD) { ck_start(CK_NOD); return; }
+  if (piece == CK_OFF || piece >= CK_PIECES) return;      // previewing "off" is the plain face
+  if (piece == CK_PENDULUM && !ck_pps_fresh()) { ck_start(CK_NOD); return; }
+  if (piece == CK_CARRY) ck_carry_n = 5;                  // preview shows the full hour chain
+  ck_start(piece);
 }
 
 // ---- the scheduler + the 10 ms tick --------------------------------------------------------
@@ -2422,6 +2440,21 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     else if (strcasecmp(value, "trust") == 0)        cuckoo = CK_TRUST;
     else                                             cuckoo = CK_OFF;
     if (cuckoo != prev) cuckoo_abort();   // a change mid-piece ends it cleanly on the plain face
+    if (!from_serial) cfg_simple_defined |= (1u<<KID_CUCKOO);
+
+  } else if (strcasecmp(key, "cuckoo_preview") == 0) {
+
+    // Serial-only bench tool: play a piece ONCE, immediately, without touching the `cuckoo`
+    // config. "on" previews the configured piece; a piece name previews that piece; "nod"
+    // previews the quarter gesture. Never valid in config.txt (a file must not perform).
+    if (from_serial) {
+      if      (strcasecmp(value, "nod") == 0)       ck_preview(CK_NOD);
+      else if (strcasecmp(value, "carry") == 0)     ck_preview(CK_CARRY);
+      else if (strcasecmp(value, "heartbeat") == 0) ck_preview(CK_HEARTBEAT);
+      else if (strcasecmp(value, "pendulum") == 0)  ck_preview(CK_PENDULUM);
+      else if (strcasecmp(value, "trust") == 0)     ck_preview(CK_TRUST);
+      else if (truthy(value))                       ck_preview(cuckoo);
+    }
 
   } else if (strcasecmp(key, "MODE_TEMPCOMP") == 0) {
     set_mode_enabled(MODE_TEMPCOMP, value);
@@ -4600,10 +4633,10 @@ static uint16_t ee_crc16(const uint8_t*p, uint32_t n){   // CRC-16-CCITT (poly 0
 }
 // Record byte layout: 0 magic u32 | 4 gen u32 | 8 schema u16 | 10 fdate u16 | 12 ftime u16 |
 // 14 simple_mask u16 | 16 modes_mask u32 | 20 modes_val u32 | 24 brightness i16 | 26 colon u8 |
-// 27 alt_colon u8 | 28 page_ms u16 | 30 sig_fade u8 | 31 pps u8 | 32 nmea u8 | 33 matrix_freq u32 | 37 tc u8 | 38 bal u8 | 39..61 rsvd | 62 crc16.
-// (bytes 15, 33..36, 37 and 38 were zeroed padding in every prior record, so widening simple_mask
-//  u8->u16 and adding matrix_freq u32 + tc u8 + bal u8 round-trip old records with those fields clear;
-//  EE_SCHEMA stays 1.)
+// 27 alt_colon u8 | 28 page_ms u16 | 30 sig_fade u8 | 31 pps u8 | 32 nmea u8 | 33 matrix_freq u32 | 37 tc u8 | 38 bal u8 | 39 cuckoo u8 | 40..61 rsvd | 62 crc16.
+// (bytes 15, 33..36, 37, 38 and 39 were zeroed padding in every prior record, so widening simple_mask
+//  u8->u16 and adding matrix_freq u32 + tc u8 + bal u8 + cuckoo u8 round-trip old records with those
+//  fields clear; EE_SCHEMA stays 1.)
 static void ee_pack(uint8_t*r, uint32_t gen){
   memset(r,0,EE_REC_SZ);
   uint32_t mg=EE_MAGIC; memcpy(r+0,&mg,4); memcpy(r+4,&gen,4);
@@ -4613,7 +4646,7 @@ static void ee_pack(uint8_t*r, uint32_t gen){
   memcpy(r+16,&ovr.modes_mask,4); memcpy(r+20,&ovr.modes_val,4);
   memcpy(r+24,&ovr.brightness,2); r[26]=ovr.colon; r[27]=ovr.alt_colon;
   memcpy(r+28,&ovr.page_ms,2); r[30]=ovr.sig_fade; r[31]=ovr.pps; r[32]=ovr.nmea;
-  memcpy(r+33,&ovr.matrix_freq,4); r[37]=ovr.tc; r[38]=ovr.bal;
+  memcpy(r+33,&ovr.matrix_freq,4); r[37]=ovr.tc; r[38]=ovr.bal; r[39]=ovr.cuckoo;
   uint16_t crc=ee_crc16(r,62); memcpy(r+62,&crc,2);
 }
 static void ee_unpack(const uint8_t*r){
@@ -4622,7 +4655,7 @@ static void ee_unpack(const uint8_t*r){
   memcpy(&ovr.modes_mask,r+16,4); memcpy(&ovr.modes_val,r+20,4);
   memcpy(&ovr.brightness,r+24,2); ovr.colon=r[26]; ovr.alt_colon=r[27];
   memcpy(&ovr.page_ms,r+28,2); ovr.sig_fade=r[30]; ovr.pps=r[31]; ovr.nmea=r[32];
-  memcpy(&ovr.matrix_freq,r+33,4); ovr.tc=r[37]; ovr.bal=r[38];
+  memcpy(&ovr.matrix_freq,r+33,4); ovr.tc=r[37]; ovr.bal=r[38]; ovr.cuckoo=r[39];
   ovr.valid=1;
 }
 // Resolve /SETTINGS.BIN into physical QSPI sector addresses through the read-only FATFS the firmware
@@ -5102,6 +5135,7 @@ void menu_apply_overrides(void){
   OVR_S(KID_MATRIX_FREQ,setDisplayFreq(ovr.matrix_freq))   // clamping setter (never ARR-direct) -> a bad stored value can't brick
   OVR_S(KID_TEMPCOMP,   tc_learn=tc_apply=tc_persist=ovr.tc?1:0)
   OVR_S(KID_BALANCE,    { if(ovr.bal){ if(!seg_balance)seg_balance=1; if(!colon_balance)colon_balance=1; } else seg_balance=colon_balance=0; colonForce=1; })  // config parse ran first: a stored "on" must not clobber a manual strength
+  OVR_S(KID_CUCKOO,     { uint8_t pv=cuckoo; cuckoo=(ovr.cuckoo<CK_PIECES)?ovr.cuckoo:CK_OFF; if(cuckoo!=pv) cuckoo_abort(); })  // range-clamped: a corrupt store must not select a ghost piece
   #undef OVR_S
   for (uint8_t m=0;m<NUM_DISPLAY_MODES;m++)
     if ((ovr.modes_mask&(1u<<m)) && (!(cfg_modes_defined&(1u<<m))||stamp_ok))
@@ -5132,6 +5166,7 @@ static void menu_record_key(uint8_t key_id, int32_t v){
     case KID_MATRIX_FREQ:ovr.matrix_freq=(uint32_t)v; break;
     case KID_TEMPCOMP:   ovr.tc=(uint8_t)(v?1:0); break;
     case KID_BALANCE:    ovr.bal=(uint8_t)(v?1:0); break;
+    case KID_CUCKOO:     ovr.cuckoo=(uint8_t)v; break;
   }
 }
 
@@ -5193,6 +5228,7 @@ static void menu_flash(const char *s){ menu_show(s); }   // transient; cleared b
 static void menu_to_L0(void){
   menu_layer=L0_CLOCK; menu_chord=0; menu_stage=0; menu_run_dir=0; menu_run_len=0; menu_text[0]=0;
   if (colon_preview != 0xFF){ colon_preview = 0xFF; applyColonForMode(); }  // §3.5: never leave a preview stuck if we idle/EXIT mid-edit
+  if (ck_menu_prev){ ck_menu_prev = 0; cuckoo_abort(); }                    // likewise the cuckoo editor's performing piece
   // KEEP menu_section/menu_idx: SETUP re-entry resumes on the last section (and last item, §fire_stage).
   if (decisec!=9) sendDate(1); else menu_repaint=1;      // restore the normal date row
 }
@@ -5259,6 +5295,17 @@ static void    s_reset (const MItem*m,int32_t v){ (void)m; if (v) factory_reset_
 
 static const char *const en_colon[] = {"SLOWFADE","HEARTBt","1PPS SAW","ALT SAW","TOGGLE","FULL"};    // FULL not SOLID: S/O/I read as 5/0/1 on 7-seg
 static const char *const en_nmea[]  = {"ALL","RMC","NONE"};
+static const char *const en_cuckoo[]= {"OFF","CARRY","HEARTBt","CATCH","TRUST"};   // CATCH = pendulum's display name (CUCKOO_SPEC v1)
+
+// CUCKOO: selecting a value in the editor PERFORMS it on the time row immediately (ck_preview) —
+// the menu's own colon-preview idiom applied to the flourishes. Only while the editor is open
+// (ck_menu_prev, armed in menu_enter_edit); the cancel-path restore write is silent.
+static int32_t g_cuckoo(const MItem*m){ (void)m; return cuckoo; }
+static void    s_cuckoo(const MItem*m,int32_t v){ (void)m;
+  uint8_t pv = cuckoo;
+  cuckoo = (uint8_t)v;
+  if (ck_menu_prev && cuckoo != pv) ck_preview(cuckoo);
+}
 
 #define MODE_ROW(mo,sec,lab) { KID_MODE_BASE+(mo), MIT_TOGGLE, lab, (mo),1,1, NULL, g_mode, s_mode, (sec) }
 // Physical order UNCHANGED (menu_idx absolute, persistence keys off key_id); .section groups the ring.
@@ -5269,6 +5316,7 @@ static const MItem menu_items[] = {
   { KID_COLON_ALT,  MIT_ENUM,  "ACOLON",   0,5,1,      en_colon, g_acolon, s_acolon, SEC_DISP },   // 6-char label leaves room for the value at L2 (COLONALT hid it)
   { KID_PAGE_MS,    MIT_STEP,  "PAGE",     250,60000,250,NULL,   g_page,   s_page,   SEC_DISP },   // shows seconds; "MS"/unit-S both misread on 7-seg
   { KID_SIG_FADE,   MIT_TOGGLE,"SIG FADE", 0,1,1,      NULL,     g_sig,    s_sig,    SEC_DISP },
+  { KID_CUCKOO,     MIT_ENUM,  "CUCKOO",   0,4,1,      en_cuckoo,g_cuckoo, s_cuckoo, SEC_DISP },   // each value PERFORMS as selected (ck_preview)
   { KID_PPS,        MIT_TOGGLE,"PPS MSG",  0,1,1,      NULL,     g_pps,    s_pps,    SEC_SYS  },   // the $PMTXTS timestamp sentence, NOT a 1PPS hardware output
   { KID_NMEA,       MIT_ENUM,  "NMEA",     0,2,1,      en_nmea,  g_nmea,   s_nmea,   SEC_SYS  },
   { KID_MATRIX_FREQ,MIT_STEP,  "MATRIX",   8000,100000,1000,NULL,g_matrix, s_matrix, SEC_SYS  },   // menu floor 8000 (flicker); config MATRIX_FREQUENCY reaches the 1000 hw floor
@@ -5378,6 +5426,9 @@ static void menu_enter_edit(void){
   if (m->key_id==KID_COLON || m->key_id==KID_COLON_ALT){        // §3.5: begin previewing the choice under the cursor
     colon_preview = (uint8_t)menu_orig; applyColonForMode();
   }
+  if (m->key_id==KID_CUCKOO){                                    // the CUCKOO editor performs each choice as it is selected
+    ck_menu_prev = 1; ck_preview((uint8_t)menu_orig);
+  }
   menu_layer=L3_EDIT; menu_render_item();
 }
 // §3c: coarse-while-held, fine-on-single-tap. A same-direction run within ACCEL_GAP_MS grows the
@@ -5421,12 +5472,18 @@ static void menu_edit_step(int dir){
 static void menu_colon_preview_end(void){
   if (colon_preview != 0xFF){ colon_preview = 0xFF; applyColonForMode(); }
 }
+// Leave cuckoo-preview: whatever piece the editor was performing stops on the plain face.
+// (The selected VALUE survives — commit persists it, cancel already restored it via set.)
+static void menu_cuckoo_preview_end(void){
+  if (ck_menu_prev){ ck_menu_prev = 0; cuckoo_abort(); }
+}
 static void menu_cancel_edit(void){
   const MItem *m=&menu_items[menu_idx];
   m->set(m, menu_orig);                                            // restore pre-edit value
   if (m->key_id==KID_COLON_ALT) colonAltExplicit = menu_acolx_orig; // the restore-write just re-set the explicit flag — an abandoned edit must not defeat the auto-distinguish on the next config load
   if (m->key_id==KID_MATRIX_FREQ) setDisplayFreq(matrix_freq_hz);  // §4: force the last rate to the date board (set-hook throttles)
   menu_colon_preview_end();                                        // §3.5: back to the context colon
+  menu_cuckoo_preview_end();                                       // the abandoned editor's piece stops on the plain face
   menu_layer=L2_ITEM; menu_render_item();
 }
 static void menu_commit_edit(void){
@@ -5442,6 +5499,7 @@ static void menu_commit_edit(void){
     if (m->key_id==KID_MATRIX_FREQ) setDisplayFreq(matrix_freq_hz);
   }
   menu_colon_preview_end();                                        // §3.5: back to the context colon
+  menu_cuckoo_preview_end();                                       // the committed piece now waits for its hour
   menu_layer=L2_ITEM; menu_render_item();
 }
 

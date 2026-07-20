@@ -94,6 +94,25 @@ raised dissolve at this boundary, for two hardware reasons:
 waits on one UART extension — a per-element intensity frame atop the existing text+latch
 framing.
 
+## Preview — hearing a piece without waiting for it
+
+Two ways to play a piece immediately, outside the schedule:
+
+- **The menu.** The on-device CUCKOO row (DISP section, values OFF / CARRY / HEARTBt /
+  CATCH / TRUST) **performs each value as it is selected** — the menu's own colon-preview
+  idiom applied to the flourishes. The menu owns the date row while open, the piece plays on
+  the time row; the two never collide. Cancel restores the old value and stops the piece;
+  commit persists the value and stops the piece (it then waits for its hour); the idle
+  auto-exit stops it too. Selecting CATCH without a live PPS previews the NOD — the same
+  stand-in the hour would get; a preview must not forge what the schedule refuses.
+- **Serial.** `cuckoo_preview = <piece>|nod|on` (serial-only, never valid in config.txt —
+  a file must not perform) plays that piece once without touching the `cuckoo` config;
+  `on` previews the configured piece.
+
+A preview preempts a running preview — a tap-through of the menu ring must respond per
+tap. That is a deliberate act at the clock, not a scheduler exception; the scheduler itself
+still never preempts.
+
 ## The catalogue
 
 Four pieces ship as selectable hourly flourishes, all time-board-local and honest:
