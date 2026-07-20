@@ -23,7 +23,7 @@ between them.**
 ## Config vocabulary
 
 ```
-# off (default) | carry | heartbeat | pendulum | trust
+# off (default) | trust
 cuckoo = off
 ```
 
@@ -75,11 +75,9 @@ boundary. If the configured piece cannot run honestly (`pendulum` in holdover), 
 stands in** — the hour boundary is never wholly silent, and the honest minimum gesture
 never forges the absent performance.
 
-Default recommendation `carry`: honest in every state (rollovers are true without GPS),
-and its carry chain is longest at the hour, so the hour already *looks* bigger than a
-quarter through one mechanism — that is the strike. There is no artificial hour-count: the
-hour digits are lit and exact; counted blinks would duplicate legible data and read as a
-fault.
+There is no artificial hour-count: the hour digits are lit and exact; counted blinks would
+duplicate legible data and read as a fault. (`trust` is honest in every state, so with the
+shipped catalogue the stand-in never fires; the law remains for the parked pieces' return.)
 
 ## Pose and the date row
 
@@ -106,16 +104,16 @@ framing.
 
 Two ways to play a piece immediately, outside the schedule:
 
-- **The menu.** The on-device CUCKOO row (DISP section, values OFF / CARRY / HEARTBt /
-  CATCH / TRUST) **performs each value as it is selected** — the menu's own colon-preview
-  idiom applied to the flourishes. The menu owns the date row while open, the piece plays on
-  the time row; the two never collide. Cancel restores the old value and stops the piece;
-  commit persists the value and stops the piece (it then waits for its hour); the idle
-  auto-exit stops it too. Selecting CATCH without a live PPS previews the NOD — the same
-  stand-in the hour would get; a preview must not forge what the schedule refuses.
-- **Serial.** `cuckoo_preview = <piece>|nod|on` (serial-only, never valid in config.txt —
-  a file must not perform) plays that piece once without touching the `cuckoo` config;
-  `on` previews the configured piece.
+- **The menu.** The on-device CUCKOO row (DISP section, values OFF / TRUST) **performs each
+  value as it is selected** — the menu's own colon-preview idiom applied to the flourishes.
+  The menu owns the date row while open, the piece plays on the time row; the two never
+  collide. Cancel restores the old value and stops the piece; commit persists the value and
+  stops the piece (it then waits for its hour); the idle auto-exit stops it too. (When the
+  parked pieces return: a preview must not forge what the schedule refuses — a PPS-dependent
+  piece previews the NOD in holdover.)
+- **Serial.** `cuckoo_preview = trust|nod|on` (serial-only, never valid in config.txt —
+  a file must not perform) plays once without touching the `cuckoo` config; `on` previews
+  the configured piece.
 
 A preview preempts a running preview — a tap-through of the menu ring must respond per
 tap. That is a deliberate act at the clock, not a scheduler exception; the scheduler itself
@@ -123,14 +121,18 @@ still never preempts.
 
 ## The catalogue
 
-Four pieces ship as selectable hourly flourishes, all time-board-local and honest:
-`carry`, `heartbeat`, `pendulum` (nod stands in during holdover), `trust`. Bodies are as
-v1 defined except:
+**Shipping: `trust` only** (first bench verdict, 2026-07-20: it was the one piece that read
+well on hardware). The others are **parked, not deleted** — parked means absent from the
+firmware, per this project's own rule:
 
-- **Amendment (`carry`):** the interval-derived chain-length branches are retired. carry
-  performs only at :00, with its full hour chain (length 5, 120 ms beat); quarters get the
-  nod, never a mini-carry.
+- **`carry`, `heartbeat`, `pendulum`** — bodies preserved in git (59fc649); they return
+  through the same enum when their visual rework earns a second bench verdict. Candidate
+  direction on record: even under the perceptual gamma their action may need structural
+  changes (bigger level strides, slower beats), not just brighter rendering.
 - **`rain`** stays on the date board — deferred, not degraded.
+
+The nod-stand-in law stands as design law (an hour whose piece cannot run honestly gets the
+nod); with `trust` — honest in every state — it is currently dormant.
 
 ## What was rejected, and why it stays rejected
 

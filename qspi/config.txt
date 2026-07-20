@@ -270,13 +270,10 @@ seg_balance = on
 # Scheduled display flourishes on the TIME row (the date row is never touched). The cadence is
 # intrinsic: a fixed small gesture (the nod) on each quarter-hour, and the piece named here on
 # the hour. off (the default) disables both. There is no interval knob.
-#   carry     — the rollover's arithmetic poured leftward through the digits that change
-#   heartbeat — the digits breathe the clock's own colon waveform
-#   pendulum  — six digit-pendulums chirp-converge onto the true PPS edge (nod stands in
-#               during holdover — no PPS, no performance)
-#   trust     — a relight wave showing how much the instrument knows right now, per digit
+#   trust — a relight wave showing how much the instrument knows right now, per digit
+# (carry / heartbeat / pendulum are parked pending visual rework — see CUCKOO_SPEC.md.)
 # Also on the on-device menu (DISP > CUCKOO) — each value PERFORMS as you select it.
 # To preview over USB serial without waiting for a boundary (ignored in this file):
-#   cuckoo_preview = carry     (any piece name, "nod", or "on" for the configured piece)
-#cuckoo = heartbeat
+#   cuckoo_preview = trust     (or "nod", or "on" for the configured piece)
+#cuckoo = trust
 

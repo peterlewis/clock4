@@ -1784,7 +1784,10 @@ void segbal_isr_refresh(void){
 // envelope is a terminating integer countdown, so a piece cannot fail to end, and its final
 // frame is the plain live face.
 
-enum { CK_OFF = 0, CK_CARRY, CK_HEARTBEAT, CK_PENDULUM, CK_TRUST, CK_PIECES };
+// Catalogue as SHIPPED: trust only (first bench verdict, 2026-07-20 — "just keep trust and off
+// for now"). carry / heartbeat / pendulum are PARKED: their bodies live in git (59fc649) and
+// return through the same enum when their visual rework earns it. Parked means absent.
+enum { CK_OFF = 0, CK_TRUST, CK_PIECES };
 #define CK_NOD 0xFE
 volatile uint8_t cuckoo = CK_OFF;      // the one config key: off, or the hourly piece
 static uint8_t ck_menu_prev = 0;       // the menu's CUCKOO editor is open and previewing choices
@@ -1797,11 +1800,10 @@ static uint8_t ck_menu_prev = 0;       // the menu's CUCKOO editor is open and p
 static uint8_t ck_bright[CK_ROWS] = {16,16,16,16,16,16,16,16,16};
 static uint8_t  ck_anim = 0xFF;        // 0xFF idle; else CK_* piece or CK_NOD
 static uint8_t  ck_phase = 0;          // per-piece state-machine step
-static uint8_t  ck_armed = 0;          // 1 = edge-start pending, 2 = pendulum pre-arm
+static uint8_t  ck_armed = 0;          // 1 = edge-start pending
 static uint8_t  ck_arm_sel = 0;        // what the pending edge starts (piece or CK_NOD)
 static uint16_t ck_tick = 0;           // 10 ms ticks since piece start
 static uint8_t  ck_last_cs = 0xFF;     // centisecond edge detector (main-loop tick)
-static uint8_t  ck_carry_n = 5;        // carry chain length (5 at the hour)
 static time_t   ck_last_arm = 0;       // trigger de-dupe: one start per armed second
 
 static void ck_set_all(uint8_t level){
@@ -1843,106 +1845,6 @@ static void ck_nod_tick(void){
     ck_bright[d] = lv;
   }
   if (ck_tick >= 6u * 3u + 40u) cuckoo_abort();                // ~550 ms and the row is clear
-}
-
-// ---- carry: make the arithmetic of the rollover visible (hour edge only) ------------------
-// charge (T-500 ms): the dying seconds digit swells; pour (T0+): light handed leftward one
-// digit per beat through exactly the digits that change; settle: decay back to the working
-// level; exit ramps to full. Working level 13/16 gives the flares headroom. Chain rows are
-// rightmost-first; at the hour the chain is 5 (ss units+tens, m, 10m, h). 120 ms beats: the
-// chain length is the payload and must be countable from across the room.
-#define CK_WORK 13
-static const uint8_t ck_chain_rows[6] = { 5, 4, 3, 2, 1, 0 };
-
-static void ck_carry_tick(void){
-  if (ck_phase == 0){                        // charge, entered at .500 of the :59 second
-    uint8_t sw = (uint8_t)(6 + (ck_tick * 10) / 50);           // 6 -> 16 over 500 ms
-    if (sw > 16) sw = 16;
-    ck_set_all(CK_WORK);
-    ck_bright[5] = sw;                                          // seconds units swells
-    if (decisec == 0 && ck_tick >= 40) { ck_phase = 1; ck_tick = 0; }   // the edge latched
-    if (ck_tick > 150) { cuckoo_abort(); }                      // safety: edge never came
-    return;
-  }
-  if (ck_phase == 1){                        // pour + settle, one pass
-    uint8_t beat = 12;                                          // 120 ms — the hour cadence
-    ck_set_all(CK_WORK);
-    for (uint8_t k = 0; k < ck_carry_n; k++){
-      uint16_t fire = (uint16_t)(k * beat);
-      if (ck_tick < fire) break;
-      uint16_t age = (uint16_t)(ck_tick - fire);
-      uint8_t row = ck_chain_rows[k];
-      uint8_t lv;
-      if      (age < 10) lv = 16;                               // flare 100 ms
-      else if (age < 40) lv = (uint8_t)(16 - ((age - 10) * (16 - CK_WORK)) / 30);
-      else               lv = CK_WORK;
-      ck_bright[row] = lv;
-      // the donor dips as its left neighbour takes the light
-      if (k + 1 < ck_carry_n){
-        uint16_t nfire = (uint16_t)((k + 1) * beat);
-        if (ck_tick >= nfire && ck_tick < nfire + 15 && ck_bright[row] > 6) ck_bright[row] = 6;
-      }
-    }
-    if (ck_tick >= (uint16_t)(ck_carry_n * beat + 40)) { ck_phase = 2; ck_tick = 0; }
-    return;
-  }
-  {                                          // exit: working level back to full over 300 ms
-    uint8_t lv = (uint8_t)(CK_WORK + (ck_tick * (16 - CK_WORK)) / 30);
-    if (lv >= 16) { cuckoo_abort(); return; }
-    ck_set_all(lv);
-    ck_bright[6] = 16; ck_bright[7] = 16; ck_bright[8] = 16;    // fast elements ride nominal
-  }
-}
-
-// ---- heartbeat: the machine shows its own pulse -------------------------------------------
-// Digits breathe the canonical colon waveform, radiating outward from the colons by physical
-// distance; four full 2 s cycles, exit lands on a peak. Big digits breathe 4..16; the
-// SUB-SECOND digits breathe a compressed 8..16 — they count at 100/1000 Hz, and letting them
-// dip toward dark shreds legibility and mimics the significance fade, a meaning this
-// animation must never borrow.
-static uint8_t ck_heart(uint8_t k){          // the canonical heartbeat table as a function
-  if (k < 50)  return (uint8_t)(k * 4);
-  if (k < 150) return (uint8_t)(200 - (k - 50) * 2);
-  return 0;
-}
-static const uint8_t ck_hb_dist[CK_ROWS] = { 2, 1, 1, 1, 1, 2, 3, 4, 5 };
-
-static void ck_heartbeat_tick(void){
-  uint8_t ph = (uint8_t)(((((uint32_t)currentTime & 1u) * 100u) + (uint32_t)decisec * 10u + centisec) % 200u);
-  for (uint8_t d = 0; d < CK_ROWS; d++){
-    uint8_t k = (uint8_t)((ph + 200 - (12 * ck_hb_dist[d]) % 200) % 200);
-    uint8_t lv;
-    if (d >= 6) lv = (uint8_t)(8 + ((uint16_t)ck_heart(k) * 8) / 200);
-    else        lv = (uint8_t)(4 + ((uint16_t)ck_heart(k) * 12) / 200);
-    ck_bright[d] = lv;
-  }
-  if (ck_tick >= 780 && ck_heart(ph) >= 190) { cuckoo_abort(); return; }  // land on a peak
-  if (ck_tick >= 900) cuckoo_abort();                                     // hard stop
-}
-
-// ---- pendulum (display label CAtCH): prove the discipline ---------------------------------
-// Six digit-pendulums under a closed-form quadratic chirp: phase_i(t) = ((300-t)^2*(6+i))>>10
-// in 1/256-cycle units, so every phase is ZERO at exactly tick 300 — the catch is mathematics,
-// not accumulation, and cannot miss. Opens in unison, decays into visible disorder, is reeled
-// back, and lands with one unified breath ON the edge it was aimed at. Requires a live PPS at
-// start; in holdover the NOD stands in (see the scheduler) — converging onto an undisciplined
-// edge would forge the signature.
-static void ck_pendulum_tick(void){
-  uint16_t rem = (ck_tick < 300) ? (uint16_t)(300 - ck_tick) : 0;
-  uint32_t r2 = (uint32_t)rem * rem;
-  for (uint8_t d = 0; d < 6; d++){
-    uint8_t lv;
-    if (ck_tick >= 285){                     // THE CATCH: one unified breath into the edge
-      lv = (ck_tick < 300) ? (uint8_t)(10 + ((ck_tick - 285) * 6) / 15) : 16;
-    } else {
-      uint8_t A = (ck_tick < 50) ? (uint8_t)((ck_tick * 6) / 50) : 6;
-      uint8_t phi = (uint8_t)((r2 * (6u + d)) >> 10);           // wraps mod 256 = one cycle
-      uint8_t tri = (phi < 128) ? phi : (uint8_t)(255 - phi);   // triangle 0..127
-      lv = (uint8_t)(10 + ((int16_t)A * ((int16_t)tri - 64)) / 64);   // 10 ± A -> 4..16
-    }
-    ck_bright[d] = lv;
-  }
-  if (ck_tick >= 330) cuckoo_abort();        // brief plain-face hold past the edge, then out
 }
 
 // ---- trust: how much the instrument actually knows right now ------------------------------
@@ -1993,10 +1895,6 @@ static void ck_trust_tick(void){
   }
 }
 
-static _Bool ck_pps_fresh(void){
-  return had_pps && ((uint32_t)currentTime - last_pps_time) < 3u;
-}
-
 // ---- preview: play a piece NOW, outside the schedule ---------------------------------------
 // Serves the menu editor (each value performs as it is selected) and the serial
 // `cuckoo_preview` key. A preview PREEMPTS a running preview — a tap-through of the menu ring
@@ -2008,8 +1906,6 @@ static void ck_preview(uint8_t piece){
   if (displayMode == MODE_STANDBY || countMode != COUNT_NORMAL) return;
   if (piece == CK_NOD) { ck_start(CK_NOD); return; }
   if (piece == CK_OFF || piece >= CK_PIECES) return;      // previewing "off" is the plain face
-  if (piece == CK_PENDULUM && !ck_pps_fresh()) { ck_start(CK_NOD); return; }
-  if (piece == CK_CARRY) ck_carry_n = 5;                  // preview shows the full hour chain
   ck_start(piece);
 }
 
@@ -2037,27 +1933,14 @@ void cuckoo_poll(void){
     uint8_t ss = (uint8_t)(nextBcd.tenSeconds * 10 + nextBcd.seconds);
     uint8_t mm = (uint8_t)(nextBcd.tenMinutes * 10 + nextBcd.minutes);
 
-    // pendulum pre-arms at :56.5 of minute 59 -> starts at :57, catching the :00:00 edge.
-    // If the PPS is not fresh at :57, the NOD is armed for the edge instead (the stand-in).
-    if (cuckoo == CK_PENDULUM && mm == 59){
-      if (ss == 56 && decisec == 5 && currentTime != ck_last_arm){
-        ck_last_arm = currentTime; ck_armed = 2;
-      }
-      if (ck_armed == 2 && ss == 57 && decisec == 0){
-        if (ck_pps_fresh()){ ck_armed = 0; ck_start(CK_PENDULUM); }
-        else               { ck_armed = 1; ck_arm_sel = CK_NOD; }
-      }
-      if (ck_armed != 1) return;             // fall through only for the armed stand-in edge
-    }
-
-    // everything else arms at .500 of the :59 second before the boundary. carry starts THERE
-    // (its charge needs the pre-edge half-second); nod/heartbeat/trust start ON the edge.
+    // Arm at .500 of the :59 second before the boundary; start ON the edge. (When the parked
+    // pieces return, this is where a piece that cannot run honestly hands its hour to the nod,
+    // and where a pre-edge piece like carry starts early — see the spec's stand-in law.)
     if (!ck_armed && ss == 59 && decisec == 5 && currentTime != ck_last_arm){
       uint8_t mm_next = (uint8_t)((mm + 1) % 60);
       if (mm_next == 0){                                        // the hour: the piece
         ck_last_arm = currentTime;
-        if (cuckoo == CK_CARRY){ ck_carry_n = 5; ck_start(CK_CARRY); }
-        else { ck_armed = 1; ck_arm_sel = cuckoo; }
+        ck_armed = 1; ck_arm_sel = cuckoo;
       } else if (mm_next == 15 || mm_next == 30 || mm_next == 45){   // a quarter: the nod
         ck_last_arm = currentTime;
         ck_armed = 1; ck_arm_sel = CK_NOD;
@@ -2071,11 +1954,8 @@ void cuckoo_poll(void){
   }
 
   ck_tick++;
-  if      (ck_anim == CK_NOD)       ck_nod_tick();
-  else if (ck_anim == CK_CARRY)     ck_carry_tick();
-  else if (ck_anim == CK_HEARTBEAT) ck_heartbeat_tick();
-  else if (ck_anim == CK_PENDULUM)  ck_pendulum_tick();
-  else if (ck_anim == CK_TRUST)     ck_trust_tick();
+  if      (ck_anim == CK_NOD)   ck_nod_tick();
+  else if (ck_anim == CK_TRUST) ck_trust_tick();
   else cuckoo_abort();
 }
 // =============== end CUCKOO ==================================================================
@@ -2445,12 +2325,8 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     // the quarter nod comes with it. off (default) disables both tiers. Unknown values fall
     // to off — a misspelt piece must not leave a stale one performing.
     uint8_t prev = cuckoo;
-    if      (falsey(value))                          cuckoo = CK_OFF;
-    else if (strcasecmp(value, "carry") == 0)        cuckoo = CK_CARRY;
-    else if (strcasecmp(value, "heartbeat") == 0)    cuckoo = CK_HEARTBEAT;
-    else if (strcasecmp(value, "pendulum") == 0)     cuckoo = CK_PENDULUM;
-    else if (strcasecmp(value, "trust") == 0)        cuckoo = CK_TRUST;
-    else                                             cuckoo = CK_OFF;
+    if      (strcasecmp(value, "trust") == 0)        cuckoo = CK_TRUST;
+    else                                             cuckoo = CK_OFF;   // off, and every parked piece name, and typos
     if (cuckoo != prev) cuckoo_abort();   // a change mid-piece ends it cleanly on the plain face
     if (!from_serial) cfg_simple_defined |= (1u<<KID_CUCKOO);
 
@@ -2461,9 +2337,6 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     // previews the quarter gesture. Never valid in config.txt (a file must not perform).
     if (from_serial) {
       if      (strcasecmp(value, "nod") == 0)       ck_preview(CK_NOD);
-      else if (strcasecmp(value, "carry") == 0)     ck_preview(CK_CARRY);
-      else if (strcasecmp(value, "heartbeat") == 0) ck_preview(CK_HEARTBEAT);
-      else if (strcasecmp(value, "pendulum") == 0)  ck_preview(CK_PENDULUM);
       else if (strcasecmp(value, "trust") == 0)     ck_preview(CK_TRUST);
       else if (truthy(value))                       ck_preview(cuckoo);
     }
@@ -5307,7 +5180,7 @@ static void    s_reset (const MItem*m,int32_t v){ (void)m; if (v) factory_reset_
 
 static const char *const en_colon[] = {"SLOWFADE","HEARTBt","1PPS SAW","ALT SAW","TOGGLE","FULL"};    // FULL not SOLID: S/O/I read as 5/0/1 on 7-seg
 static const char *const en_nmea[]  = {"ALL","RMC","NONE"};
-static const char *const en_cuckoo[]= {"OFF","CARRY","HEARTBt","CATCH","TRUST"};   // CATCH = pendulum's display name (CUCKOO_SPEC v1)
+static const char *const en_cuckoo[]= {"OFF","TRUST"};   // shipped catalogue; parked pieces return here when reworked
 
 // CUCKOO: selecting a value in the editor PERFORMS it on the time row immediately (ck_preview) —
 // the menu's own colon-preview idiom applied to the flourishes. Only while the editor is open
@@ -5328,7 +5201,7 @@ static const MItem menu_items[] = {
   { KID_COLON_ALT,  MIT_ENUM,  "ACOLON",   0,5,1,      en_colon, g_acolon, s_acolon, SEC_DISP },   // 6-char label leaves room for the value at L2 (COLONALT hid it)
   { KID_PAGE_MS,    MIT_STEP,  "PAGE",     250,60000,250,NULL,   g_page,   s_page,   SEC_DISP },   // shows seconds; "MS"/unit-S both misread on 7-seg
   { KID_SIG_FADE,   MIT_TOGGLE,"SIG FADE", 0,1,1,      NULL,     g_sig,    s_sig,    SEC_DISP },
-  { KID_CUCKOO,     MIT_ENUM,  "CUCKOO",   0,4,1,      en_cuckoo,g_cuckoo, s_cuckoo, SEC_DISP },   // each value PERFORMS as selected (ck_preview)
+  { KID_CUCKOO,     MIT_ENUM,  "CUCKOO",   0,1,1,      en_cuckoo,g_cuckoo, s_cuckoo, SEC_DISP },   // each value PERFORMS as selected (ck_preview)
   { KID_PPS,        MIT_TOGGLE,"PPS MSG",  0,1,1,      NULL,     g_pps,    s_pps,    SEC_SYS  },   // the $PMTXTS timestamp sentence, NOT a 1PPS hardware output
   { KID_NMEA,       MIT_ENUM,  "NMEA",     0,2,1,      en_nmea,  g_nmea,   s_nmea,   SEC_SYS  },
   { KID_MATRIX_FREQ,MIT_STEP,  "MATRIX",   8000,100000,1000,NULL,g_matrix, s_matrix, SEC_SYS  },   // menu floor 8000 (flicker); config MATRIX_FREQUENCY reaches the 1000 hw floor
