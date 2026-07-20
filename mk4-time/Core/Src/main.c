@@ -1465,6 +1465,14 @@ void setDisplayPWM(uint32_t bright){
 static uint8_t ck_bright[CK_ROWS];
 static uint8_t cuckoo_active(void);
 void cuckoo_abort(void);
+// Perceptual gamma: pieces write INTENT levels (0..16, meaning perceived lightness); the segbal
+// compose maps them to dither DUTY through this table. Light output is linear in lit cycles but
+// the eye is not (lightness ~ luminance^(1/2.2)): duties 13/16 and 16/16 differ by barely 7%
+// perceived, which is why the bench found carry and pendulum nearly invisible while trust (a
+// 2->16 swing) read fine. duty = 16*(L/16)^2.2, floored at 1 for any lit intent, so intent
+// differences read evenly across the whole range. THE bench-tuning knob is this curve, not
+// per-piece numbers.
+static const uint8_t CK_GAMMA[17] = {0,1,1,1,1,1,2,3,4,5,6,7,9,10,12,14,16};
 
 void displayOff(void){
 
@@ -1695,14 +1703,16 @@ void segbal_poll(void){
     if (performing) {
       // Per-digit cuckoo multipliers, composed multiplicatively (the same law as the fade):
       // B col k is big digit row k; C col 0 is the seconds units (row 5), cols 1..3 are
-      // ds/cs/ms (rows 6..8); the DP rides its digit. The >=1-cycle floor applies only to
-      // duties that arrived non-zero — a digit the significance fade already extinguished
-      // stays extinguished (the cuckoo must never resurrect what the fade claims is gone).
-      uint32_t g = ck_bright[col], p;
+      // ds/cs/ms (rows 6..8); the DP rides its digit. Intent levels pass through CK_GAMMA
+      // so they read perceptually (see the table above). The >=1-cycle floor applies only
+      // to duties that arrived non-zero — a digit the significance fade already
+      // extinguished stays extinguished (the cuckoo must never resurrect what the fade
+      // claims is gone).
+      uint32_t g = CK_GAMMA[ck_bright[col]], p;
       p = sb;  sb  = (sb  * g + 8u) / 16u;  if (g && p && !sb)  sb  = 1u;  if (!g) sb  = 0u;
       uint32_t rowc = (col == 0) ? 5u : (col <= 3 ? 5u + col : 0xFFu);
       if (rowc != 0xFFu) {
-        g = ck_bright[rowc];
+        g = CK_GAMMA[ck_bright[rowc]];
         p = sc;  sc  = (sc  * g + 8u) / 16u;  if (g && p && !sc)  sc  = 1u;  if (!g) sc  = 0u;
         p = sdp; sdp = (sdp * g + 8u) / 16u;  if (g && p && !sdp) sdp = 1u;  if (!g) sdp = 0u;
       }
@@ -1778,6 +1788,8 @@ enum { CK_OFF = 0, CK_CARRY, CK_HEARTBEAT, CK_PENDULUM, CK_TRUST, CK_PIECES };
 #define CK_NOD 0xFE
 volatile uint8_t cuckoo = CK_OFF;      // the one config key: off, or the hourly piece
 static uint8_t ck_menu_prev = 0;       // the menu's CUCKOO editor is open and previewing choices
+// (CK_GAMMA — the intent->duty perceptual curve — lives with the forward block above displayOff,
+//  because segbal_poll's compose reads it before this section is reached.)
 
 // element rows: 0..4 = port-B big-digit categories (10h h 10m m 10s), 5 = seconds units
 // (port-C column 0), 6..8 = ds/cs/ms (port-C columns 1..3). Left-to-right = rows 0..5.

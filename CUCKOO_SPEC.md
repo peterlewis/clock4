@@ -54,6 +54,14 @@ miniature.
   written but held for a bench check at across-the-room distance — respiration, not a
   power sag — before the PR locks them.
 
+**Perceptual gamma (bench-tuned 2026-07-20):** pieces write INTENT levels; the render maps
+them through `duty = 16·(L/16)^2.2` (floored at one lit cycle for any lit intent). Light
+output is linear in dither duty but the eye is not — the first bench check found `carry`
+and `pendulum` nearly invisible (their action lives at the top of the duty range, where
+perceived differences compress) while `trust` (a 2→16 swing) read fine. Under the gamma an
+intent difference reads evenly anywhere in the range. The tuning knob is this one curve;
+piece bodies stay in intent space and never re-tune per piece.
+
 Why it survives 96 plays/day: shallow, brief, monochrome, carrying no data — nothing in it
 can be wrong and there is no novelty to exhaust. Identical every quarter, it reads as the
 clock's respiration, not a message. In holdover it is unchanged (pure brightness, no PPS
