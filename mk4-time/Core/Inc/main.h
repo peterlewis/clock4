@@ -240,6 +240,11 @@ enum {
   // GPS fix + local_sidereal_time (transit when LST == RA). Gated by the MODE_STAR key.
   MODE_STAR,
 
+  // Second civil timezone: the remote city's live HH:MM:SS on the date row, computed from
+  // GPS-disciplined UTC + the on-device tzrules.bin, so it stays DST-correct forever. The
+  // remote zone is named by the `zone2` config key (an IANA name, or a UTC/+HH:MM literal).
+  MODE_ZONE2,
+
   NUM_DISPLAY_MODES
 };
 
