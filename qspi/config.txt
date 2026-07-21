@@ -11,6 +11,13 @@ MATRIX_FREQUENCY = 20000
 # For UTC use Etc/UTC
 #ZONE_OVERRIDE = America/New_York
 
+# Second timezone, shown on the date row by MODE_ZONE2 (see below). Same format as
+# ZONE_OVERRIDE: an IANA name (e.g. America/New_York) follows full daylight-saving via
+# the same TZRULES.BIN/TZMAP.BIN the main zone uses, or a fixed offset — UTC, +HH:MM,
+# -HH:MM — resolves immediately without the SD card (no DST). Leave unset for no second
+# zone (the mode then shows "----").
+#zone2 = America/New_York
+
 
 
 
@@ -240,6 +247,13 @@ MODE_SOLAR = disabled
 # locked seconds. The honest crystal signal (DWT phase, not the disciplined output).
 # (Companion serial command: "adev_dump = on" prints the whole curve as $PMADEV.)
 MODE_ADEV = disabled
+
+# Second civil timezone on the date row: pages a label screen then HH:MM:SS, with a
+# +1/-1 marker when that zone is a day ahead/behind the local one. Set which zone with
+# the `zone2` key near the top of this file (by the ZONE_OVERRIDE section); shows "----"
+# until it's set. This enable toggle is also on the on-device menu; the zone target is
+# config-only.
+MODE_ZONE2 = disabled
 
 # Colon animation while an alternate-timebase mode (MODE_LST / MODE_SOLAR) is shown, so
 # it can never be mistaken for civil time at a glance — solar especially, which can sit
