@@ -181,15 +181,22 @@ struct astro_cache_s {
 uint32_t last_pps_time = 0;
 uint32_t time_till_first_fix = 0;
 
-struct {
+struct tzrule {
   uint32_t t;
   int32_t offset;
-} rules[162];
-#define MAX_RULES (sizeof rules / sizeof rules[0])
+} rules[162], rules2[162];             // rules2 = ZONE 2's independent DST table
+#define MAX_RULES  (sizeof rules  / sizeof rules[0])
+#define MAX_RULES2 (sizeof rules2 / sizeof rules2[0])
 
 char loadedRulesString[32];
 char preloadRulesString[32];
 char textDisplay[32];
+// ZONE 2 (MODE_ZONE2): a second civil timezone, named by the `zone2` config key.
+int32_t offset2 = 0;                    // ZONE 2's resolved UTC->local offset (seconds)
+char loadedZone2[32];                   // active ZONE 2 label ("" = unset/unresolved -> dashes)
+char preloadZone2[32];                  // pending name from config, resolved in checkDelayedLoadRules
+_Bool delayedLoadZone2 = 0;
+_Bool zone2_fixed = 0;                  // 1 = offset2 is a literal (UTC / +HH:MM), no DST table walk
 _Bool delayedLoadRules = 0;
 _Bool delayedReadConfigFile = 0;
 _Bool delayedCheckOnEject = 0;
@@ -259,7 +266,7 @@ static struct {
   uint8_t  tc;                         // KID_TEMPCOMP: 1 = learn+apply+persist armed
   uint8_t  bal;                        // KID_BALANCE: 1 = seg+colon balance AUTO
   uint8_t  cuckoo;                     // KID_CUCKOO: the hourly piece (CK_OFF..CK_TRUST)
-  uint64_t modes_mask, modes_val;      // bit per MODE_* ordinal (u64: MODE_STAR=32 now overflows a u32)
+  uint64_t modes_mask, modes_val;      // bit per MODE_* ordinal (u64: MODE_STAR=31 filled a u32; ZONE2/RELATIV/HOLD need >=32)
 } ovr;
 static uint16_t cfg_simple_defined;    // bit per KID 1..10 set by config.txt this load
 static uint64_t cfg_modes_defined;     // bit per MODE_* ordinal set by config.txt this load
@@ -667,6 +674,32 @@ static void star_update(void){
   __enable_irq();
 }
 
+// ZONE 2 offset resolver — mirrors setNextTimestamp()'s DST walk but on rules2[].
+static int32_t zone2_offset_at(time_t t){
+  if (zone2_fixed) return offset2;      // literal offset: no table walk
+  int32_t off = 0;
+  for (uint8_t i=0; i<MAX_RULES2; i++){
+    if (rules2[i].t <= (uint32_t)t) off = rules2[i].offset;   // sentinel t==-1 (0xFFFFFFFF) never matches -> break
+    else break;
+  }
+  return off;
+}
+// Parse a ZONE 2 fixed-offset literal ("UTC"/"GMT" or [+-]HH[:MM]) into seconds. Returns 0 on no match.
+static _Bool zone2_parse_fixed(const char* s, int32_t* out){
+  if (!strcasecmp(s,"UTC") || !strcasecmp(s,"GMT")) { *out = 0; return 1; }
+  if (s[0] != '+' && s[0] != '-') return 0;
+  int sign = (s[0]=='-') ? -1 : 1;
+  const char* p = s + 1;
+  if (*p < '0' || *p > '9') return 0;
+  int hh = 0; while (*p>='0' && *p<='9'){ hh = hh*10 + (*p-'0'); p++; if (hh > 14) return 0; }
+  int mm = 0;
+  if (*p == ':'){ p++; if (*p<'0'||*p>'9') return 0; while (*p>='0'&&*p<='9'){ mm = mm*10 + (*p-'0'); p++; } }
+  if (*p) return 0;                     // trailing garbage -> not a literal
+  if (mm > 59) return 0;
+  *out = sign * (hh*3600 + mm*60);
+  return 1;
+}
+
 void sendDate( _Bool now ){
   if (waitingForLatch) {
     if (countMode==COUNT_HIDDEN) {
@@ -1058,6 +1091,26 @@ void sendDate( _Bool now ){
                   lat ? "LAT" : "LON", h < 0 ? '-' : ' ', a2 / 100, a2 % 100);
     }
     break;
+  case MODE_ZONE2: {
+    // A second civil timezone on the date row. The time is computed from GPS-disciplined UTC +
+    // the on-device tzrules.bin, so it stays DST-correct forever (never a hardcoded offset).
+    if (!loadedZone2[0]) { uart2_tx_buffer[1]='-'; i=1; break; }   // unset / unresolved -> dashes
+    if (currentTime % 8 < 2) {                                     // ~2s of every 8: the city / zone label
+      const char *lbl = loadedZone2, *s = loadedZone2;            // IANA tail after '/', or the literal verbatim
+      while (*s) { if (*s=='/') lbl = s+1; s++; }
+      i = snprintf((char*)&uart2_tx_buffer[1], 11, "%s", lbl);
+      if (i > 10) i = 10;
+    } else {                                                       // the live remote clock (ticks on each per-second repaint)
+      long rsec = (long)currentTime + zone2_offset_at(currentTime);
+      long lsec = (long)currentTime + currentOffset;
+      long sod  = ((rsec % 86400) + 86400) % 86400;                // 0..86399 second-of-day (defensive against negatives)
+      int  dd   = (int)(rsec/86400 - lsec/86400);                  // remote vs local calendar day: -1 / 0 / +1
+      i = sprintf((char*)&uart2_tx_buffer[1], "%02d:%02d:%02d%s",
+                  (int)(sod/3600), (int)((sod/60)%60), (int)(sod%60),
+                  dd>0 ? "+1" : dd<0 ? "-1" : "");
+    }
+    break;
+  }
   case MODE_DARK: {
     // The observing-session twilight ladder, paged: headline countdown to astronomical darkness, then
     // civil / nautical / astronomical dusk times and the astronomical dawn (dark ends). Honest at the
@@ -2260,6 +2313,20 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     delayedLoadRules=1;
     ZDAbort();
 
+  } else if (strcasecmp(key, "zone2") == 0) {
+
+    if (!value[0]) {                                                          // empty -> clear (dashes)
+      loadedZone2[0]=0; zone2_fixed=0; delayedLoadZone2=0;
+    } else if (zone2_parse_fixed(value, &offset2)) {                          // "UTC" / "+HH:MM" literal: resolve now (no FATFS)
+      zone2_fixed = 1; delayedLoadZone2 = 0;
+      strncpy(loadedZone2, value, sizeof loadedZone2 - 1);
+      loadedZone2[sizeof loadedZone2 - 1] = 0;
+    } else if (!delayedLoadZone2) {                                          // IANA name: defer the FATFS load to checkDelayedLoadRules
+      strncpy(preloadZone2, value, sizeof preloadZone2 - 1);
+      preloadZone2[sizeof preloadZone2 - 1] = 0;
+      delayedLoadZone2 = 1; loadedZone2[0] = 0;                               // dashes until resolved
+    }
+
   } else if (strcasecmp(key, "brightness") == 0) {
 
     config.brightness_override = parseBrightness(value, 1);
@@ -2335,8 +2402,6 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     set_mode_enabled(MODE_GRID, value);
   } else if (strcasecmp(key, "MODE_LATLON") == 0) {
     set_mode_enabled(MODE_LATLON, value);
-  } else if (strcasecmp(key, "MODE_DARK") == 0) {
-    set_mode_enabled(MODE_DARK, value);
   } else if (strcasecmp(key, "page_ms") == 0) {
     int v = atoi(value);
     config.page_ms = v < 0 ? 0 : (v > 65535 ? 65535 : v);   // fits uint16; 0 -> default
@@ -2408,6 +2473,10 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     set_mode_enabled(MODE_ADEV, value);
   } else if (strcasecmp(key, "MODE_STAR") == 0) {
     set_mode_enabled(MODE_STAR, value);
+  } else if (strcasecmp(key, "MODE_ZONE2") == 0) {
+    set_mode_enabled(MODE_ZONE2, value);
+  } else if (strcasecmp(key, "MODE_DARK") == 0) {
+    set_mode_enabled(MODE_DARK, value);
   } else if (strcasecmp(key, "tc_learn") == 0) {
     tc_learn = truthy(value);         // accumulate (die temp, ppm) samples while GPS-locked
     if (!from_serial) cfg_simple_defined |= (1u<<KID_TEMPCOMP);   // menu TEMPCOMP toggle bundles learn+apply
@@ -4128,7 +4197,7 @@ uint8_t findField( FIL* fp, char* str, uint8_t count, uint8_t padding ) {
   }
   return 0;
 }
-uint8_t loadRules( char* cat, char* zo ) {
+uint8_t loadRules( char* cat, char* zo, struct tzrule* dest, uint32_t maxrules ) {
   FIL file;
 
   if (f_open(&file, RULES_FILENAME, FA_READ) != FR_OK) {
@@ -4179,17 +4248,17 @@ uint8_t loadRules( char* cat, char* zo ) {
   // TZRULES.BIN is host-writable over the USB mass-storage volume, so its length
   // fields are untrusted: a rowLength larger than one rule slot, or numEntries larger
   // than the array, would overrun rules[] (global RAM corruption / HardFault). Reject.
-  if (rowLength > sizeof rules[0] || numEntries > MAX_RULES) {
+  if (rowLength > sizeof dest[0] || numEntries > maxrules) {
     f_close(&file);
     return RULES_HEADER_ERR;
   }
 
   int i;
   for (i=0;i<numEntries;i++) {
-    f_read(&file, &rules[i], rowLength, &rc);
+    f_read(&file, &dest[i], rowLength, &rc);
   }
-  while (i< MAX_RULES ) {
-    rules[i++].t=-1;
+  while (i< (int)maxrules ) {
+    dest[i++].t=-1;
   }
 
   f_close(&file);
@@ -4203,10 +4272,25 @@ uint8_t loadRulesSingle(char * str){
   while (*zo && *zo != '/') zo++;
   if (*zo!='/') return RULES_STR_ERR;
   *zo=0; zo++;
-  uint8_t err = loadRules( str, zo );
+  uint8_t err = loadRules( str, zo, rules, MAX_RULES );
   if (!err) {
     zo--;*zo='/';
     strcpy( loadedRulesString, str );
+  }
+  return err;
+}
+
+// ZONE 2 counterpart of loadRulesSingle: resolve an IANA "Cat/Zone" into rules2[].
+uint8_t loadZone2Single(char * str){
+  char * zo = str;
+  while (*zo && *zo != '/') zo++;
+  if (*zo!='/') return RULES_STR_ERR;
+  *zo=0; zo++;
+  uint8_t err = loadRules( str, zo, rules2, MAX_RULES2 );
+  if (!err) {
+    zo--;*zo='/';
+    strncpy( loadedZone2, str, sizeof loadedZone2 - 1 );
+    loadedZone2[sizeof loadedZone2 - 1] = 0;
   }
   return err;
 }
@@ -4220,6 +4304,12 @@ void checkDelayedLoadRules(){
     }
   }
   delayedLoadRules=0;
+
+  if (delayedLoadZone2) {                                     // IANA-name path only (literals resolve in the config parse)
+    delayedLoadZone2 = 0;
+    zone2_fixed = 0;
+    if (loadZone2Single(preloadZone2) != RULES_OK) loadedZone2[0] = 0;   // unresolved -> dashes
+  }
 }
 
 void setPrecision(void){
@@ -4578,8 +4668,9 @@ static uint16_t ee_crc16(const uint8_t*p, uint32_t n){   // CRC-16-CCITT (poly 0
 // 27 alt_colon u8 | 28 page_ms u16 | 30 sig_fade u8 | 31 pps u8 | 32 nmea u8 | 33 matrix_freq u32 | 37 tc u8 | 38 bal u8 | 39 cuckoo u8 |
 // 40 modes_mask_hi u32 | 44 modes_val_hi u32 | 48..61 rsvd | 62 crc16.
 // (bytes 15, 33..36, 37, 38, 39 and 40..47 were zeroed padding in every prior record, so widening simple_mask
-//  u8->u16, adding matrix_freq u32 + tc u8 + bal u8 + cuckoo u8, and splitting the mode masks u32->u64 with their
-//  high words at 40/44 all round-trip old records with those fields clear -> modes >=32 read disabled; EE_SCHEMA stays 1.)
+//  u8->u16, adding matrix_freq u32 + tc u8 + bal u8 + cuckoo u8, and splitting the mode masks u32->u64 with
+//  their high words at 40/44 all round-trip old records with those fields clear -> modes >=32 read disabled;
+//  EE_SCHEMA stays 1.)
 static void ee_pack(uint8_t*r, uint32_t gen){
   memset(r,0,EE_REC_SZ);
   uint32_t mg=EE_MAGIC; memcpy(r+0,&mg,4); memcpy(r+4,&gen,4);
@@ -5275,6 +5366,7 @@ static const MItem menu_items[] = {
   MODE_ROW(MODE_ISO_WEEK,SEC_CAL,"ISO WEEK"),     MODE_ROW(MODE_UNIX,SEC_CAL,"UNIX"),
   MODE_ROW(MODE_JULIAN_DATE,SEC_CAL,"JULIAN"),    MODE_ROW(MODE_MODIFIED_JD,SEC_CAL,"MOD JD"),
   MODE_ROW(MODE_SHOW_OFFSET,SEC_CAL,"UTC OFFS"),  MODE_ROW(MODE_SHOW_TZ_NAME,SEC_CAL,"TZ NAME"),
+  MODE_ROW(MODE_ZONE2,SEC_CAL,"ZONE 2"),
   MODE_ROW(MODE_WEEKDAY,SEC_CAL,"WEEKDAY"),       MODE_ROW(MODE_WEEKDA_DD,SEC_CAL,"WKDAY DD"),
   MODE_ROW(MODE_WDY_MM_DD,SEC_CAL,"WDY MMDD"),    MODE_ROW(MODE_STANDBY,SEC_DISP,"STANDBY"),
   MODE_ROW(MODE_SATVIEW,SEC_DIAG,"SATVIEW"),      MODE_ROW(MODE_SUN,SEC_ASTRO,"SUN"),
