@@ -258,10 +258,10 @@ static struct {
   uint32_t matrix_freq;                // KID_MATRIX_FREQ (u32: 100000 > u16)
   uint8_t  tc;                         // KID_TEMPCOMP: 1 = learn+apply+persist armed
   uint8_t  bal;                        // KID_BALANCE: 1 = seg+colon balance AUTO
-  uint32_t modes_mask, modes_val;      // bit per MODE_* ordinal
+  uint64_t modes_mask, modes_val;      // bit per MODE_* ordinal (u64: MODE_STAR=32 now overflows a u32)
 } ovr;
 static uint16_t cfg_simple_defined;    // bit per KID 1..10 set by config.txt this load
-static uint32_t cfg_modes_defined;     // bit per MODE_* ordinal set by config.txt this load
+static uint64_t cfg_modes_defined;     // bit per MODE_* ordinal set by config.txt this load
 static _Bool    menu_dirty = 0;        // a menu edit is awaiting flash commit
 
 uint8_t nmea_cdc_level=0;
@@ -1994,7 +1994,7 @@ float parseBrightness(char *v, _Bool invert){
 
 #define set_mode_enabled(mode, value) \
   do { if ((config.modes_enabled[mode] = truthy(value))) requestMode=mode; \
-       if (!from_serial) cfg_modes_defined |= (1u<<(mode)); } while(0)   /* menu-precedence tracking */
+       if (!from_serial) cfg_modes_defined |= (1ull<<(mode)); } while(0)   /* menu-precedence tracking */
 
 static uint8_t parseColonName(const char *value){
   if (strcasecmp(value, "solid") == 0)        return COLON_MODE_SOLID;
@@ -4316,27 +4316,34 @@ static uint16_t ee_crc16(const uint8_t*p, uint32_t n){   // CRC-16-CCITT (poly 0
   return c;
 }
 // Record byte layout: 0 magic u32 | 4 gen u32 | 8 schema u16 | 10 fdate u16 | 12 ftime u16 |
-// 14 simple_mask u16 | 16 modes_mask u32 | 20 modes_val u32 | 24 brightness i16 | 26 colon u8 |
-// 27 alt_colon u8 | 28 page_ms u16 | 30 sig_fade u8 | 31 pps u8 | 32 nmea u8 | 33 matrix_freq u32 | 37 tc u8 | 38 bal u8 | 39..61 rsvd | 62 crc16.
-// (bytes 15, 33..36, 37 and 38 were zeroed padding in every prior record, so widening simple_mask
-//  u8->u16 and adding matrix_freq u32 + tc u8 + bal u8 round-trip old records with those fields clear;
-//  EE_SCHEMA stays 1.)
+// 14 simple_mask u16 | 16 modes_mask_lo u32 | 20 modes_val_lo u32 | 24 brightness i16 | 26 colon u8 |
+// 27 alt_colon u8 | 28 page_ms u16 | 30 sig_fade u8 | 31 pps u8 | 32 nmea u8 | 33 matrix_freq u32 | 37 tc u8 | 38 bal u8 | 39 rsvd |
+// 40 modes_mask_hi u32 | 44 modes_val_hi u32 | 48..61 rsvd | 62 crc16.
+// (bytes 15, 33..36, 37, 38, 39 and 40..47 were zeroed padding in every prior record, so widening simple_mask
+//  u8->u16, adding matrix_freq u32 + tc u8 + bal u8, and splitting the mode masks u32->u64 with their high
+//  words at 40/44 all round-trip old records with those fields clear -> modes >=32 read disabled; EE_SCHEMA stays 1.)
 static void ee_pack(uint8_t*r, uint32_t gen){
   memset(r,0,EE_REC_SZ);
   uint32_t mg=EE_MAGIC; memcpy(r+0,&mg,4); memcpy(r+4,&gen,4);
   uint16_t sc=EE_SCHEMA; memcpy(r+8,&sc,2);
   memcpy(r+10,&ovr.stamp_fdate,2); memcpy(r+12,&ovr.stamp_ftime,2);
   memcpy(r+14,&ovr.simple_mask,2);
-  memcpy(r+16,&ovr.modes_mask,4); memcpy(r+20,&ovr.modes_val,4);
+  uint32_t mm_lo=(uint32_t)ovr.modes_mask, mv_lo=(uint32_t)ovr.modes_val;
+  uint32_t mm_hi=(uint32_t)(ovr.modes_mask>>32), mv_hi=(uint32_t)(ovr.modes_val>>32);
+  memcpy(r+16,&mm_lo,4); memcpy(r+20,&mv_lo,4);
   memcpy(r+24,&ovr.brightness,2); r[26]=ovr.colon; r[27]=ovr.alt_colon;
   memcpy(r+28,&ovr.page_ms,2); r[30]=ovr.sig_fade; r[31]=ovr.pps; r[32]=ovr.nmea;
   memcpy(r+33,&ovr.matrix_freq,4); r[37]=ovr.tc; r[38]=ovr.bal;
+  memcpy(r+40,&mm_hi,4); memcpy(r+44,&mv_hi,4);
   uint16_t crc=ee_crc16(r,62); memcpy(r+62,&crc,2);
 }
 static void ee_unpack(const uint8_t*r){
   memcpy(&ovr.stamp_fdate,r+10,2); memcpy(&ovr.stamp_ftime,r+12,2);
   memcpy(&ovr.simple_mask,r+14,2);
-  memcpy(&ovr.modes_mask,r+16,4); memcpy(&ovr.modes_val,r+20,4);
+  uint32_t mm_lo,mv_lo,mm_hi,mv_hi;
+  memcpy(&mm_lo,r+16,4); memcpy(&mv_lo,r+20,4);
+  memcpy(&mm_hi,r+40,4); memcpy(&mv_hi,r+44,4);
+  ovr.modes_mask=((uint64_t)mm_hi<<32)|mm_lo; ovr.modes_val=((uint64_t)mv_hi<<32)|mv_lo;
   memcpy(&ovr.brightness,r+24,2); ovr.colon=r[26]; ovr.alt_colon=r[27];
   memcpy(&ovr.page_ms,r+28,2); ovr.sig_fade=r[30]; ovr.pps=r[31]; ovr.nmea=r[32];
   memcpy(&ovr.matrix_freq,r+33,4); ovr.tc=r[37]; ovr.bal=r[38];
@@ -4821,8 +4828,8 @@ void menu_apply_overrides(void){
   OVR_S(KID_BALANCE,    { if(ovr.bal){ if(!seg_balance)seg_balance=1; if(!colon_balance)colon_balance=1; } else seg_balance=colon_balance=0; colonForce=1; })  // config parse ran first: a stored "on" must not clobber a manual strength
   #undef OVR_S
   for (uint8_t m=0;m<NUM_DISPLAY_MODES;m++)
-    if ((ovr.modes_mask&(1u<<m)) && (!(cfg_modes_defined&(1u<<m))||stamp_ok))
-      config.modes_enabled[m] = (ovr.modes_val>>m)&1u;   // postConfigCleanup's >=1 guard backstops this
+    if ((ovr.modes_mask&(1ull<<m)) && (!(cfg_modes_defined&(1ull<<m))||stamp_ok))
+      config.modes_enabled[m] = (ovr.modes_val>>m)&1ull;   // postConfigCleanup's >=1 guard backstops this
 }
 // Record a menu edit into the override store (value already applied live). Stamped with the current
 // config.txt mtime so a later host re-save (mtime advances) reasserts that key.
@@ -4830,10 +4837,10 @@ static void menu_record_key(uint8_t key_id, int32_t v){
   ovr.stamp_fdate=config.fdate; ovr.stamp_ftime=config.ftime; ovr.valid=1; menu_dirty=1;
   if (key_id>=KID_MODE_BASE){
     uint8_t m=(uint8_t)(key_id-KID_MODE_BASE);
-    ovr.modes_mask|=(1u<<m); if(config.modes_enabled[m]) ovr.modes_val|=(1u<<m); else ovr.modes_val&=~(1u<<m);
+    ovr.modes_mask|=(1ull<<m); if(config.modes_enabled[m]) ovr.modes_val|=(1ull<<m); else ovr.modes_val&=~(1ull<<m);
     if (m==MODE_FIRMWARE_CRC_T){    // the FW-CRC row drives both display slots; persist both
-      ovr.modes_mask|=(1u<<MODE_FIRMWARE_CRC_D);
-      if(config.modes_enabled[MODE_FIRMWARE_CRC_D]) ovr.modes_val|=(1u<<MODE_FIRMWARE_CRC_D); else ovr.modes_val&=~(1u<<MODE_FIRMWARE_CRC_D);
+      ovr.modes_mask|=(1ull<<MODE_FIRMWARE_CRC_D);
+      if(config.modes_enabled[MODE_FIRMWARE_CRC_D]) ovr.modes_val|=(1ull<<MODE_FIRMWARE_CRC_D); else ovr.modes_val&=~(1ull<<MODE_FIRMWARE_CRC_D);
     }
     return;
   }
@@ -5002,6 +5009,7 @@ static const MItem menu_items[] = {
   MODE_ROW(MODE_GRID,SEC_ASTRO,"GRID"),           MODE_ROW(MODE_LATLON,SEC_ASTRO,"LAT LON"),
   MODE_ROW(MODE_LST,SEC_ASTRO,"LST"),             MODE_ROW(MODE_SOLAR,SEC_ASTRO,"SOLAR"),
   MODE_ROW(MODE_ADEV,SEC_DIAG,"ADEV"),            MODE_ROW(MODE_STAR,SEC_ASTRO,"STAR"),
+  MODE_ROW(MODE_DARK,SEC_ASTRO,"DARK"),
   MODE_ROW(MODE_TEMPCOMP,SEC_DIAG,"TC DATA"),   // the model READOUT; "TEMPCOMP" beside it is the enable
   { KID_MODE_BASE+MODE_FIRMWARE_CRC_T, MIT_TOGGLE, "FW CRC", MODE_FIRMWARE_CRC_T,1,1, NULL, g_mode, s_fwcrc, SEC_DIAG },
   MODE_ROW(MODE_VBAT, SEC_DIAG, "VBAT"),      // coin-cell health belongs beside the diagnostics (was config-only)

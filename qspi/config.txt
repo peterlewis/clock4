@@ -206,6 +206,13 @@ MODE_GRID = disabled
 # Latitude / longitude in decimal degrees. Pages LAT -> LON (see page_ms).
 MODE_LATLON = disabled
 
+# Observing twilight ladder. Pages a live countdown to astronomical darkness, then
+# civil / nautical / astronomical dusk and the dawn that ends it (see page_ms):
+# "DARK 02.14" -> "CIV  21.56" -> "NAU  22.57" -> "AST  23.41" -> "End  05.59".
+# Where the sun never reaches -18 deg the astronomical pages read "----" and the
+# headline reads NO DARK; inside a polar night it reads DARK NOW.
+MODE_DARK = disabled
+
 # Bright-star meridian-transit predictor. Paged countdowns to the soonest bright stars crossing
 # your local meridian (culminating), e.g. "SIRI  0 45" = Sirius transits in 45 min. Needs a position
 # (GPS fix or fake_longitude); shows "STAr ----" without one. J2000 catalogue precessed to date.
@@ -242,8 +249,9 @@ MODE_ADEV = disabled
 # One of: slowfade, heartbeat, sawtooth, alt_sawtooth, toggle, solid
 #colon_alt_mode = alt_sawtooth
 
-# Dwell per sub-screen for the paged modes (MODE_SUN, MODE_LATLON, MODE_TEMPCOMP, MODE_ADEV,
-# MODE_STAR), in ms. Default 5500 (a subjectively-tuned cadence, found by feel); floored at 250.
+# Dwell per sub-screen for the paged modes (MODE_SUN, MODE_LATLON, MODE_DARK,
+# MODE_TEMPCOMP, MODE_ADEV, MODE_STAR), in ms. Default 5500 (a subjectively-tuned
+# cadence, found by feel); floored at 250.
 page_ms = 5500
 
 # Fixed position for the astro modes when there is no GPS fix (decimal degrees, N+/E+).
