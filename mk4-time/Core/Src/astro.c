@@ -69,7 +69,8 @@ double equation_of_time(double unix_s) {
 
 int sun_times(double lat, double lon, double unix_s,
               double *sunrise, double *sunset, double *solar_noon,
-              double *civil_dusk, double *nautical_dusk, double *golden_dusk) {
+              double *civil_dusk, double *nautical_dusk, double *golden_dusk,
+              double *astro_dusk) {
     /* Reference instant = 12:00:00 UTC of the calendar day of unix_s. */
     double noon_unix = trunc(unix_s / 86400.0) * 86400.0 + 43200.0;
     double n = days_since_j2000(noon_unix);
@@ -101,6 +102,13 @@ int sun_times(double lat, double lon, double unix_s,
         double c = (sin(6.0 * DEG) - sin(lat * DEG) * sin(delta)) / (cos(lat * DEG) * cos(delta));
         double o = (c < -1.0 || c > 1.0) ? omega : acos(c) * RAD;
         *golden_dusk = noon + o / 15.0;
+    }
+    if (astro_dusk) {
+        /* Astronomical dusk (sun centre at -18 deg): true observing darkness. Unlike the tiers above
+         * there is NO omega fallback — if the sun never dips to -18 (a summer "white night") we report
+         * NAN so the caller can say "no astronomical dark tonight" rather than a fabricated time. */
+        double c = (sin(-18.0 * DEG) - sin(lat * DEG) * sin(delta)) / (cos(lat * DEG) * cos(delta));
+        *astro_dusk = (c < -1.0 || c > 1.0) ? NAN : noon + acos(c) * RAD / 15.0;
     }
     return 0;
 }

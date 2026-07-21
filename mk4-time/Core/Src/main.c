@@ -162,6 +162,11 @@ struct astro_cache_s {
   uint8_t  moon_idx, moon_pct;           // phase index 0..7 / illuminated %
   char     grid[8];        // Maidenhead locator, or "----"
   float    lat_show, lon_show;           // the snapshot lat/lon, for MODE_LATLON
+  // MODE_DARK twilight ladder — local minutes-of-day, -1 = not applicable (dashes).
+  int16_t  civ_dusk_min, nau_dusk_min;   // civil (-6) / nautical (-12) evening twilight
+  int16_t  ast_dusk_min, ast_dawn_min;   // astronomical (-18) darkness begins / ends
+  _Bool    dark_tonight;                 // astronomical darkness occurs this date
+  _Bool    always_dark;                  // polar night: sun below -18 now (dark round the clock)
 } astro = {0};
 #define rtc_last_write RTC->BKP30R
 #define rtc_last_calibration RTC->BKP31R
@@ -298,17 +303,27 @@ static void astro_update(void){
   if (c.have_pos) {
     c.lat_show = lat;
     c.lon_show = lon;
-    double az, el, rise = 0, set = 0, noon = 0;
+    double az, el, rise = 0, set = 0, noon = 0, civd = 0, naud = 0, astd = 0;
     sun_az_el(lat, lon, (double)currentTime, &az, &el);
     int ia = (int)(az + 0.5); if (ia >= 360) ia -= 360;
     c.az = (int16_t)ia;
     c.el = (int16_t)(el < 0 ? el - 0.5 : el + 0.5);
+    c.civ_dusk_min = c.nau_dusk_min = c.ast_dusk_min = c.ast_dawn_min = -1;   // MODE_DARK: n/a unless computed below
     c.sun_up_today = (sun_times(lat, lon, (double)currentTime,
-                                &rise, &set, &noon, 0, 0, 0) == 0);
+                                &rise, &set, &noon, &civd, &naud, 0, &astd) == 0);
     c.noon_min = (int16_t)astro_local_minutes(noon);     // noon is valid even at the poles
     if (c.sun_up_today) {
       c.rise_min = (int16_t)astro_local_minutes(rise);
       c.set_min  = (int16_t)astro_local_minutes(set);
+      c.civ_dusk_min = (int16_t)astro_local_minutes(civd);
+      c.nau_dusk_min = (int16_t)astro_local_minutes(naud);
+      if (!isnan(astd)) {                                 // astronomical dark occurs -> dusk + symmetric dawn
+        c.ast_dusk_min = (int16_t)astro_local_minutes(astd);
+        c.ast_dawn_min = (int16_t)astro_local_minutes(2.0 * noon - astd);   // dawn = mirror of dusk about solar noon
+        c.dark_tonight = 1;
+      }
+    } else {
+      c.always_dark = (c.el < -18);                       // polar night: sun deep below the horizon now
     }
     maidenhead(lat, lon, c.grid);
   } else {
@@ -619,6 +634,46 @@ void sendDate( _Bool now ){
                   lat ? "LAT" : "LON", h < 0 ? '-' : ' ', a2 / 100, a2 % 100);
     }
     break;
+  case MODE_DARK: {
+    // The observing-session twilight ladder, paged: headline countdown to astronomical darkness, then
+    // civil / nautical / astronomical dusk times and the astronomical dawn (dark ends). Honest at the
+    // edges: no fix -> dashes; a white night that never reaches -18 -> "NO DARK"; polar night -> "DARK NOW".
+    if (!astro.have_pos || !astro.epoch) { i = sprintf((char*)&uart2_tx_buffer[1], "%-4.4s ----", "DARK"); break; }
+    int now_min = (int)((((long)currentTime + currentOffset) % 86400L + 86400L) % 86400L) / 60;
+    // Every page uses MODE_SUN's RISE/SET layout: a 4-wide label + " HH.MM", so the digits sit in the
+    // SAME columns as the ladder pages -> the numbers stay put as the mode pages. Countdown hours are
+    // 2-digit too (05.57, not 5.57) so they line up with the times; no hyphen.
+    switch ((int)((uwTick / page_ms()) % 5)) {
+    case 0:                                              // headline: live countdown / status
+      if (astro.always_dark)        i = sprintf((char*)&uart2_tx_buffer[1], "DARK  NOW");
+      else if (!astro.dark_tonight) i = sprintf((char*)&uart2_tx_buffer[1], "NO DARK");
+      else {
+        int dusk = astro.ast_dusk_min, dawn = astro.ast_dawn_min;
+        _Bool in_dark = (now_min >= dusk) || (now_min < dawn);   // dark window wraps midnight
+        int togo = in_dark ? ((dawn - now_min + 1440) % 1440) : (dusk - now_min);   // minutes to the next edge
+        // DAWN = counting to the end of dark (observing time left); DARK = counting down to its start.
+        i = sprintf((char*)&uart2_tx_buffer[1], "%-4.4s %02d.%02d", in_dark ? "DAWN" : "DARK", togo / 60, togo % 60);
+      }
+      break;
+    case 1:                                              // civil dusk (-6)
+      i = astro.civ_dusk_min < 0 ? sprintf((char*)&uart2_tx_buffer[1], "%-4.4s ----", "CIV")
+        : sprintf((char*)&uart2_tx_buffer[1], "%-4.4s %02d.%02d", "CIV", astro.civ_dusk_min/60, astro.civ_dusk_min%60);
+      break;
+    case 2:                                              // nautical dusk (-12)
+      i = astro.nau_dusk_min < 0 ? sprintf((char*)&uart2_tx_buffer[1], "%-4.4s ----", "NAU")
+        : sprintf((char*)&uart2_tx_buffer[1], "%-4.4s %02d.%02d", "NAU", astro.nau_dusk_min/60, astro.nau_dusk_min%60);
+      break;
+    case 3:                                              // astronomical dusk (-18): dark begins
+      i = astro.ast_dusk_min < 0 ? sprintf((char*)&uart2_tx_buffer[1], "%-4.4s ----", "AST")
+        : sprintf((char*)&uart2_tx_buffer[1], "%-4.4s %02d.%02d", "AST", astro.ast_dusk_min/60, astro.ast_dusk_min%60);
+      break;
+    default:                                             // astronomical dawn: dark ends
+      i = astro.ast_dawn_min < 0 ? sprintf((char*)&uart2_tx_buffer[1], "%-4.4s ----", "End")
+        : sprintf((char*)&uart2_tx_buffer[1], "%-4.4s %02d.%02d", "End", astro.ast_dawn_min/60, astro.ast_dawn_min%60);
+      break;
+    }
+    break;
+  }
   }
   if (now) {
     uart2_tx_buffer[++i]= CMD_RELOAD_TEXT;
@@ -1156,6 +1211,8 @@ void parseConfigString(char *key, char *value) {
     set_mode_enabled(MODE_GRID, value);
   } else if (strcasecmp(key, "MODE_LATLON") == 0) {
     set_mode_enabled(MODE_LATLON, value);
+  } else if (strcasecmp(key, "MODE_DARK") == 0) {
+    set_mode_enabled(MODE_DARK, value);
   } else if (strcasecmp(key, "page_ms") == 0) {
     int v = atoi(value);
     config.page_ms = v < 0 ? 0 : (v > 65535 ? 65535 : v);   // fits uint16; 0 -> default
@@ -2429,14 +2486,14 @@ int main(void)
       measure_vbat();
 
     if (displayMode == MODE_SUN  || displayMode == MODE_SUN_AZEL || displayMode == MODE_MOON
-        || displayMode == MODE_GRID || displayMode == MODE_LATLON) {
+        || displayMode == MODE_GRID || displayMode == MODE_LATLON || displayMode == MODE_DARK) {
       astro_update();
       // honour the ms page dwell: the date row otherwise only repaints at 1 Hz, so repaint
       // the moment a paged mode flips sub-screen. Only with a fix (no-fix shows a
       // page-independent "----"), and never in the last decisecond -- there the SysTick ISR
       // runs its own (non-reentrant, shared-UART) sendDate(0), so we'd race it. Same
       // decisec!=9 guard the existing main-loop sendDate(1) calls use.
-      if ((displayMode == MODE_SUN || displayMode == MODE_LATLON) && astro.have_pos && astro.epoch) {
+      if ((displayMode == MODE_SUN || displayMode == MODE_LATLON || displayMode == MODE_DARK) && astro.have_pos && astro.epoch) {
         static uint32_t last_pg = 0;
         uint32_t pg = uwTick / page_ms();
         if (pg != last_pg && decisec != 9) { last_pg = pg; sendDate(1); }

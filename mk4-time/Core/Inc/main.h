@@ -172,6 +172,11 @@ enum {
   MODE_GRID,       // Maidenhead grid locator
   MODE_LATLON,     // latitude / longitude, auto-paged
 
+  // Observing-session twilight ladder: civil / nautical / astronomical dusk times and a live countdown
+  // to astronomical darkness (sun -18 deg). Answers "when is it actually dark, and for how long." Honest:
+  // high-latitude white nights that never reach -18 report NO DARK; polar night reports DARK NOW.
+  MODE_DARK,
+
   NUM_DISPLAY_MODES
 };
 
