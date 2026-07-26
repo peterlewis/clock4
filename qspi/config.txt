@@ -187,6 +187,10 @@ page_ms = 5500
 # (GPS fix or fake_longitude); shows "STAr ----" without one. J2000 catalogue precessed to date.
 # (Companion serial command: "star_dump = on" prints the whole list as $PMSTAR.)
 MODE_STAR = disabled
+# Trim the transit catalogue to stars brighter than this apparent magnitude, applied when
+# STARS.BIN is loaded at boot. Smaller numbers keep fewer, brighter stars. Default 6.0, which
+# loads the whole supplied file (generate-stars.py cuts it at magnitude 2.5, about 90 stars).
+#star_max_mag = 1.5
 
 # Local Sidereal Time as a LIVE TICKING CLOCK on the time row (big digits). The date row
 # keeps the civil date, and the colons animate differently (colon_alt_mode below) so it
