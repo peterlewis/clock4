@@ -139,7 +139,7 @@ int main(void) {
      * sun_times()'s solar_noon and confirm -- catches any longitude/EoT sign or wrap error. */
     for (int i = 0; i < 4; i++) {
         double nn;
-        sun_times(V[i]->lat, V[i]->lon, V[i]->t, NULL, NULL, &nn, NULL, NULL, NULL);
+        sun_times(V[i]->lat, V[i]->lon, V[i]->t, NULL, NULL, &nn, NULL, NULL, NULL, NULL);
         double noon_unix = trunc(V[i]->t / 86400.0) * 86400.0 + nn * 3600.0;
         char nm[40]; sprintf(nm, "solar@noon %s", V[i]->tag);
         chk(nm, local_solar_time(noon_unix, V[i]->lon), 12.0, 0.02);
