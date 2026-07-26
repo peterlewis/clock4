@@ -244,7 +244,7 @@ struct {
   time_t countdown_to;
   float brightness_override;
   volatile _Bool zone_override;
-  uint16_t page_ms;             // paged modes (SUN/LATLON): sub-screen dwell, ms
+  uint16_t page_ms;             // sub-screen dwell, ms, for every mode that pages its date row on uwTick / page_ms()
   _Bool modes_enabled[NUM_DISPLAY_MODES];
 
 } config = {0};
@@ -276,7 +276,7 @@ void memcpyword(volatile uint32_t *dest, volatile uint32_t *src, size_t n){
 static _Bool astro_pos_ok(float lat, float lon){
   return lat >= -90.0f && lat <= 90.0f && lon >= -180.0f && lon <= 180.0f;
 }
-// Sub-screen dwell (ms) for the paged modes (SUN, LATLON). Unset -> 5500 ms, a
+// Sub-screen dwell (ms) for every mode that pages its date row. Unset -> 5500 ms, a
 // subjectively-tuned cadence found by feel. Floored at 250 ms so a tiny value can't
 // flood the date-board UART.
 static uint32_t page_ms(void){ uint32_t m = config.page_ms; return m == 0 ? 5500 : (m < 250 ? 250 : m); }
