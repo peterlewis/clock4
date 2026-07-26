@@ -46,6 +46,18 @@ quarter, 7 waning crescent. This is the one astro mode that needs no position.
 
 `MODE_LATLON` pages latitude and longitude in decimal degrees: `LAT  51.48` → `LON  -0.01` (a 3-digit longitude drops the gap: `LON-179.99`).
 
+`MODE_DARK` is the observing-session twilight ladder: five pages on the `page_ms` dwell, laid out in
+`MODE_SUN`'s columns so the digits stay put as it pages. The first page is a live countdown in hours
+and minutes to the start of astronomical darkness (`DARK 05.57`), flipping once dark to the time left
+in it, counting down to astronomical dawn (`DAWN 03.20`). Behind it are the evening tiers and the end
+of the night, in local time: civil dusk at -6 degrees (`CIV  21.42`), nautical at -12 (`NAU  22.31`),
+astronomical at -18 (`AST  23.40`), and the dawn that ends the dark (`End  02.16`, taken as the
+mirror of dusk about solar noon). Where the sun sets but never reaches -18 the headline reads
+`NO DARK` and the `AST` and `End` pages read `----` rather than a fabricated time, while `CIV` and
+`NAU` still show. During polar day or night, when the sun doesn't rise or set on the current date,
+all four tier pages read `----` and the headline reads `NO DARK`, or `DARK  NOW` if the sun is below
+-18 right now. With no position the mode shows `DARK ----`.
+
 ### Sidereal and solar time
 
 ```
@@ -137,9 +149,9 @@ precedence between the two is explained in the menu section.
 page_ms = 5500
 ```
 
-The dwell time per sub-screen, in milliseconds, for all the paged date-row modes (`MODE_SUN`,
-`MODE_LATLON`, `MODE_TEMPCOMP`, `MODE_ADEV`, `MODE_STAR`). Default 5500, minimum 250. Also settable
-from the menu (DISP > PAGE, shown in seconds).
+The dwell time per sub-screen, in milliseconds. Every date-row mode that pages honours it, including
+`MODE_SUN`, `MODE_LATLON`, `MODE_TEMPCOMP`, `MODE_ADEV` and `MODE_STAR`. Default 5500, minimum 250.
+Also settable from the menu (DISP > PAGE, shown in seconds).
 
 ### significance_fade
 
@@ -405,7 +417,7 @@ the file is fragmented or too small). Useful for checking whether your settings 
 cycle without guessing which silicon your clock was built with.
 
 ```
-menu_reset = on
+factory_reset = on
 ```
 Factory-resets the on-device menu: erases every setting changed with the two-button menu and
 immediately re-reads `config.txt`, returning the clock to exactly what the file says. No reboot
@@ -535,7 +547,7 @@ Two rows are read-only live read-outs (they offer no EDIT):
 SYS > RESET erases every setting you've changed with the menu **and everything the clock has
 learned** — the stored and live temperature-compensation model included — then immediately re-reads
 `config.txt`, returning the clock to exactly what the file says (a `tc_*` seed block in the file
-re-seeds compensation on the spot). It is the same thing as the `menu_reset` serial command. EDIT
+re-seeds compensation on the spot). It is the same thing as the `factory_reset` serial command. EDIT
 opens a `DELETE ALL` confirm screen: APPLY fires it (the row flashes `DONE`), CANCEL backs out.
 This is deliberately a different thing from the REBOOT chord, which restarts the clock but keeps
 your settings.
