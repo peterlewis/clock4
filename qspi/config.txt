@@ -143,7 +143,7 @@ MODE_DARK = disabled
 # Default 5500 (a subjectively-tuned cadence, found by feel); floored at 250.
 page_ms = 5500
 # Local Sidereal Time as a LIVE TICKING CLOCK on the time row (big digits). The date row
-# keeps the civil date, and the colons animate differently (alt_colon_mode below) so it
+# keeps the civil date, and the colons animate differently (colon_alt_mode below) so it
 # can never be mistaken for civil time. Sidereal runs 1.00273791x faster than civil, so the
 # seconds display double-steps about once every 6 minutes -- real sidereal behaviour, not a
 # glitch. Needs a position (GPS fix or fake_longitude); shows dashes without one.
@@ -158,7 +158,7 @@ MODE_SOLAR = disabled
 # Same names as colon_mode; automatically kept different from your civil colon unless you
 # explicitly set them equal here. One of: slowfade, heartbeat, sawtooth, alt_sawtooth,
 # toggle, solid
-#alt_colon_mode = alt_sawtooth
+#colon_alt_mode = alt_sawtooth
 
 # Fixed position for the astro modes when there is no GPS fix (decimal degrees, N+/E+).
 # Note: setting these also pins the clock's position (GPS position updates are ignored).
