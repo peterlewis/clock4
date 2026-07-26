@@ -137,6 +137,33 @@ current date, so the shown minute stays right for decades — including for Pola
 
 The companion serial command `star_dump` prints the whole list — see USB serial output below.
 
+### Second timezone
+
+```
+MODE_ZONE2 = enabled
+zone2 = America/New_York
+```
+
+A second civil timezone on the date row, while the time row keeps local time. The mode alternates on
+a fixed eight-second cycle: two seconds of label, then six seconds of the remote clock. It is not one
+of the paged modes, so `page_ms` has no effect on it.
+
+The label page shows the tail of the IANA name after the last `/` (`America/New_York` reads
+`New_York`), or a fixed offset verbatim, truncated to the row's ten characters. The clock page reads
+`HH:MM:SS` and ticks with the time row, with a `+1` or `-1` marker appended when the remote calendar
+day is ahead of or behind the local one (`19:04:37-1` is the previous day there). The reading is
+computed from GPS-disciplined UTC and the zone's own transition table on every repaint, so it follows
+that zone's daylight-saving changes on their own dates; no offset is stored.
+
+`zone2` takes the same format as `ZONE_OVERRIDE`, and sits beside it in `config.txt`. An IANA name is
+resolved from the same `tzrules.bin` the main zone uses, into a second transition table held
+alongside it. A literal `UTC`, `GMT`, `+HH:MM` or `-HH:MM` (`+05:30`, or `-8` with the minutes left
+off) resolves immediately without reading the drive, and has no daylight saving; offsets beyond 14
+hours are rejected. The mode needs no position.
+
+Leave `zone2` unset, or name a zone `tzrules.bin` does not carry, and the row shows a single dash.
+`MODE_ZONE2` is also on the menu (CAL > ZONE 2); the zone target is config-only.
+
 ## New configuration parameters
 
 All of these go in `config.txt` like any other parameter, and can also be typed over the USB serial
