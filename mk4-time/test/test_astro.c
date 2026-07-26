@@ -22,6 +22,14 @@ static void chk(const char *name, double got, double exp, double tol) {
     }
 }
 
+/* astro_dusk is deliberately NAN when the sun never reaches -18 deg (white night),
+ * which is what lets MODE_DARK report darkness as absent rather than inventing one. */
+static void chknan(const char *name, double got) {
+    total++;
+    if (isnan(got)) printf("  ok   %-28s nan (no astronomical darkness)\n", name);
+    else            { printf("  FAIL %-28s got %.6f  exp nan\n", name, got); fails++; }
+}
+
 static void chks(const char *name, const char *got, const char *exp) {
     total++;
     if (strcmp(got, exp) != 0) { printf("  FAIL %-28s got \"%s\"  exp \"%s\"\n", name, got, exp); fails++; }
@@ -67,26 +75,28 @@ int main(void) {
     }
 
     printf("sun_times (UTC h):\n");
-    double rise, set, noon, civ, nau, gold;
-    /* V1 Greenwich */
-    sun_times(V1.lat, V1.lon, V1.t, &rise, &set, &noon, &civ, &nau, &gold);
+    double rise, set, noon, civ, nau, gold, ast;
+    /* V1 Greenwich — 21 June at 51.5N, the sun never reaches -18 deg */
+    sun_times(V1.lat, V1.lon, V1.t, &rise, &set, &noon, &civ, &nau, &gold, &ast);
     chk("noon V1", noon, 12.032231, 0.0003);
     chk("rise V1", rise, 3.715903, 0.0003);
     chk("set  V1", set, 20.348558, 0.0003);
     chk("civil V1", civ, 21.143501, 0.0003);
     chk("naut V1", nau, 22.383822, 0.0003);
+    chknan("astro V1", ast);
     /* V3 Quito */
-    sun_times(V3.lat, V3.lon, V3.t, &rise, &set, &noon, NULL, NULL, NULL);
+    sun_times(V3.lat, V3.lon, V3.t, &rise, &set, &noon, NULL, NULL, NULL, NULL);
     chk("noon V3", noon, 17.081196, 0.0003);
     chk("rise V3", rise, 11.025277, 0.0003);
     chk("set  V3", set, 23.137114, 0.0003);
     /* V4 Fairbanks (events spill past midnight) */
-    sun_times(V4.lat, V4.lon, V4.t, &rise, &set, &noon, &civ, &nau, &gold);
+    sun_times(V4.lat, V4.lon, V4.t, &rise, &set, &noon, &civ, &nau, &gold, &ast);
     chk("noon V4", noon, 21.798861, 0.0005);
     chk("rise V4", rise, 19.944940, 0.0005);
     chk("set  V4", set, 23.652783, 0.0005);
     chk("civil V4", civ, 25.076604, 0.0005);
     chk("naut V4", nau, 26.273118, 0.0005);
+    chk("astro V4", ast, 27.301764, 0.0005);
 
     printf("maidenhead:\n");
     char g[7];
