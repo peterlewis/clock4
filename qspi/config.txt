@@ -270,8 +270,15 @@ page_ms = 5500
 # otherwise stay bright as the digits dim down). "on"/1 = the auto curve; a number 2..256 pins a
 # fixed scale of 256. Leave off until the digit brightness levels are dialled in, then switch on.
 #colon_balance = on
+# Per-hardware anchors for the AUTO colon curve above (ignored when colon_balance is off or
+# pinned to a fixed number). colon_full_at is the brightness DAC value at and below which the
+# colons run at full scale; colon_floor is the scale, out of 256, they fall to at the dimmest
+# rail (DAC 4095). Defaults 2048 and 20; values are clamped to 0..4000 and 0..256.
+#colon_full_at = 2048
+#colon_floor   = 20
 
-# Factory-reset the ON-DEVICE MENU: send "menu_reset = on" over USB serial (ignored in this file) to
-# erase every setting you changed with the two-button menu, returning the clock to exactly this
-# config.txt. Note the on-device RESET chord only REBOOTS — it keeps your menu settings.
+# Factory reset: send "factory_reset = on" over USB serial (ignored in this file) to erase every
+# setting you changed with the two-button menu AND the learned temperature-compensation model,
+# returning the clock to exactly this config.txt. The on-device equivalent is the menu's SYS > RESET row; the REBOOT chord only
+# restarts the clock and keeps your menu settings.
 
