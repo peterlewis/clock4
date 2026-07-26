@@ -132,7 +132,14 @@ MODE_GRID = disabled
 # Latitude / longitude in decimal degrees. Pages LAT -> LON (see page_ms).
 MODE_LATLON = disabled
 
-# Dwell per sub-screen for the paged modes (MODE_SUN, MODE_LATLON), in milliseconds.
+# Observing twilight ladder. Pages a live countdown to astronomical darkness, then
+# civil / nautical / astronomical dusk and the dawn that ends it (see page_ms):
+# "DARK 02.14" -> "CIV  21.56" -> "NAU  22.57" -> "AST  23.41" -> "End  05.59".
+# Where the sun never reaches -18 deg the astronomical pages read "----" and the
+# headline reads NO DARK; inside a polar night it reads DARK NOW.
+MODE_DARK = disabled
+
+# Dwell per sub-screen for the paged modes (MODE_SUN, MODE_LATLON, MODE_DARK), in ms.
 # Default 5500 (a subjectively-tuned cadence, found by feel); floored at 250.
 page_ms = 5500
 
