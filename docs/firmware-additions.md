@@ -229,6 +229,62 @@ to alt_sawtooth, or toggle if that's your civil choice); setting it explicitly d
 guarantee, including setting the two equal if you really want to. Also settable from the menu
 (DISP > ACOLON).
 
+### cuckoo
+
+```
+cuckoo = trust
+```
+
+Scheduled display flourishes on the time row. The cadence is intrinsic, after the Westminster
+pattern: a fixed small gesture on each quarter-hour, and the piece named by this key on the hour.
+There is no interval knob. Default `off`, which disables both tiers. `trust` is the only piece in
+the shipped catalogue; every other value, including the parked piece names in `CUCKOO_SPEC.md`,
+parses to `off`, so a misspelt name cannot leave a stale piece performing. Also settable from the
+menu (DISP > CUCKOO), where each value performs on the real digits as you select it.
+
+Nothing is ever written to the date row, so whatever it holds — the date, a star countdown, an ADEV
+octave — keeps reading straight through a flourish, and the feature asks nothing of the date board.
+
+The quarter gesture (:15, :30, :45) is the same every time and carries no data: a shallow brightness
+trough sweeps the six big digits left to right, each digit starting 30 ms after the one to its left
+and dipping to half brightness and back over 400 ms. It is finished about 0.6 s after the boundary.
+The colons and the sub-second digits are untouched, and holdover changes nothing about it.
+
+`trust`, the hour piece, shows how much of the displayed time the clock can currently stand behind.
+The whole row dips to a dim x-ray for 0.3 s, then a relight wave walks HH → MM → SS → ds → cs → ms
+at 80 ms per digit, each digit coming back to the confidence the `Tolerance_time_*` ladder holds for
+it at that moment:
+
+| digit | relights on |
+|---|---|
+| the six whole-second digits | full once the clock has seen a PPS pulse or came up on a good battery-backed RTC; a dim trace if it has had neither |
+| deciseconds | the better of PPS age against `Tolerance_time_10ms` and RTC-calibration age against `Tolerance_time_100ms` |
+| centiseconds | PPS age against `Tolerance_time_10ms` |
+| milliseconds | PPS age against `Tolerance_time_1ms` |
+
+Within a window the digit is full while the age is under half the tolerance, then rolls off linearly
+to dark at the tolerance itself, which is where the ladder would dash it. A clock that has had
+neither anchor leaves all three sub-second digits dark for the piece. With every digit full the row
+closes on one unified pulse and the piece ends about 1.5 s after the hour; otherwise the wave dies
+at the honest position, holds that picture, and the dark digits fade back up to the live face, about
+1.9 s in all. Both endings finish on the plain live face, and a digit that `significance_fade` has
+already extinguished is never relit by a flourish.
+
+Flourishes are refused, and one in flight is abandoned, in `MODE_STANDBY`, in the countdown and text
+displays, and while an alternate timebase drives the time row (`MODE_LST` / `MODE_SOLAR`). They also
+need the same dither canvas as `seg_balance`, so a matrix frequency below ~4 kHz skips them rather
+than showing them badly; `seg_balance` itself need not be on, since the mirror runs at identity duty
+when it is off. With `cuckoo = off` the display path is byte-identical to stock.
+
+```
+cuckoo_preview = trust
+```
+
+Serial-only, and ignored in `config.txt` so that loading a file never makes the clock perform. Plays
+one flourish immediately, without changing `cuckoo`: `nod` plays the quarter gesture, `trust` plays
+the hour piece, `on` plays whatever `cuckoo` is currently set to (nothing, if that is `off`). A
+second preview replaces one already running.
+
 ### star_max_mag
 
 ```
