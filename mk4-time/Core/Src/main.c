@@ -4276,17 +4276,18 @@ void buttonsBothHeld(void){
 }
 
 // ================= Menu persistence: firmware-owned emulated-EEPROM =============================
-// Two flash pages, append-only ping-pong. Each 64-byte record: {magic, generation, schema, config.txt
+// Two 4 KB pages, append-only ping-pong. Each 64-byte record: {magic, generation, schema, config.txt
 // mtime stamp, the packed override set, CRC16 in the LAST doubleword}. Boot picks the highest-
-// generation CRC-valid record. The pages are the TOP TWO of physical flash, derived AT RUNTIME from
-// the flash-size register: on the 1 MB RG they land in bank 2 (read-while-write -> no CPU stall) and
-// ABOVE the app-CRC region; on the 256 KB RC there is no room above the app, so persistence DISABLES
-// itself (settings stay RAM-only) rather than write into the CRC-covered app and brick the boot.
+// generation CRC-valid record. The pages live in /SETTINGS.BIN on the QSPI FAT volume on EVERY clock,
+// whatever the STM32L476 variant: the bootloader treats every die as 256 KB (boot + app end at
+// 0x08040000 even on a 1 MB RG) and every board carries the same QSPI chip, so one medium means one
+// path to test. The RG-only internal-flash home (the top of bank 2) is retired: records an earlier
+// build left there are never read again, so an RG clock upgrading starts from config.txt.
 #define EE_MAGIC   0x4D4B3445u        // "MK4E"  (menu store)
 #define EE_SCHEMA  1u
 #define EE_REC_SZ  64u                // 8 doublewords; CRC16 lives in DW7 so it programs last
-#define EE_SLOTS   (FLASH_PAGE_SIZE / EE_REC_SZ)
 #define EE_QSPI_PGSZ 4096u            // W25Q128 erase unit (one FAT cluster == one MSC block == one sector)
+#define EE_SLOTS   (EE_QSPI_PGSZ / EE_REC_SZ)
 #define EE2_MAGIC  0x4D4B3454u        // "MK4T"  (tempcomp store — distinct magic so the two never alias)
 #define EE2_SCHEMA 1u
 static uint32_t ee_page_a=0, ee_page_b=0, ee_active=0, ee_gen=0;
@@ -4298,18 +4299,13 @@ static uint32_t ee2_page_a=0, ee2_page_b=0, ee2_active=0, ee2_gen=0;
 static uint16_t ee2_next=0;
 static _Bool    ee2_avail=0;
 
-// --- Backing medium. On RG silicon (1 MB) the store keeps its original home: the top two internal-
-// flash pages (EE_BK_INTERNAL, byte-identical behaviour). On RC silicon (256 KB) internal flash ends
-// exactly at the app-CRC boundary, so the store relocates into /SETTINGS.BIN on the QSPI FAT volume
-// (EE_BK_QSPI): a 16 KiB contiguous host-visible file whose four 4 KB sectors we rewrite RAW through
-// qspi_drv — never touching FAT metadata, the dirent, or the file size, so the host, the bootloader
-// and fsck all still see an ordinary opaque file. No file (or a fragmented one) -> EE_BK_NONE =
-// today's RAM-only fallback. File layout: +0x0000 menu page A | +0x1000 menu page B | +0x2000
-// tempcomp page A | +0x3000 tempcomp page B.
-typedef enum { EE_BK_NONE=0, EE_BK_INTERNAL, EE_BK_QSPI } EEBacking;
+// --- Backing medium: /SETTINGS.BIN on the QSPI FAT volume (EE_BK_QSPI), a 16 KiB contiguous
+// host-visible file whose four 4 KB sectors we rewrite RAW through qspi_drv — never touching FAT
+// metadata, the dirent, or the file size, so the host, the bootloader and fsck all still see an
+// ordinary opaque file. No file (or a fragmented one) -> EE_BK_NONE = the RAM-only fallback. File
+// layout: +0x0000 menu page A | +0x1000 menu page B | +0x2000 tempcomp page A | +0x3000 tempcomp page B.
+typedef enum { EE_BK_NONE=0, EE_BK_QSPI } EEBacking;
 static EEBacking ee_backing = EE_BK_NONE;
-static uint16_t  ee_slots = EE_SLOTS;         // records per erase unit: 32 internal / 64 QSPI sector
-static uint32_t  ee_pgsz  = FLASH_PAGE_SIZE;  // erase-unit size: 2048 internal / 4096 QSPI
 static uint8_t   ee_sfile_state = 0;          // 0 no SETTINGS.BIN | 1 ok | 2 fragmented/too small
 // Host-write generation: STORAGE_Write_FS bumps it on EVERY host MSC write. A commit whose mapping
 // generation is stale must re-resolve the file's physical base first — the host may have moved,
@@ -4319,9 +4315,9 @@ volatile uint32_t settings_map_gen = 0;
 static uint32_t   settings_map_seen = 0;
 
 #ifdef __EMSCRIPTEN__
-// The emu models the RC/QSPI path — the real Mk IV hardware — with TRUE NOR semantics: program can
-// only clear bits (AND), erase refills a whole 4 KB sector with 0xFF. The old memcpy-overwrite shim
-// let every persistence test pass while the hardware silently never persisted; never bring it back.
+// The emu models the QSPI store with TRUE NOR semantics: program can only clear bits (AND), erase
+// refills a whole 4 KB sector with 0xFF. The old memcpy-overwrite shim let every persistence test
+// pass while the hardware silently never persisted; never bring it back.
 #define EE_SFILE_SZ 16384u
 static uint8_t ee_sfile[EE_SFILE_SZ];
 static uint8_t ee_sfile_attached = 1;   // SETTINGS.BIN present on the emulated card (tests can detach)
@@ -4334,38 +4330,24 @@ static void ee_prog_dw(uint32_t a, uint64_t v){
   for (int i=0;i<8;i++) ee_sfile[a+i] &= s[i];                    // NOR: 1->0 only
 }
 #else
-// Native: dispatch on the backing. QSPI reads retry through the driver's reentrancy self-abort the
-// same way USER_read does (the MSC ISR always releases the lock before returning to thread mode).
+// Native: straight to the QSPI chip. Every caller holds a resolved SETTINGS.BIN (ee_avail/ee2_avail
+// gate them all). Reads retry through the driver's reentrancy self-abort the same way USER_read does
+// (the MSC ISR always releases the lock before returning to thread mode).
 static QSPI_STATUS ee_qspi_rd(uint32_t a, void*d, uint32_t n){
   QSPI_STATUS s;
   do { s = QSPI_Read((uint8_t*)d, a, n); } while (s == QSPI_STATUS_LOCKED);
   return s;
 }
 static uint32_t ee_rd32(uint32_t a){
-  if (ee_backing == EE_BK_QSPI){
-    uint32_t v;
-    if (ee_qspi_rd(a, &v, 4) != QSPI_STATUS_OK) return 0;   // read fault reads as garbage -> callers abort, never erase
-    return v;
-  }
-  return *(volatile uint32_t*)a;
+  uint32_t v;
+  if (ee_qspi_rd(a, &v, 4) != QSPI_STATUS_OK) return 0;   // read fault reads as garbage -> callers abort, never erase
+  return v;
 }
 static void ee_rd(uint32_t a, void*d, uint32_t n){
-  if (ee_backing == EE_BK_QSPI){ if (ee_qspi_rd(a, d, n) != QSPI_STATUS_OK) memset(d, 0, n); return; }
-  memcpy(d,(const void*)a,n);
+  if (ee_qspi_rd(a, d, n) != QSPI_STATUS_OK) memset(d, 0, n);
 }
-static void ee_erase(uint32_t a){
-  if (ee_backing == EE_BK_QSPI){ QSPI_Erase_Sector(a); return; }
-  FLASH_EraseInitTypeDef e = {0}; uint32_t err;
-  e.TypeErase = FLASH_TYPEERASE_PAGES; e.NbPages = 1;
-  uint32_t bank_sz = FLASH_BANK_SIZE;                 // RG 512K, RC 128K
-  if (a - FLASH_BASE >= bank_sz){ e.Banks=FLASH_BANK_2; e.Page=(a-FLASH_BASE-bank_sz)/FLASH_PAGE_SIZE; }
-  else { e.Banks=FLASH_BANK_1; e.Page=(a-FLASH_BASE)/FLASH_PAGE_SIZE; }
-  HAL_FLASHEx_Erase(&e,&err);
-}
-static void ee_prog_dw(uint32_t a, uint64_t v){
-  if (ee_backing == EE_BK_QSPI){ uint8_t b[8]; memcpy(b,&v,8); QSPI_Program(b, a, 8); return; }
-  HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, a, v);
-}
+static void ee_erase(uint32_t a){ QSPI_Erase_Sector(a); }
+static void ee_prog_dw(uint32_t a, uint64_t v){ uint8_t b[8]; memcpy(b,&v,8); QSPI_Program(b, a, 8); }
 #endif
 
 static uint16_t ee_crc16(const uint8_t*p, uint32_t n){   // CRC-16-CCITT (poly 0x1021, init 0xFFFF)
@@ -4419,7 +4401,6 @@ static _Bool settings_resolve(void){
   ee_sfile_state = ee_sfile_attached ? (ee_sfile_frag ? 2 : 1) : 0;
   if (ee_sfile_state != 1) return 0;
   ee_page_a = 0x0000u; ee_page_b = 0x1000u;
-  ee_slots = (uint16_t)(EE_QSPI_PGSZ / EE_REC_SZ); ee_pgsz = EE_QSPI_PGSZ;
   ee_backing = EE_BK_QSPI;
   return 1;
 }
@@ -4440,7 +4421,6 @@ static _Bool settings_resolve(void){
     uint32_t base = sect * 4096u;
     if (base + 4u*EE_QSPI_PGSZ > 0x1000000u) { ee_sfile_state = 2; break; } // must fit the 16 MB chip
     ee_page_a = base; ee_page_b = base + EE_QSPI_PGSZ;
-    ee_slots = (uint16_t)(EE_QSPI_PGSZ / EE_REC_SZ); ee_pgsz = EE_QSPI_PGSZ;
     ee_backing = EE_BK_QSPI; ee_sfile_state = 1; ok = 1;
   } while (0);
   f_close(&f);
@@ -4450,25 +4430,17 @@ static _Bool settings_resolve(void){
 static void ee_init_base(void){
   ee_backing = EE_BK_NONE;
 #ifdef __EMSCRIPTEN__
-  settings_resolve();                                // emu IS the RC/QSPI hardware (file attachable)
+  settings_resolve();                                // emu: the same file, attachable/detachable by tests
 #else
-  uint32_t kb  = *(uint16_t*)FLASHSIZE_BASE;      // flash size in KB from the die reg (RG 1024, RC 256)
-  uint32_t top = FLASH_BASE + kb*1024u;
-  ee_page_b = top - FLASH_PAGE_SIZE;
-  ee_page_a = top - 2u*FLASH_PAGE_SIZE;
-  if (ee_page_a >= 0x08040000u){                     // RG: room above the app-CRC region -> unchanged
-    ee_backing = EE_BK_INTERNAL; ee_slots = EE_SLOTS; ee_pgsz = FLASH_PAGE_SIZE;
-  } else {                                           // RC: no internal room -> the QSPI file, if usable
-    fatfs_busy = 1;
-    settings_resolve();
-    fatfs_busy = 0;
-  }
+  fatfs_busy = 1;
+  settings_resolve();                                // no usable file -> stays EE_BK_NONE (RAM-only)
+  fatfs_busy = 0;
 #endif
   ee_avail = (ee_backing != EE_BK_NONE);
   settings_map_seen = settings_map_gen;              // boot mapping is fresh by definition
 }
 static _Bool ee_page_blank(uint32_t base){
-  for (uint32_t o = 0; o < ee_pgsz; o += 4) if (ee_rd32(base + o) != 0xFFFFFFFFu) return 0;
+  for (uint32_t o = 0; o < EE_QSPI_PGSZ; o += 4) if (ee_rd32(base + o) != 0xFFFFFFFFu) return 0;
   return 1;
 }
 // Scan both pages for the highest-generation CRC-valid record; position the append cursor. Shared by
@@ -4480,7 +4452,7 @@ static void ee_scan(_Bool unpack){
   ee_active=ee_page_a; ee_next=0;
   for (int pg=0; pg<2; pg++){
     uint32_t base = pg? ee_page_b : ee_page_a;
-    for (uint16_t s=0; s<ee_slots; s++){
+    for (uint16_t s=0; s<EE_SLOTS; s++){
       uint32_t addr = base + (uint32_t)s*EE_REC_SZ;
       if (ee_rd32(addr) != EE_MAGIC) continue;
       ee_rd(addr, rec, EE_REC_SZ);
@@ -4504,9 +4476,9 @@ static void ee_scan(_Bool unpack){
     }
   }
   // NOR skip-to-blank: never leave the cursor on a non-blank slot (a torn write there would AND-merge
-  // into unpredictable bytes; internal flash would raise PROGERR). Cursor may land == ee_slots ->
-  // the next commit rolls over onto an erased page.
-  while (ee_next < ee_slots && ee_rd32(ee_active + (uint32_t)ee_next*EE_REC_SZ) != 0xFFFFFFFFu) ee_next++;
+  // into unpredictable bytes). Cursor may land == EE_SLOTS -> the next commit rolls over onto an
+  // erased page.
+  while (ee_next < EE_SLOTS && ee_rd32(ee_active + (uint32_t)ee_next*EE_REC_SZ) != 0xFFFFFFFFu) ee_next++;
 }
 // Boot: derive the base, scan both pages, unpack the highest-generation CRC-valid record into ovr.
 void ee_load(void){
@@ -4516,10 +4488,9 @@ void ee_load(void){
   ee_scan(1);
 }
 // "menu_dump = on" over serial: ONE human-readable line reporting whether the on-device override store
-// (menu settings + tempcomp model) is FLASH-BACKED or RAM-only. The store lives in the two flash pages
-// above the app-CRC region (top-2*PAGE): RG silicon (1 MB) has room there and the store survives a
-// power cycle; RC silicon (256 KB) ends exactly at the app-CRC boundary (0x08040000), so ee_avail is 0
-// and every setting is lost on power-off. This one line tells us which without guessing at the die.
+// (menu settings + tempcomp model) is backed by SETTINGS.BIN or RAM-only, and if RAM-only, why. It
+// also reports the die's flash size (RG 1024 KB, RC 256 KB): the store no longer depends on it, but
+// it's the one way to learn which STM32L476 a clock was built with without reading the chip marking.
 // Same CDC/BUSY-retry contract as star_dump_step.
 static void menu_dump_step(void){
   static int      dn = -1;
@@ -4534,9 +4505,8 @@ static void menu_dump_step(void){
 #else
     unsigned kb = *(uint16_t*)FLASHSIZE_BASE;         // die-programmed flash size in KB (RG 1024, RC 256)
 #endif
-    static const char *bk_nm[3] = { "NONE", "INT", "QSPI" };
+    static const char *bk_nm[2] = { "NONE", "QSPI" };
     const char *verdict =
-        (ee_backing == EE_BK_INTERNAL) ? "internal-flash-backed (settings persist)" :
         (ee_backing == EE_BK_QSPI)     ? "QSPI SETTINGS.BIN (settings persist)" :
         (ee_sfile_state == 2)          ? "RAM-ONLY (SETTINGS.BIN fragmented/too small - reformat + recreate it first)" :
                                          "RAM-ONLY (no SETTINGS.BIN on the drive)";
@@ -4607,15 +4577,9 @@ static _Bool ee_commit(void){
   uint8_t rec[EE_REC_SZ];
   fatfs_busy = 1;          // eject-triggered reset must defer across the WHOLE multi-op commit
   if (!ee_sentinel(EE_MAGIC, ee_page_a, ee_page_b, &ee_active, &ee_next)){ fatfs_busy = 0; return 0; }
-#ifndef __EMSCRIPTEN__
-  if (ee_backing == EE_BK_INTERNAL){
-    HAL_FLASH_Unlock();
-    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
-  }
-#endif
-  // Never program a non-blank slot (NOR AND-merges; internal flash PROGERRs): skip past strays.
-  while (ee_next < ee_slots && ee_rd32(ee_active + (uint32_t)ee_next*EE_REC_SZ) != 0xFFFFFFFFu) ee_next++;
-  if (ee_next >= ee_slots){
+  // Never program a non-blank slot (NOR AND-merges): skip past strays.
+  while (ee_next < EE_SLOTS && ee_rd32(ee_active + (uint32_t)ee_next*EE_REC_SZ) != 0xFFFFFFFFu) ee_next++;
+  if (ee_next >= EE_SLOTS){
     uint32_t other = (ee_active==ee_page_a)? ee_page_b : ee_page_a;
     ee_erase(other); ee_active=other; ee_next=0;
   }
@@ -4623,9 +4587,6 @@ static _Bool ee_commit(void){
   ee_pack(rec, ee_gen+1);
   for (uint32_t o=0;o<EE_REC_SZ;o+=8){ uint64_t dw; memcpy(&dw, rec+o, 8); ee_prog_dw(addr+o, dw); }
   ee_gen++; ee_next++;
-#ifndef __EMSCRIPTEN__
-  if (ee_backing == EE_BK_INTERNAL) HAL_FLASH_Lock();
-#endif
   fatfs_busy = 0;
   return 1;
 }
@@ -4645,18 +4606,7 @@ static void ee2_init_base(void){
     ee2_avail = 1;
     return;
   }
-  if (ee_backing == EE_BK_NONE){ ee2_avail = 0; return; }
-#ifndef __EMSCRIPTEN__
-  // EE_BK_INTERNAL (RG): the pair just below the menu store (runtime-derived from the die). MUST land
-  // in bank 2 so a ~20 ms erase runs read-while-write (code executes from bank 1) and never stalls
-  // PPS/SysTick.
-  ee2_page_b = ee_page_a - FLASH_PAGE_SIZE;
-  ee2_page_a = ee_page_a - 2u*FLASH_PAGE_SIZE;
-  uint32_t bank2_base = FLASH_BASE + FLASH_BANK_SIZE;                  // RG: 0x08080000
-  ee2_avail = (ee2_page_a >= 0x08040000u) && (ee2_page_a >= bank2_base);   // above app-CRC AND in bank 2
-#else
-  ee2_avail = 0;   // emu models the RC/QSPI hardware; no internal-flash pair exists there
-#endif
+  ee2_avail = 0;                                     // no usable SETTINGS.BIN -> RAM-only, like the menu store
 }
 static void tc_pack(uint8_t*r, uint32_t gen){
   memset(r,0,EE_REC_SZ);
@@ -4694,7 +4644,7 @@ static void ee2_scan(_Bool unpack){
   ee2_active=ee2_page_a; ee2_next=0;
   for (int pg=0; pg<2; pg++){
     uint32_t base = pg? ee2_page_b : ee2_page_a;
-    for (uint16_t s=0; s<ee_slots; s++){
+    for (uint16_t s=0; s<EE_SLOTS; s++){
       uint32_t addr = base + (uint32_t)s*EE_REC_SZ;
       if (ee_rd32(addr) != EE2_MAGIC) continue;
       ee_rd(addr, rec, EE_REC_SZ);
@@ -4714,7 +4664,7 @@ static void ee2_scan(_Bool unpack){
       ee2_active=ee2_page_a; ee2_next=0;
     }
   }
-  while (ee2_next < ee_slots && ee_rd32(ee2_active + (uint32_t)ee2_next*EE_REC_SZ) != 0xFFFFFFFFu) ee2_next++;
+  while (ee2_next < EE_SLOTS && ee_rd32(ee2_active + (uint32_t)ee2_next*EE_REC_SZ) != 0xFFFFFFFFu) ee2_next++;
 }
 void ee2_load(void){
   ee2_init_base();
@@ -4729,11 +4679,8 @@ static _Bool ee2_commit(void){
   uint8_t rec[EE_REC_SZ];
   fatfs_busy = 1;
   if (!ee_sentinel(EE2_MAGIC, ee2_page_a, ee2_page_b, &ee2_active, &ee2_next)){ fatfs_busy = 0; return 0; }
-#ifndef __EMSCRIPTEN__
-  if (ee_backing == EE_BK_INTERNAL){ HAL_FLASH_Unlock(); __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS); }
-#endif
-  while (ee2_next < ee_slots && ee_rd32(ee2_active + (uint32_t)ee2_next*EE_REC_SZ) != 0xFFFFFFFFu) ee2_next++;
-  if (ee2_next >= ee_slots){
+  while (ee2_next < EE_SLOTS && ee_rd32(ee2_active + (uint32_t)ee2_next*EE_REC_SZ) != 0xFFFFFFFFu) ee2_next++;
+  if (ee2_next >= EE_SLOTS){
     uint32_t other = (ee2_active==ee2_page_a)? ee2_page_b : ee2_page_a;
     ee_erase(other); ee2_active=other; ee2_next=0;
   }
@@ -4741,9 +4688,6 @@ static _Bool ee2_commit(void){
   tc_pack(rec, ee2_gen+1);
   for (uint32_t o=0;o<EE_REC_SZ;o+=8){ uint64_t dw; memcpy(&dw, rec+o, 8); ee_prog_dw(addr+o, dw); }
   ee2_gen++; ee2_next++;
-#ifndef __EMSCRIPTEN__
-  if (ee_backing == EE_BK_INTERNAL) HAL_FLASH_Lock();
-#endif
   fatfs_busy = 0;
   tc_unpack(rec);          // shadow := just-persisted model
   return 1;
@@ -4856,13 +4800,7 @@ static void tc_forget_step(void){
   tc2.valid = 0; tc_model_dirty = 0;
   if (!ee2_avail) return;
   fatfs_busy = 1;
-#ifndef __EMSCRIPTEN__
-  if (ee_backing == EE_BK_INTERNAL){ HAL_FLASH_Unlock(); __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS); }
-#endif
   ee_erase(ee2_page_a); ee_erase(ee2_page_b);
-#ifndef __EMSCRIPTEN__
-  if (ee_backing == EE_BK_INTERNAL) HAL_FLASH_Lock();
-#endif
   fatfs_busy = 0;
   ee2_active = ee2_page_a; ee2_next = 0; ee2_gen = 0;
 }
@@ -4927,21 +4865,12 @@ static void factory_reset_step(void){
   if (!factory_reset_pending) return;
   if (ee_avail && !settings_mapping_ok()) return;   // QSPI: never erase against a stale mapping; retry
   factory_reset_pending = 0;
-  memset(&ovr, 0, sizeof ovr);          // drop the RAM override store (also handles the RC no-flash case)
+  memset(&ovr, 0, sizeof ovr);          // drop the RAM override store (also covers the no-SETTINGS.BIN case)
   menu_dirty = 0;
   if (ee_avail){
     fatfs_busy = 1;
-#ifndef __EMSCRIPTEN__
-    if (ee_backing == EE_BK_INTERNAL){
-      HAL_FLASH_Unlock();
-      __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
-    }
-#endif
     ee_erase(ee_page_a);
     ee_erase(ee_page_b);
-#ifndef __EMSCRIPTEN__
-    if (ee_backing == EE_BK_INTERNAL) HAL_FLASH_Lock();
-#endif
     fatfs_busy = 0;
     ee_active = ee_page_a; ee_next = 0; ee_gen = 0;
   }

@@ -317,11 +317,11 @@ temperature coverage (the model is never extrapolated beyond it); `tc_dump` prin
 round-trips. Over serial, send the coefficients first and `tc_seed = on` last — the order `tc_dump`
 prints.
 
-With `tc_persist = on` the learned model is also saved automatically to the settings store (internal
-flash on 1 MB parts, `SETTINGS.BIN` on 256 KB parts) and warm-starts itself on every boot — so a
-pasted seed block is no longer required for day-to-day power cycles. It is still worth keeping in
-`config.txt` as the recovery point: a factory reset (or losing `SETTINGS.BIN`) wipes the stored
-model, and the file's block is what re-seeds the clock immediately afterwards.
+With `tc_persist = on` the learned model is also saved automatically to the settings store in
+`SETTINGS.BIN` and warm-starts itself on every boot — so a pasted seed block is no longer required
+for day-to-day power cycles. It is still worth keeping in `config.txt` as the recovery point: a
+factory reset (or losing `SETTINGS.BIN`) wipes the stored model, and the file's block is what
+re-seeds the clock immediately afterwards.
 
 ```
 tc_persist = on
@@ -332,9 +332,8 @@ and the menu settings), so the very first holdover after a power-up is already c
 waiting to re-learn. Only a well-supported model is saved — enough samples, real temperature
 coverage, a believable fit — at most once every 30 minutes and only when it has moved meaningfully,
 so the flash lasts decades. On boot the stored model loads as an evolving seed; `config.txt` still
-wins per-key, so pasted coefficients override it. On 1M-flash clocks the store lives in internal
-flash; on 256K-flash clocks it lives inside `SETTINGS.BIN` (see Flash memory files below). Default
-off.
+wins per-key, so pasted coefficients override it. The store lives inside `SETTINGS.BIN` (see Flash
+memory files below). Default off.
 
 ## USB serial output
 
@@ -411,10 +410,11 @@ $PMSTAR,<n>,<name>,<sec>,<alt>,<dir>,...*CC
 ```
 menu_dump = on
 ```
-Prints one line reporting where the on-device menu settings live: internal-flash-backed (settings
-persist), QSPI `SETTINGS.BIN` (settings persist), or RAM-only with the reason (no `SETTINGS.BIN`, or
-the file is fragmented or too small). Useful for checking whether your settings will survive a power
-cycle without guessing which silicon your clock was built with.
+Prints one line reporting whether the on-device menu settings persist in `SETTINGS.BIN` or are
+RAM-only, and if RAM-only, why (no `SETTINGS.BIN`, or the file is fragmented or too small). Useful
+for checking whether your settings will survive a power cycle. The line also gives the
+microcontroller's flash size, `flash=256KB` for an STM32L476RC or `flash=1024KB` for an STM32L476RG,
+which is the easiest way to find out which one your clock was built with.
 
 ```
 factory_reset = on
@@ -554,17 +554,10 @@ your settings.
 
 ### Where settings live
 
-Menu changes take effect immediately and are written to persistent storage shortly after you return
-to the clock face, so they survive power-off. Where they're stored depends on the silicon your clock
-was built with:
-
-- **1M-flash parts (STM32L476RG):** two spare pages of internal flash, above the region covered by
-  the firmware CRC. Nothing on the USB drive is involved.
-- **256K-flash parts (STM32L476RC):** there is no spare internal flash, so the store lives inside
-  `SETTINGS.BIN` on the USB drive (see below). If that file is missing or unusable, settings still
-  work but are RAM-only — lost at power-off.
-
-`menu_dump = on` over serial reports which of these your clock is doing.
+Menu changes take effect immediately and are written to `SETTINGS.BIN` on the USB drive (see below)
+shortly after you return to the clock face, so they survive power-off. If that file is missing or
+unusable, settings still work but are RAM-only, lost at power-off. `menu_dump = on` over serial
+reports which of these your clock is doing.
 
 Only the settings you actually changed are recorded, so `config.txt` remains the source of truth for
 everything else. When both have an opinion about the same key, the rule is: a key defined in
@@ -580,10 +573,9 @@ Two new files join `config.txt`, `tzrules.bin` and `tzmap.bin` on the USB drive.
 
 ### SETTINGS.BIN
 
-On clocks built with 256K-flash silicon the firmware keeps its settings store (on-device menu changes
-plus the retained temperature-compensation model) inside `SETTINGS.BIN`: a 16 KiB file whose four
-4 KiB clusters the firmware rewrites in place through the flash driver, without ever touching the FAT
-metadata. Rules:
+The firmware keeps its settings store (on-device menu changes plus the retained temperature-
+compensation model) inside `SETTINGS.BIN`: a 16 KiB file whose four 4 KiB clusters the firmware
+rewrites in place through the flash driver, without ever touching the FAT metadata. Rules:
 
 - Create it **first** on a freshly formatted volume, so it is contiguous — the firmware verifies
   contiguity at boot and falls back to RAM-only settings (lost at power-off) if the file is
@@ -596,8 +588,11 @@ metadata. Rules:
   re-initialises it (stored settings reset to the live values; nothing else on the volume is
   touched).
 
-1M-flash clocks ignore the file entirely and use internal flash. `menu_dump = on` over serial tells
-you which store is in use and, if it's RAM-only, why.
+Every clock uses this file, whichever STM32L476 it was built with. Earlier betas kept settings in
+internal flash on 1M-flash (STM32L476RG) clocks instead; this build doesn't read those, so an RG
+clock starts from `config.txt` after upgrading: re-apply any menu changes, and a persisted
+temperature model re-learns. `menu_dump = on` over serial tells you whether the store is in use
+and, if it's RAM-only, why.
 
 ### STARS.BIN
 
