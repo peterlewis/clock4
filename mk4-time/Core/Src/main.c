@@ -4737,6 +4737,7 @@ void tc_seed_from_flash(void){
 // clock does not immediately rewrite the record it just loaded.
 void tc_persist_after_seed(void){
   if (!tc_persist_seeded) return;
+  tc_persist_seeded = 0;      // readConfigFile ends with this tail on every reload, not just at boot
   if (tc_hse_prior > 2) tc_hse_prior = 2;
   if (tc_lse_prior > 2) tc_lse_prior = 2;
   if (tc2.n_hse) tc_n_hse = tc2.n_hse;
