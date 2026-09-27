@@ -252,15 +252,16 @@ void menu_isr_event(uint8_t evt){
 static struct {
   _Bool    valid;
   uint16_t stamp_fdate, stamp_ftime;   // config.txt mtime when the override was made
-  uint16_t simple_mask;                // bit per KID 1..10 (u16: KID_MATRIX_FREQ=8..KID_BALANCE=10 overflow a u8)
+  uint16_t simple_mask;                // bit per persisted KID (u16: KID_MATRIX_FREQ=8 and up overflow a u8)
   int16_t  brightness; uint8_t colon, alt_colon; uint16_t page_ms;
   uint8_t  sig_fade, pps, nmea;
   uint32_t matrix_freq;                // KID_MATRIX_FREQ (u32: 100000 > u16)
   uint8_t  tc;                         // KID_TEMPCOMP: 1 = learn+apply+persist armed
   uint8_t  bal;                        // KID_BALANCE: 1 = seg+colon balance AUTO
   uint64_t modes_mask, modes_val;      // bit per MODE_* ordinal (u64: MODE_STAR=32 now overflows a u32)
+  uint8_t  brit;                       // KID_BRIT: 1 = the 1 Hz $PMBRIT dimmer report (brightness_report)
 } ovr;
-static uint16_t cfg_simple_defined;    // bit per KID 1..10 set by config.txt this load
+static uint16_t cfg_simple_defined;    // bit per KID set by config.txt this load
 static uint64_t cfg_modes_defined;     // bit per MODE_* ordinal set by config.txt this load
 static _Bool    menu_dirty = 0;        // a menu edit is awaiting flash commit
 
@@ -1794,7 +1795,7 @@ static uint8_t   pmloop_maxtag = 0;
     if (g_ > pmloop_max) { pmloop_max = g_; pmloop_maxtag = pmloop_lasttag; } \
     pmloop_last = t_; pmloop_lasttag = (n); } while (0)
 
-// ---- $PMBRIT: the auto-dimmer's operating point (`brightness_report = on` over serial or config) -
+// ---- $PMBRIT: the auto-dimmer's operating point (`brightness_report = on`, or SYS > BRT MSG) -----
 // Once per second: the ambient reading the brightness loop last sampled, the display brightness it
 // chose, what chose it, and the two balance values that follow it, so a host can place the clock on
 // its BS curve live. Nothing else on USB carries the sensor or the rail: MODE_DEBUG_BRIGHTNESS shows
@@ -2245,6 +2246,7 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     loop_diag = truthy(value) ? 1 : 0;   // 1 Hz $PMLOOP main-loop latency diagnostic
   } else if (strcasecmp(key, "brightness_report") == 0) {
     brightness_report = truthy(value) ? 1 : 0;   // 1 Hz $PMBRIT auto-dimmer operating point
+    if (!from_serial) cfg_simple_defined |= (1u<<KID_BRIT);
   } else if (strcasecmp(key, "menu_dump") == 0) {
     if (from_serial && truthy(value)) menu_dump_pending = 1;  // serial-only: report whether the store is flash-backed or RAM-only
   } else if (strcasecmp(key, "factory_reset") == 0) {
@@ -4359,10 +4361,10 @@ static uint16_t ee_crc16(const uint8_t*p, uint32_t n){   // CRC-16-CCITT (poly 0
 // Record byte layout: 0 magic u32 | 4 gen u32 | 8 schema u16 | 10 fdate u16 | 12 ftime u16 |
 // 14 simple_mask u16 | 16 modes_mask_lo u32 | 20 modes_val_lo u32 | 24 brightness i16 | 26 colon u8 |
 // 27 alt_colon u8 | 28 page_ms u16 | 30 sig_fade u8 | 31 pps u8 | 32 nmea u8 | 33 matrix_freq u32 | 37 tc u8 | 38 bal u8 | 39 rsvd |
-// 40 modes_mask_hi u32 | 44 modes_val_hi u32 | 48..61 rsvd | 62 crc16.
-// (bytes 15, 33..36, 37, 38, 39 and 40..47 were zeroed padding in every prior record, so widening simple_mask
-//  u8->u16, adding matrix_freq u32 + tc u8 + bal u8, and splitting the mode masks u32->u64 with their high
-//  words at 40/44 all round-trip old records with those fields clear -> modes >=32 read disabled; EE_SCHEMA stays 1.)
+// 40 modes_mask_hi u32 | 44 modes_val_hi u32 | 48 brit u8 | 49..61 rsvd | 62 crc16.
+// (bytes 15, 33..36, 37, 38, 39, 40..47 and 48 were zeroed padding in every prior record, so widening simple_mask
+//  u8->u16, adding matrix_freq u32 + tc u8 + bal u8 + brit u8, and splitting the mode masks u32->u64 with their
+//  high words at 40/44 all round-trip old records with those fields clear -> modes >=32 read disabled; EE_SCHEMA stays 1.)
 static void ee_pack(uint8_t*r, uint32_t gen){
   memset(r,0,EE_REC_SZ);
   uint32_t mg=EE_MAGIC; memcpy(r+0,&mg,4); memcpy(r+4,&gen,4);
@@ -4376,6 +4378,7 @@ static void ee_pack(uint8_t*r, uint32_t gen){
   memcpy(r+28,&ovr.page_ms,2); r[30]=ovr.sig_fade; r[31]=ovr.pps; r[32]=ovr.nmea;
   memcpy(r+33,&ovr.matrix_freq,4); r[37]=ovr.tc; r[38]=ovr.bal;
   memcpy(r+40,&mm_hi,4); memcpy(r+44,&mv_hi,4);
+  r[48]=ovr.brit;
   uint16_t crc=ee_crc16(r,62); memcpy(r+62,&crc,2);
 }
 static void ee_unpack(const uint8_t*r){
@@ -4383,7 +4386,7 @@ static void ee_unpack(const uint8_t*r){
   memcpy(&ovr.simple_mask,r+14,2);
   uint32_t mm_lo,mv_lo,mm_hi,mv_hi;
   memcpy(&mm_lo,r+16,4); memcpy(&mv_lo,r+20,4);
-  memcpy(&mm_hi,r+40,4); memcpy(&mv_hi,r+44,4);
+  memcpy(&mm_hi,r+40,4); memcpy(&mv_hi,r+44,4); ovr.brit=r[48];
   ovr.modes_mask=((uint64_t)mm_hi<<32)|mm_lo; ovr.modes_val=((uint64_t)mv_hi<<32)|mv_lo;
   memcpy(&ovr.brightness,r+24,2); ovr.colon=r[26]; ovr.alt_colon=r[27];
   memcpy(&ovr.page_ms,r+28,2); ovr.sig_fade=r[30]; ovr.pps=r[31]; ovr.nmea=r[32];
@@ -4819,6 +4822,7 @@ void menu_apply_overrides(void){
   OVR_S(KID_PAGE_MS,    config.page_ms=ovr.page_ms)
   OVR_S(KID_SIG_FADE,   significance_fade=ovr.sig_fade)
   OVR_S(KID_PPS,        pps_ts_enabled=ovr.pps)
+  OVR_S(KID_BRIT,       brightness_report=ovr.brit?1:0)
   OVR_S(KID_NMEA,       nmea_cdc_level=ovr.nmea)
   OVR_S(KID_MATRIX_FREQ,setDisplayFreq(ovr.matrix_freq))   // clamping setter (never ARR-direct) -> a bad stored value can't brick
   OVR_S(KID_TEMPCOMP,   tc_learn=tc_apply=tc_persist=ovr.tc?1:0)
@@ -4849,6 +4853,7 @@ static void menu_record_key(uint8_t key_id, int32_t v){
     case KID_PAGE_MS:    ovr.page_ms=(uint16_t)v; break;
     case KID_SIG_FADE:   ovr.sig_fade=(uint8_t)v; break;
     case KID_PPS:        ovr.pps=(uint8_t)v; break;
+    case KID_BRIT:       ovr.brit=(uint8_t)(v?1:0); break;
     case KID_NMEA:       ovr.nmea=(uint8_t)v; break;
     case KID_MATRIX_FREQ:ovr.matrix_freq=(uint32_t)v; break;
     case KID_TEMPCOMP:   ovr.tc=(uint8_t)(v?1:0); break;
@@ -4934,6 +4939,8 @@ static int32_t g_sig   (const MItem*m){ (void)m; return significance_fade; }
 static void    s_sig   (const MItem*m,int32_t v){ (void)m; significance_fade=v?1:0; }
 static int32_t g_pps   (const MItem*m){ (void)m; return pps_ts_enabled; }
 static void    s_pps   (const MItem*m,int32_t v){ (void)m; pps_ts_enabled=v?1:0; }
+static int32_t g_brit  (const MItem*m){ (void)m; return brightness_report; }
+static void    s_brit  (const MItem*m,int32_t v){ (void)m; brightness_report=v?1:0; }
 static int32_t g_nmea  (const MItem*m){ (void)m; return nmea_cdc_level; }
 static void    s_nmea  (const MItem*m,int32_t v){ (void)m; nmea_cdc_level=(uint8_t)v; }
 static int32_t g_matrix(const MItem*m){ (void)m; return (int32_t)matrix_freq_hz; }
@@ -4982,6 +4989,7 @@ static const MItem menu_items[] = {
   { KID_PAGE_MS,    MIT_STEP,  "PAGE",     250,60000,250,NULL,   g_page,   s_page,   SEC_DISP },   // shows seconds; "MS"/unit-S both misread on 7-seg
   { KID_SIG_FADE,   MIT_TOGGLE,"SIG FADE", 0,1,1,      NULL,     g_sig,    s_sig,    SEC_DISP },
   { KID_PPS,        MIT_TOGGLE,"PPS MSG",  0,1,1,      NULL,     g_pps,    s_pps,    SEC_SYS  },   // the $PMTXTS timestamp sentence, NOT a 1PPS hardware output
+  { KID_BRIT,       MIT_TOGGLE,"BRT MSG",  0,1,1,      NULL,     g_brit,   s_brit,   SEC_SYS  },   // the $PMBRIT dimmer report (brightness_report)
   { KID_NMEA,       MIT_ENUM,  "NMEA",     0,2,1,      en_nmea,  g_nmea,   s_nmea,   SEC_SYS  },
   { KID_MATRIX_FREQ,MIT_STEP,  "MATRIX",   8000,100000,1000,NULL,g_matrix, s_matrix, SEC_SYS  },   // menu floor 8000 (flicker); config MATRIX_FREQUENCY reaches the 1000 hw floor
   { KID_RESET,      MIT_ACTION,"RESET",    0,0,0,       NULL,     g_reset,  s_reset,  SEC_SYS  },   // factory-reset the on-device settings (confirm required)

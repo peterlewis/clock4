@@ -225,8 +225,8 @@ brightness_report = on
 Outputs one `$PMBRIT` sentence over USB serial each second, reporting where the automatic dimmer
 is: the ambient light reading, the display brightness it chose, and what chose it. A host can then
 place the clock on its `BS` brightness curve live, which the firmware otherwise shows only on its own
-date row, in the brightness debug mode. Default off. The sentence format is documented under USB
-serial output below.
+date row, in the brightness debug mode. Default off. Also settable from the menu (SYS > BRT MSG). The
+sentence format is documented under USB serial output below.
 
 ### colon_alt_mode
 
@@ -469,7 +469,7 @@ treat the sentence as 9 fields and ignore any extras.
 
 ### The $PMBRIT brightness sentence
 
-With `brightness_report = on`, once a second:
+With `brightness_report = on` (or SYS > BRT MSG in the menu), once a second:
 
 ```
 $PMBRIT,<adc>,<dac>,<src>,<segk>,<colon>*CC
@@ -545,10 +545,10 @@ mode row.
 enable; the read-out is the row beside it), `SATVIEW`, `ADEV`, `TC DATA` (the `MODE_TEMPCOMP`
 read-out), `FW CRC`, `VBAT`, plus a read-only `PPS` row.
 
-**SYS** — system: `PPS MSG` (the `$PMTXTS` timestamp sentence — not a hardware 1PPS output), `NMEA`
-(`ALL` / `RMC` / `NONE`), `MATRIX` (the matrix frequency in kHz, floored at 8 kHz here to keep the
-display flicker-free while you scrub; `config.txt` can still reach the 1 kHz hardware floor), and
-`RESET` (factory reset, below).
+**SYS** — system: `PPS MSG` (the `$PMTXTS` timestamp sentence — not a hardware 1PPS output), `BRT MSG`
+(the `$PMBRIT` dimmer report), `NMEA` (`ALL` / `RMC` / `NONE`), `MATRIX` (the matrix frequency in kHz,
+floored at 8 kHz here to keep the display flicker-free while you scrub; `config.txt` can still reach the
+1 kHz hardware floor), and `RESET` (factory reset, below).
 
 ### Editing values
 
