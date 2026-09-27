@@ -144,16 +144,12 @@ MODE_ZONE2 = enabled
 zone2 = America/New_York
 ```
 
-A second civil timezone on the date row, while the time row keeps local time. The mode alternates on
-a fixed eight-second cycle: two seconds of label, then six seconds of the remote clock. It is not one
-of the paged modes, so `page_ms` has no effect on it.
-
-The label page shows the tail of the IANA name after the last `/` (`America/New_York` reads
-`New_York`), or a fixed offset verbatim, truncated to the row's ten characters. The clock page reads
-`HH:MM:SS` and ticks with the time row, with a `+1` or `-1` marker appended when the remote calendar
-day is ahead of or behind the local one (`19:04:37-1` is the previous day there). The reading is
-computed from GPS-disciplined UTC and the zone's own transition table on every repaint, so it follows
-that zone's daylight-saving changes on their own dates; no offset is stored.
+A second civil timezone as a live clock on the time row, the way `MODE_LST` and `MODE_SOLAR` show
+their timebases: the big digits tick the other zone's time, the date row keeps the local civil date,
+and the colons switch to `colon_alt_mode`, so the row can't be mistaken for local time. The reading is
+GPS-disciplined UTC plus the zone's offset from its own transition table, taken every second, so it
+follows that zone's daylight-saving changes on their own dates; no offset is stored. The sub-second
+digits and the holdover dashing behave exactly as they do on the civil clock.
 
 `zone2` takes the same format as `ZONE_OVERRIDE`, and sits beside it in `config.txt`. An IANA name is
 resolved from the same `tzrules.bin` the main zone uses, into a second transition table held
@@ -161,7 +157,7 @@ alongside it. A literal `UTC`, `GMT`, `+HH:MM` or `-HH:MM` (`+05:30`, or `-8` wi
 off) resolves immediately without reading the drive, and has no daylight saving; offsets beyond 14
 hours are rejected. The mode needs no position.
 
-Leave `zone2` unset, or name a zone `tzrules.bin` does not carry, and the row shows a single dash.
+Leave `zone2` unset, or name a zone `tzrules.bin` does not carry, and the time row shows dashes.
 `MODE_ZONE2` is also on the menu (CAL > ZONE 2); the zone target is config-only.
 
 ## New configuration parameters
@@ -261,7 +257,7 @@ sentence format is documented under USB serial output below.
 colon_alt_mode = alt_sawtooth
 ```
 
-The colon animation used while an alternate-timebase mode (`MODE_LST` / `MODE_SOLAR`) is displayed,
+The colon animation used while an alternate-timebase mode (`MODE_LST`, `MODE_SOLAR`, `MODE_ZONE2`) is displayed,
 so those can never be mistaken for civil time at a glance. Takes the same names as `colon_mode`. If
 you don't set it, the firmware guarantees it differs from your civil colon automatically (defaulting
 to alt_sawtooth, or toggle if that's your civil choice); setting it explicitly disables that

@@ -11,11 +11,11 @@ MATRIX_FREQUENCY = 20000
 # For UTC use Etc/UTC
 #ZONE_OVERRIDE = America/New_York
 
-# Second timezone, shown on the date row by MODE_ZONE2 (see below). Same format as
+# Second timezone, shown as a live clock on the time row by MODE_ZONE2 (see below). Same format as
 # ZONE_OVERRIDE: an IANA name (e.g. America/New_York) follows full daylight-saving via
 # the same TZRULES.BIN/TZMAP.BIN the main zone uses, or a fixed offset — UTC, +HH:MM,
 # -HH:MM — resolves immediately without the SD card (no DST). Leave unset for no second
-# zone (the mode then shows "----").
+# zone (the mode then shows dashes).
 #zone2 = America/New_York
 
 
@@ -248,14 +248,14 @@ MODE_SOLAR = disabled
 # (Companion serial command: "adev_dump = on" prints the whole curve as $PMADEV.)
 MODE_ADEV = disabled
 
-# Second civil timezone on the date row: pages a label screen then HH:MM:SS, with a
-# +1/-1 marker when that zone is a day ahead/behind the local one. Set which zone with
-# the `zone2` key near the top of this file (by the ZONE_OVERRIDE section); shows "----"
-# until it's set. This enable toggle is also on the on-device menu; the zone target is
-# config-only.
+# Second civil timezone as a live clock on the time row, like MODE_LST / MODE_SOLAR: the big
+# digits tick that zone's time, the date row keeps your local date, and the colons take
+# colon_alt_mode so it never reads as local time. Set which zone with the `zone2` key near the
+# top of this file (by the ZONE_OVERRIDE section); the time row shows dashes until it's set.
+# This enable toggle is also on the on-device menu; the zone target is config-only.
 MODE_ZONE2 = disabled
 
-# Colon animation while an alternate-timebase mode (MODE_LST / MODE_SOLAR) is shown, so
+# Colon animation while an alternate-timebase mode (MODE_LST / MODE_SOLAR / MODE_ZONE2) is shown, so
 # it can never be mistaken for civil time at a glance — solar especially, which can sit
 # within minutes of civil. Same names as colon_mode; automatically kept different from
 # your civil colon unless you explicitly set them equal here. Leave commented to keep the

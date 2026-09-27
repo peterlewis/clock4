@@ -214,10 +214,13 @@ uint32_t LPTIM1_high;
 uint8_t displayMode = 0, countMode = 0, colonMode = 0;
 // Civil vs alternate-timebase colon animation: colonMode is the ACTIVE selection that
 // loadColonAnimation() renders; the per-context choices live here and applyColonForMode()
-// swaps between them. The sidereal default must stay visually distinct from civil so
-// MODE_LST/MODE_SOLAR can never masquerade as civil time.
+// swaps between them. The sidereal default must stay visually distinct from civil so an
+// alternate-timebase mode can never masquerade as civil time.
 uint8_t colonModeCivil = 0;
 uint8_t colonModeAlt = COLON_MODE_ALT_SAWTOOTH;
+// The alternate-timebase modes: the time row ticks another clock (sidereal, apparent solar, or the
+// ZONE 2 civil time), the date row keeps the local civil date, and the colons take colon_alt_mode.
+#define is_alt_mode(m) ((m) == MODE_LST || (m) == MODE_SOLAR || (m) == MODE_ZONE2)
 _Bool colonAltExplicit = 0;    // user explicitly set colon_alt_mode
 // §3.5 colon context-preview: while a colon-animation item is being EDITED, force the value under the
 // cursor onto the real colons regardless of the display context (so ALTCOLON is visible even from a
@@ -729,6 +732,7 @@ void sendDate( _Bool now ){
   default:
   case MODE_LST:       // alt-timebase modes keep the civil date on the date row —
   case MODE_SOLAR:   // the bottom row stays an unambiguous civil anchor
+  case MODE_ZONE2:
   case MODE_ISO8601_STD:
     uart2_tx_buffer[1] ='2';
     uart2_tx_buffer[2] ='0';
@@ -1092,26 +1096,6 @@ void sendDate( _Bool now ){
                   lat ? "LAT" : "LON", h < 0 ? '-' : ' ', a2 / 100, a2 % 100);
     }
     break;
-  case MODE_ZONE2: {
-    // A second civil timezone on the date row. The time is computed from GPS-disciplined UTC +
-    // the on-device tzrules.bin, so it stays DST-correct forever (never a hardcoded offset).
-    if (!loadedZone2[0]) { uart2_tx_buffer[1]='-'; i=1; break; }   // unset / unresolved -> dashes
-    if (currentTime % 8 < 2) {                                     // ~2s of every 8: the city / zone label
-      const char *lbl = loadedZone2, *s = loadedZone2;            // IANA tail after '/', or the literal verbatim
-      while (*s) { if (*s=='/') lbl = s+1; s++; }
-      i = snprintf((char*)&uart2_tx_buffer[1], 11, "%s", lbl);
-      if (i > 10) i = 10;
-    } else {                                                       // the live remote clock (ticks on each per-second repaint)
-      long rsec = (long)currentTime + zone2_offset_at(currentTime);
-      long lsec = (long)currentTime + currentOffset;
-      long sod  = ((rsec % 86400) + 86400) % 86400;                // 0..86399 second-of-day (defensive against negatives)
-      int  dd   = (int)(rsec/86400 - lsec/86400);                  // remote vs local calendar day: -1 / 0 / +1
-      i = sprintf((char*)&uart2_tx_buffer[1], "%02d:%02d:%02d%s",
-                  (int)(sod/3600), (int)((sod/60)%60), (int)(sod%60),
-                  dd>0 ? "+1" : dd<0 ? "-1" : "");
-    }
-    break;
-  }
   case MODE_DARK: {
     // The observing-session twilight ladder, paged: headline countdown to astronomical darkness, then
     // civil / nautical / astronomical dusk times and the astronomical dawn (dark ends). Honest at the
@@ -1223,8 +1207,8 @@ void setNextCountdown(time_t nextTime){
   next7seg.c = cLut[seconds % 10];
 }
 
-// --- Alternate timebase (MODE_LST / MODE_SOLAR) ------------------------------------------
-// The TIME ROW ticks Local Sidereal Time or apparent solar time. Heavy double
+// --- Alternate timebase (MODE_LST / MODE_SOLAR / MODE_ZONE2) -----------------------------
+// The TIME ROW ticks Local Sidereal Time, apparent solar time, or the ZONE 2 civil time. The
 // math runs in THREAD context once per second (alt_update), staging the reading for the
 // coming civil boundary; the SysTick_Alt_* handlers latch it at the .900 prep mark. The
 // display is quantized to civil second boundaries — value = floor(alt time at the boundary),
@@ -1236,7 +1220,7 @@ static volatile struct {
   uint32_t for_time;            // civil epoch this reading is the floor of; 0 = invalid
 } alt_stage;
 static uint8_t alt_hh, alt_mm, alt_ss;   // ISR-owned: what the row currently shows
-static volatile _Bool alt_have_pos = 0;
+static volatile _Bool alt_have_pos = 0;     // the timebase is computable: a position (LST/SOLAR), a resolved zone (ZONE 2)
 static volatile _Bool alt_seed_pending = 0;  // mode entered: thread must seed the row
 static volatile uint8_t alt_gen = 0;         // bumped on mode entry; cancels in-flight staging
 
@@ -1272,6 +1256,13 @@ static volatile uint8_t alt_gen = 0;         // bumped on mode entry; cancels in
 
 // Compute floor-HH:MM:SS of the alternate time at `when` (thread context only: doubles).
 static _Bool alt_compute(uint32_t when, uint8_t *hh, uint8_t *mm, uint8_t *ss){
+  if (displayMode == MODE_ZONE2) {         // whole-second offset from civil: integer, needs no position
+    if (!loadedZone2[0]) return 0;         // unset / unresolved -> dashed until the zone loads
+    long t = (long)when + zone2_offset_at((time_t)when);
+    long sod = ((t % 86400L) + 86400L) % 86400L;
+    *hh = (uint8_t)(sod / 3600); *mm = (uint8_t)((sod / 60) % 60); *ss = (uint8_t)(sod % 60);
+    return 1;
+  }
   float lat = latitude, lon = longitude;   // one consistent snapshot (astro_update pattern)
   if (!astro_pos_ok(lat, lon)) return 0;
   double hours = (displayMode == MODE_LST)
@@ -1296,7 +1287,7 @@ static _Bool alt_compute(uint32_t when, uint8_t *hh, uint8_t *mm, uint8_t *ss){
 // A generation counter cancels any in-flight computation when the mode flips mid-pass, so
 // a stale timebase can never be stamped as valid.
 void alt_update(void){
-  if (displayMode != MODE_LST && displayMode != MODE_SOLAR) return;
+  if (!is_alt_mode(displayMode)) return;
 
   uint8_t gen = alt_gen;                 // snapshot: mode flips abort the publish below
 
@@ -2222,7 +2213,7 @@ void loadColonAnimation(void){
 void applyColonForMode(void){
   uint8_t want = (colon_preview != 0xFF)                         // §3.5: an editor is previewing a choice
                ? colon_preview
-               : (displayMode == MODE_LST || displayMode == MODE_SOLAR)
+               : is_alt_mode(displayMode)
                ? colonModeAlt : colonModeCivil;
   if (want != colonMode) {
     colonMode = want;
@@ -2439,7 +2430,7 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
 
   } else if (strcasecmp(key, "colon_alt_mode") == 0) {
 
-    colonModeAlt = parseColonName(value);   // shared by MODE_LST and MODE_SOLAR ("COLONALT" in the menu)
+    colonModeAlt = parseColonName(value);   // shared by the alternate-timebase modes (ACOLON in the menu)
     colonAltExplicit = 1;
     if (!from_serial) cfg_simple_defined |= (1u<<KID_COLON_ALT);
 
@@ -4115,7 +4106,7 @@ void SysTick_CountDown_P0(void)
   }
 }
 
-// Alternate-timebase handlers (MODE_LST / MODE_SOLAR): identical to the CountUp family —
+// Alternate-timebase handlers (MODE_LST / MODE_SOLAR / MODE_ZONE2): identical to the CountUp family —
 // same cascade, same sub-second painting, same precision ladder — except the .900 prep
 // overlays the staged alternate HH:MM:SS onto next7seg (see alt_prep_next).
 void SysTick_Alt_P3(void)
@@ -4550,7 +4541,7 @@ void nextMode(_Bool reverse){
     buffer_c[3].high &= ~cSegDP;
   }
   if ( displayMode == MODE_ISO_WEEK || justExited(MODE_COUNTDOWN)
-       || justExited(MODE_LST) || justExited(MODE_SOLAR)) {
+       || justExited(MODE_LST) || justExited(MODE_SOLAR) || justExited(MODE_ZONE2)) {
     // If we exit countdown/alt mode at .9 seconds
     // it will show the wrong time for .1 seconds
     setNextTimestamp(currentTime);
@@ -4577,7 +4568,7 @@ void nextMode(_Bool reverse){
     TIM2->CCR2 = 0;
     latchSegments();
 
-  } else if (displayMode == MODE_LST || displayMode == MODE_SOLAR) {
+  } else if (is_alt_mode(displayMode)) {
 
     countMode = COUNT_ALT;
     setNextTimestamp(currentTime);   // stock civil bookkeeping (integer path; countdown-arm cost)
@@ -6093,7 +6084,7 @@ int main(void)
       if (pg != star_last_pg && decisec != 9) { star_last_pg = pg; sendDate(1); }
     }
 
-    // MODE_LST / MODE_SOLAR: stage the next civil boundary's alternate reading
+    // MODE_LST / MODE_SOLAR / MODE_ZONE2: stage the next civil boundary's alternate reading
     // (thread-context doubles; no-op in every other mode)
     LP_MARK(9);
     alt_update();
