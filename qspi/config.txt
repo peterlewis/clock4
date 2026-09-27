@@ -277,6 +277,12 @@ page_ms = 5500
 #colon_full_at = 2048
 #colon_floor   = 20
 
+# Report the auto-dimmer once a second over USB serial as $PMBRIT: the ambient light reading, the
+# display brightness it chose (on the BSn scale), what chose it (A auto, M manual, S standby), and
+# the segment and colon balance values that follow it. For a host placing the clock on its BS curve
+# live; off by default, so the stock serial output is unchanged.
+#brightness_report = on
+
 # Factory reset: send "factory_reset = on" over USB serial (ignored in this file) to erase every
 # setting you changed with the two-button menu AND the learned temperature-compensation model,
 # returning the clock to exactly this config.txt. The on-device equivalent is the menu's SYS > RESET row; the REBOOT chord only

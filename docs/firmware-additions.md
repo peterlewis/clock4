@@ -216,6 +216,18 @@ setting. The defaults are measured values from a production clock.
 The menu's DISP > BALANCE toggle arms `seg_balance` and `colon_balance` together at their automatic
 curves; the individual keys remain for calibration.
 
+### brightness_report
+
+```
+brightness_report = on
+```
+
+Outputs one `$PMBRIT` sentence over USB serial each second, reporting where the automatic dimmer
+is: the ambient light reading, the display brightness it chose, and what chose it. A host can then
+place the clock on its `BS` brightness curve live, which the firmware otherwise shows only on its own
+date row, in the brightness debug mode. Default off. The sentence format is documented under USB
+serial output below.
+
 ### colon_alt_mode
 
 ```
@@ -454,6 +466,26 @@ USB frame's own arrival time in hardware can place the PPS edge on its clock as
 `hostTime(sof_frame) + (dwt_pps − dwt_sof)/f_dwt`, immune to the several milliseconds of USB read
 jitter; successive `dwt_pps` deltas self-calibrate `f_dwt`. Parsers that only want the phase can
 treat the sentence as 9 fields and ignore any extras.
+
+### The $PMBRIT brightness sentence
+
+With `brightness_report = on`, once a second:
+
+```
+$PMBRIT,<adc>,<dac>,<src>,<segk>,<colon>*CC
+```
+
+| field | meaning |
+|---|---|
+| `adc` | ambient light: the phototransistor's raw ADC reading, 0–4095 |
+| `dac` | display brightness, 0–4095, on the scale of the second number of a `BS` stop: 0 is dark, 4095 full |
+| `src` | what set it: `A` the automatic curve, `M` a manual override (the `brightness` key, or `BRIGHT` in the menu), `S` standby |
+| `segk` | effective per-segment balance strength (`seg_balance`), 0 when off |
+| `colon` | applied colon brightness scale (`colon_balance`), of 256; 256 is full |
+
+With `src` = `A` in steady light, (`adc`, `dac`) is a point on the active `BS` curve; after the light
+changes, `dac` settles onto it within about a second, because the dimmer smooths its steps. In standby
+the display is off, and `segk` and `colon` read 0.
 
 ## The on-device menu
 

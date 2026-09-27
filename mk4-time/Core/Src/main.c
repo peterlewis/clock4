@@ -1802,7 +1802,7 @@ static uint8_t   pmloop_maxtag = 0;
 //   $PMBRIT,<adc>,<dac>,<src>,<segk>,<colon>*CC
 //   adc    ambient light, the raw ADC code 0-4095 (sampled on every pass, whatever drives the rail)
 //   dac    display brightness 0-4095 on the BSn scale: 4095 - dac_target, so 0 is dark, 4095 full
-//   src    A auto (following the BS curve) . M manual override (the brightness key) . S standby
+//   src    A auto (following the BS curve) . M manual override (brightness key / menu BRIGHT) . S standby
 //   segk   effective per-segment balance strength, 0 when off or unavailable at this scan rate
 //   colon  applied colon animation scale, of 256 (256 = full, the stock behaviour)
 //   In standby the display is off, so segk and colon read 0.
