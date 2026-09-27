@@ -221,3 +221,9 @@ MODE_SOLAR = disabled
 # rail (DAC 4095). Defaults 2048 and 20; values are clamped to 0..4000 and 0..256.
 #colon_full_at = 2048
 #colon_floor   = 20
+
+# Report the auto-dimmer once a second over USB serial as $PMBRIT: the ambient light reading, the
+# display brightness it chose (on the BSn scale), what chose it (A auto, M manual, S standby), and
+# the segment and colon balance values that follow it. For a host placing the clock on its BS curve
+# live; off by default, so the stock serial output is unchanged.
+#brightness_report = on

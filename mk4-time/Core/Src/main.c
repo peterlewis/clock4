@@ -1498,7 +1498,7 @@ void segbal_isr_refresh(void){
 // tag of the section that produced it: $PMLOOP,<worst_ms>,<tag>. Marks bracket the main loop's
 // sections; PendSV stamps tag 15 when it preempts, so the once-per-second display prep shows up
 // under its own name. Emission is lossy on a busy USB endpoint by design (1 Hz diagnostic).
-// Tags: 1 menu . 2 balance/colon . 3 tz-lookup . 4 delayed-housekeeping . 5 vbus/temp .
+// Tags: 1 menu . 2 balance/colon/brightness-report . 3 tz-lookup . 4 delayed-housekeeping . 5 vbus/temp .
 //       6 pps-emit/tempcomp/dumps . 7 vbat/astro . 8 mode-pages/star . 9 alt/loop-tail . 15 PendSV
 volatile uint8_t loop_diag = 0;
 volatile uint8_t pmloop_lasttag = 0;
@@ -1507,6 +1507,21 @@ static uint8_t   pmloop_maxtag = 0;
 #define LP_MARK(n) do { uint32_t t_ = uwTick, g_ = t_ - pmloop_last; \
     if (g_ > pmloop_max) { pmloop_max = g_; pmloop_maxtag = pmloop_lasttag; } \
     pmloop_last = t_; pmloop_lasttag = (n); } while (0)
+
+// ---- $PMBRIT: the auto-dimmer's operating point (`brightness_report = on` over serial or config) -
+// Once per second: the ambient reading the brightness loop last sampled, the display brightness it
+// chose, what chose it, and the two balance values that follow it, so a host can place the clock on
+// its BS curve live. Nothing else on USB carries the sensor or the rail: MODE_DEBUG_BRIGHTNESS shows
+// the same pair, but on the date row. Off by default, so the stock serial output is unchanged.
+//   $PMBRIT,<adc>,<dac>,<src>,<segk>,<colon>*CC
+//   adc    ambient light, the raw ADC code 0-4095 (sampled on every pass, whatever drives the rail)
+//   dac    display brightness 0-4095 on the BSn scale: 4095 - dac_target, so 0 is dark, 4095 full
+//   src    A auto (following the BS curve) . M manual override (the brightness key) . S standby
+//   segk   effective per-segment balance strength, 0 when off or unavailable at this scan rate
+//   colon  applied colon animation scale, of 256 (256 = full, the stock behaviour)
+//   In standby the display is off, so segk and colon read 0.
+volatile uint8_t brightness_report = 0;
+static uint32_t  brit_win = 0;
 
 void setDisplayFreq(uint32_t freq){
   if (waitingForLatch) {
@@ -1906,6 +1921,8 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     if (from_serial && truthy(value)) tc_dump_pending = 1;
   } else if (strcasecmp(key, "loop_diag") == 0) {
     loop_diag = truthy(value) ? 1 : 0;   // 1 Hz $PMLOOP main-loop latency diagnostic
+  } else if (strcasecmp(key, "brightness_report") == 0) {
+    brightness_report = truthy(value) ? 1 : 0;   // 1 Hz $PMBRIT auto-dimmer operating point
   } else if (strcasecmp(key, "tc_reset") == 0) {
     if (from_serial && truthy(value)) tc_reset_pending = 1;   // serial-only, same guard
 
@@ -2319,6 +2336,48 @@ static uint8_t emitPPSTimestamp(void){
   if (r != USBD_BUSY && pps_cap.seq == snap_seq) pps_record_pending = 0;
   __enable_irq();
   return r;
+}
+
+// Format + send one $PMBRIT sentence. Main loop only. The DAC DMA callbacks write the rail, so read
+// it once; the rest is main-loop state. Same CDC contract as emitPPSTimestamp: serialise the submit
+// against the ISR NMEA passthrough, and only BUSY is worth retrying.
+static uint8_t emitBrightnessReport(void){
+  if (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED) return USBD_FAIL;   // no host: skip this second
+
+  __disable_irq();
+  float dt = dac_target;                 // 0 = brightest .. 4095 = dimmest (inverted, as stored)
+  __enable_irq();
+  uint32_t adc = ADC1->DR & 0xFFFu;
+  char src = (displayMode == MODE_STANDBY) ? 'S'
+           : (config.brightness_override >= 0.0f) ? 'M' : 'A';
+  int32_t dac = (int32_t)(4095.0f - dt + 0.5f);
+  if (dac < 0) dac = 0; else if (dac > 4095) dac = 4095;
+  uint32_t segk  = (src != 'S' && seg_balance && segbal_depth()) ? segbal_strength() : 0;
+  unsigned colon = (src == 'S') ? 0u : (unsigned)colonScale;
+
+  char body[48];                         // everything between '$' and '*'
+  int n = snprintf(body, sizeof body, "PMBRIT,%lu,%ld,%c,%lu,%u",
+                   (unsigned long)adc, (long)dac, src, (unsigned long)segk, colon);
+  if (n < 0 || n >= (int)sizeof body) return USBD_FAIL;
+
+  uint8_t cks = 0;                       // standard NMEA XOR checksum
+  for (int i = 0; i < n; i++) cks ^= (uint8_t)body[i];
+
+  char line[NMEA_BUF_SIZE];              // must fit the CDC txbuf[NMEA_BUF_SIZE] downstream
+  int m = snprintf(line, sizeof line, "$%s*%02X\r\n", body, (unsigned)cks);
+  if (m < 0 || m >= (int)sizeof line) return USBD_FAIL;
+
+  __disable_irq();
+  uint8_t r = CDC_Copy_Transmit((uint8_t*)line, (uint16_t)m);
+  __enable_irq();
+  return r;
+}
+
+// Main loop: one report a second while brightness_report is on. BUSY holds the window open so the
+// next pass retries; a report that went, or had no host to take it, closes it until the next second.
+void brightness_report_poll(void){
+  if (!brightness_report || (uint32_t)(uwTick - brit_win) < 1000u) return;
+  if (emitBrightnessReport() != USBD_BUSY) brit_win = uwTick;
 }
 
 // ==================== Temperature compensation (opt-in; state near pps_cap) ====================
@@ -3905,6 +3964,7 @@ int main(void)
     LP_MARK(2);
     segbal_poll();   // per-segment brightness balance (seg_balance) — refills the mirror slots, ≤1 kHz
     colon_balance_poll();   // dim the colons with the rail (colon_balance) — reloads the anim buffer on change
+    brightness_report_poll();   // $PMBRIT once a second (brightness_report) — the dimmer's operating point
 
     LP_MARK(3);
     // Distance gate: skip the ~300 ms FATFS/ZoneDetect lookup unless the fix has actually moved far
