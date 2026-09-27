@@ -19,8 +19,13 @@ without ever writing FAT metadata. Rules:
 - Create it **first** on a freshly formatted volume (flash.sh does this) so it is contiguous -- the
   firmware verifies contiguity at boot and falls back to RAM-only settings (lost at power-off) if
   the file is fragmented, missing, or under 16 KiB.
-- Fill it with `0xFF` (the NOR erased state): `tr '\0' '\377' < /dev/zero | dd bs=4096 count=4 of=SETTINGS.BIN`.
+- Fill it with `0xFF` (the NOR erased state). `output/settings.bin` is that blank store, ready to
+  copy; flash.sh uses it. To make one yourself: `LC_ALL=C tr '\0' '\377' < /dev/zero | head -c 16384 > SETTINGS.BIN`.
   A zero-filled file also works -- the firmware erases it on first use -- but 0xFF is the honest state.
+- Updating by copying files rather than reformatting? If the drive has no `SETTINGS.BIN` (one
+  formatted before the store existed), copy `output/settings.bin` onto it. Never copy it over an
+  existing one: that file holds your settings, and the reboot that applies a firmware update would
+  start from the blank copy. If `menu_dump` then reports it fragmented, reformat with flash.sh.
 - Treat it as **opaque**: don't edit, copy over, or defragment it. If a host tool rewrites or moves
   it, the firmware detects this before its next write, re-resolves the file's location, and
   re-initialises it (stored settings reset to the live values; nothing else on the volume is touched).
