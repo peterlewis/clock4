@@ -4260,54 +4260,54 @@ uint8_t loadRules( char* cat, char* zo, struct tzrule* dest, uint32_t maxrules )
     return RULES_NO_FILE;
   }
 
+  // Every field below comes from a host-writable file that may be TRUNCATED: a short read leaves
+  // its buffer untouched, so each one is zero-initialised (never stack garbage) and the byte count
+  // is checked. Any short read is a header error; nothing is written to dest[] until the whole
+  // rule table is known to lie inside the file.
+#define RULES_RD(p, n) (f_read(&file, (p), (n), &rc) == FR_OK && rc == (n))
+#define RULES_FAIL(code) do { f_close(&file); return (code); } while (0)
+
   unsigned int rc;
-  char buf[4];
+  char buf[4] = {0};
 
-  f_read(&file, &buf, 4, &rc);
+  if (!RULES_RD(&buf, 4) || memcmp(&buf, "MTZ", 3)) RULES_FAIL(RULES_HEADER_ERR);
+  if (buf[3]!=1) RULES_FAIL(RULES_VERSION_UNKNOWN);
 
-  if(memcmp(&buf, "MTZ", 3)) {
-    return RULES_HEADER_ERR;
-  }
-  if (buf[3]!=1) {
-    return RULES_VERSION_UNKNOWN;
-  }
+  uint8_t rowLength = 0;
+  if (!RULES_RD(&rowLength, 1)) RULES_FAIL(RULES_HEADER_ERR);
 
-  uint8_t rowLength;
-  f_read(&file, &rowLength, 1, &rc);
+  uint8_t numCats = 0;
+  if (!RULES_RD(&numCats, 1)) RULES_FAIL(RULES_HEADER_ERR);
 
-  uint8_t numCats;
-  f_read(&file, &numCats, 1, &rc);
+  if (findField( &file, cat, numCats, 3 ) ==0) RULES_FAIL(RULES_CATEGORY_UNKNOWN);
 
-  if (findField( &file, cat, numCats, 3 ) ==0) {
-    return RULES_CATEGORY_UNKNOWN;
-  }
-  uint16_t catAddr;
-  f_read(&file, &catAddr, 2, &rc);
+  uint16_t catAddr = 0;
+  if (!RULES_RD(&catAddr, 2)) RULES_FAIL(RULES_HEADER_ERR);
 
-  uint8_t numZones;
-  f_read(&file, &numZones, 1, &rc);
+  uint8_t numZones = 0;
+  if (!RULES_RD(&numZones, 1)) RULES_FAIL(RULES_HEADER_ERR);
 
   f_lseek(&file, catAddr);
 
-  if (findField( &file, zo, numZones, 4 ) ==0) {
-    return RULES_ZONE_UNKNOWN;
-  }
+  if (findField( &file, zo, numZones, 4 ) ==0) RULES_FAIL(RULES_ZONE_UNKNOWN);
 
   uint32_t zoAddr = 0;
-  f_read(&file, &zoAddr, 3, &rc);
+  if (!RULES_RD(&zoAddr, 3)) RULES_FAIL(RULES_HEADER_ERR);
 
-  uint8_t numEntries;
-  f_read(&file, &numEntries, 1, &rc);
-
-  f_lseek(&file, zoAddr);
+  uint8_t numEntries = 0;
+  if (!RULES_RD(&numEntries, 1)) RULES_FAIL(RULES_HEADER_ERR);
 
   // TZRULES.BIN is host-writable over the USB mass-storage volume, so its length
   // fields are untrusted: a rowLength larger than one rule slot, or numEntries larger
   // than the array, would overrun rules[] (global RAM corruption / HardFault). Reject.
-  if (rowLength > sizeof dest[0] || numEntries > maxrules) {
-    f_close(&file);
-    return RULES_HEADER_ERR;
+  // Likewise a rule table that runs past the end of the file: reject BEFORE the first
+  // write, so a truncated file can never leave dest[] half old zone, half new.
+  if (rowLength > sizeof dest[0] || numEntries > maxrules
+      || (uint64_t)zoAddr + (uint32_t)numEntries * rowLength > (uint64_t)f_size(&file)) {
+    RULES_FAIL(RULES_HEADER_ERR);
   }
+
+  f_lseek(&file, zoAddr);
 
   int i;
   for (i=0;i<numEntries;i++) {
@@ -4320,6 +4320,8 @@ uint8_t loadRules( char* cat, char* zo, struct tzrule* dest, uint32_t maxrules )
   f_close(&file);
 
   return RULES_OK;
+#undef RULES_RD
+#undef RULES_FAIL
 }
 
 // loadRulesSingle modifies the input string, can't be used with const str
