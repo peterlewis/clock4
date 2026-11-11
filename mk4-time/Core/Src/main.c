@@ -5564,8 +5564,15 @@ static void menu_fire_stage(void){
   if (!menu_chord) return;
   if (menu_layer==L0_CLOCK){
     if (menu_stage==1){                                                // SETUP -> section ring (resumes menu_section)
-      if (menu_l0_snap_valid && (uint32_t)(uwTick - menu_l0_snap_ms) < 2500u)
-        displayMode = menu_l0_snap_mode;                               // a staggered both-press leaked a single tap first (nextMode fired) — undo it, the user was reaching for the menu
+      // A staggered both-press leaked a single tap first (nextMode fired) — undo it, the user was
+      // reaching for the menu. The undo goes THROUGH nextMode: a bare displayMode write left the
+      // leaked mode's machinery installed (countMode, the SysTick/PPS handlers, the colon, a
+      // standby display-off), so a leak into LST kept sidereal time ticking on a civil face.
+      if (menu_l0_snap_valid && (uint32_t)(uwTick - menu_l0_snap_ms) < 2500u
+          && displayMode != menu_l0_snap_mode && config.modes_enabled[menu_l0_snap_mode]){
+        requestMode = menu_l0_snap_mode;
+        nextMode(0);
+      }
       menu_layer=L1_SECTION; menu_render_item();
     }
     else if (menu_stage==3 && menu_cycle>=1){ buttonsBothHeld(); }     // REBOOT (2nd cycle, ~4.3s) = NVIC reset (L0 ONLY). Factory reset is SYS>RESET.
