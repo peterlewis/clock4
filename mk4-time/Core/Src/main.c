@@ -3818,15 +3818,15 @@ static void menu_dump_step(void);
 static void computeHoldoverFade(void){
   uint32_t age = (uint32_t)currentTime - last_pps_time;              // holdover seconds
 
-  // σ_cal — frequency knowledge from the last RTC calibration, decaying with its age.
+  // σ_cal — a random-walk bound that grows with the age of the last successful RTC calibration (the
+  // last moment the clock is known to have been disciplined). ONE continuous term, so U(τ) can only
+  // grow through a holdover. It must NOT include debug_rtc_val: that is the raw LSE offset (~19 ppm
+  // on a typical crystal), a known bias of the 32 kHz oscillator, while the displayed time runs on
+  // the HSE-driven SysTick. An earlier branch used it as σ while the calibration was under
+  // CAL_PERIOD old: with an LSE model learned, the ms digit went dark ~9 s into a holdover, then
+  // RELIT when that branch expired (within 64 s), then faded again minutes later.
   float cal_age = (float)((uint32_t)currentTime - (uint32_t)rtc_last_calibration);
-  float sigma_cal;
-  if (cal_age <= (float)CAL_PERIOD && tc_lse_valid) {
-    float cal_ppm = (float)debug_rtc_val * (1e6f / (32768.0f * (float)CAL_PERIOD));
-    sigma_cal = fabsf(cal_ppm) + 0.05f * sqrtf(cal_age / (float)CAL_PERIOD);
-  } else {
-    sigma_cal = 0.02f * sqrtf(cal_age);                             // stale cal: random-walk bound
-  }
+  float sigma_cal = 0.02f * sqrtf(cal_age);
 
   // σ_temp — the MEASURED tempco-model residual (ppm), plus a penalty beyond the learned range.
   float sigma_temp;
