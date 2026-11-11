@@ -4234,9 +4234,13 @@ uint8_t f_getzcmp(FIL* fp, char * str){
   char b[1] = {1};
   uint8_t ret = 0;
 
+  // TZRULES.BIN is host-writable, so it can be truncated (an interrupted copy). f_read at end-of-file
+  // returns FR_OK with rc == 0 and leaves b untouched: without the rc check this loop never ended and
+  // walked `a` off the end of RAM (HardFault, on every boot). `a` also stops at str's terminator.
   while (b[0]!=0) {
-    f_read(fp, &b, 1, &rc);
-    if (b[0] != *a++) ret=-1;
+    if (f_read(fp, &b, 1, &rc) != FR_OK || rc != 1) return (uint8_t)-1;   // truncated: no match
+    if (b[0] != *a) ret=-1;
+    if (*a) a++;
   }
   return ret;
 }
