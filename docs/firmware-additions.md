@@ -419,6 +419,9 @@ tc_rtc = on
 temperature-driven *change* since the moment GPS was lost, so it engages glitch-free at zero and
 grows only as the temperature moves. `tc_rtc` additionally trims the battery RTC's calibration
 register from the model while GPS is absent, so the RTC hands over better time across a power loss.
+The steering reads the die temperature in fractions of a degree, filtered over about two minutes, so
+a reading that sits between two whole degrees does not chop the rate; the display and `$PMTXTS` still
+show whole degrees.
 The menu's DIAG > TEMPCOMP toggle arms `tc_learn`, `tc_apply` and `tc_persist` together — switch the compensator on from the front panel and its learned model persists across power-off.
 
 ```

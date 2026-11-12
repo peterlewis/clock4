@@ -287,6 +287,30 @@ int debug_rtc_val = 0;
 volatile uint8_t pps_ts_enabled = 0;
 volatile _Bool   pps_record_pending = 0;
 int16_t die_temp_c = 0;  // latest STM32 die temperature (°C), a proxy for the crystal temperature
+// The same sensor, kept in fractions of a degree and low-pass filtered, for the holdover steering.
+// die_temp_c is the vendor's whole-degree conversion; the bins, the display and $PMTXTS keep using it.
+// Steering from it made every 1 degree flip of the reading a step in rate, and froze the temperature
+// "at loss" to the nearest degree: on recorded data tc_apply cut the large holdover errors but DOUBLED
+// the typical one (7.6 -> 15.6 us at an hour). Filtering the readings took that back to about 9 us and
+// improved the large errors further. One raw count is about 0.3 degC; the filter resolves finer.
+float die_temp_f = 0.0f;
+_Bool die_temp_f_ok = 0;                 // false until the first reading: the steering then falls back to die_temp_c
+#define DIE_TEMP_FILTER 32.0f            // readings in the filter's memory: one every 4 s, about 2 minutes
+
+// Raw sensor count -> degrees C, the vendor's two-point formula in floating point (no truncation).
+// cal1/cal2 are the factory counts at the two calibration temperatures, taken at 3.0 V; vdda_mv is
+// the supply the count was taken at.
+static float die_temp_convert(uint32_t raw, int32_t cal1, int32_t cal2, float vdda_mv){
+  if (cal2 == cal1) return 0.0f;
+  float scaled = (float)raw * vdda_mv / (float)TEMPSENSOR_CAL_VREFANALOG;
+  return (scaled - (float)cal1) * (float)(TEMPSENSOR_CAL2_TEMP - TEMPSENSOR_CAL1_TEMP) / (float)(cal2 - cal1)
+         + (float)TEMPSENSOR_CAL1_TEMP;
+}
+static void die_temp_filter(float t){
+  if (!isfinite(t)) return;
+  if (!die_temp_f_ok) { die_temp_f = t; die_temp_f_ok = 1; return; }   // the first reading is the estimate
+  die_temp_f += (t - die_temp_f) / DIE_TEMP_FILTER;
+}
 volatile struct {
   uint32_t seq;        // increments every PPS edge (32-bit: no practical wrap; host detects gaps)
   uint32_t systick;    // SysTick->VAL at the edge, captured BEFORE the reload (down-counter)
@@ -3593,25 +3617,25 @@ static _Bool tc_model_lse(int t, float *ppm){
 // holdover needs: at GPS loss the display is phase-true, and the error that then accrues is
 // the temperature-driven CHANGE of the oscillator, model(T_now) − model(T_loss). Frozen config
 // coefficients are in ppm; a cancels in the difference, so only tc_hse_b/c are required.
-static _Bool tc_hse_delta(int t_now, int t_ref, int32_t *dticks){
+static _Bool tc_hse_delta(float t_now, float t_ref, float *dticks){   // temperatures in degC, fractions welcome; result in ticks/s
   float b = tc_cfg_hse[1], c = tc_cfg_hse[2];
   if (!isnan(b)) {                            // frozen: b (and optionally c) from config
     if (isnan(c)) c = 0;
-    float x1 = (float)t_now - (float)tc_t0, x0 = (float)t_ref - (float)tc_t0;
+    float x1 = t_now - (float)tc_t0, x0 = t_ref - (float)tc_t0;
     float dppm = (b*x1 + c*x1*x1) - (b*x0 + c*x0*x0);
     if (!isfinite(dppm)) return 0;
-    *dticks = (int32_t)lroundf(dppm * (float)tc_tpp());
+    *dticks = dppm * (float)tc_tpp();
     return 1;
   }
   if (!tc_hse_valid) return 0;
-  if (t_now < tc_hse_tmin) t_now = tc_hse_tmin;   // no extrapolation past learned coverage
-  if (t_now > tc_hse_tmax) t_now = tc_hse_tmax;
-  if (t_ref < tc_hse_tmin) t_ref = tc_hse_tmin;
-  if (t_ref > tc_hse_tmax) t_ref = tc_hse_tmax;
-  float d = tc_poly(tc_hse_m, (float)t_now - (float)tc_t0)
-          - tc_poly(tc_hse_m, (float)t_ref - (float)tc_t0);
+  if (t_now < (float)tc_hse_tmin) t_now = (float)tc_hse_tmin;   // no extrapolation past learned coverage
+  if (t_now > (float)tc_hse_tmax) t_now = (float)tc_hse_tmax;
+  if (t_ref < (float)tc_hse_tmin) t_ref = (float)tc_hse_tmin;
+  if (t_ref > (float)tc_hse_tmax) t_ref = (float)tc_hse_tmax;
+  float d = tc_poly(tc_hse_m, t_now - (float)tc_t0)
+          - tc_poly(tc_hse_m, t_ref - (float)tc_t0);
   if (!isfinite(d)) return 0;
-  *dticks = (int32_t)lroundf(d);              // learned model is already in ticks
+  *dticks = d;                                // learned model is already in ticks
   return 1;
 }
 
@@ -3759,7 +3783,7 @@ static void tc_governor(void){
   static _Bool    hold_ok = 0;
   static int32_t  dither = 0;                 // carried 1/16-tick remainder, [0,16)
   static _Bool    was_on = 0;
-  static int16_t  t_loss = 0;                 // die temp captured when steering engaged
+  static float    t_loss = 0;                 // die temp captured when steering engaged (filtered, sub-degree)
   static int32_t  last_steps = 0x7FFF;        // last CALR trim written (sentinel: none)
   static uint32_t last_calr = 0;
 
@@ -3781,9 +3805,13 @@ static void tc_governor(void){
   _Bool have_l = tc_model_lse(t, &lp);
   int32_t tpp = tc_tpp();
 
+  // The steering works from the filtered sub-degree temperature; t (whole degrees) still serves the
+  // RTC trim, whose own steps are coarser than a degree of the LSE model, and the display.
+  float tf = die_temp_f_ok ? die_temp_f : (float)t;
+
   // Would-be steering delta at the current temperatures (also feeds the display)
-  int32_t dt_now = 0;
-  _Bool have_h = tc_hse_delta(t, was_on ? t_loss : t, &dt_now);
+  float dt_now = 0;
+  _Bool have_h = tc_hse_delta(tf, was_on ? t_loss : tf, &dt_now);
 
   // display cache (clamped so "HSE -99.99" never exceeds the 10-char row).
   // HSE page shows the ACTIVE steering correction in ppm. While locked the PPS discipline owns the
@@ -3814,17 +3842,18 @@ static void tc_governor(void){
   // Re-lock needs no unwinding beyond the LOAD restore (the per-edge phase snap owns lock).
   if ((tc_apply || freq_hold) && had_pps && fresh >= tc_engage_s) {
     if (!was_on) {
-      t_loss = (int16_t)t;                    // remember the temperature we lost GPS at
+      t_loss = tf;                            // remember the temperature we lost GPS at
       hold_ok = freq_hold && fh_estimate(&hold_fp);
       if (!hold_ok) hold_fp = 0;
     }
     int32_t lim = (int32_t)tc_max_ppm * tpp * FH_FP;    // 200 ppm * 80 * 16 = 256000: no overflow
-    int32_t dtemp = 0;
-    _Bool have_t = tc_apply && tc_hse_delta(t, t_loss, &dtemp);
+    float dtemp_t = 0;                                   // ticks/s, with its fraction
+    _Bool have_t = tc_apply && tc_hse_delta(tf, t_loss, &dtemp_t);
     if (have_t || hold_ok) {
-      if (dtemp >  lim / FH_FP) dtemp =  lim / FH_FP;   // clamp BEFORE scaling
-      if (dtemp < -lim / FH_FP) dtemp = -lim / FH_FP;
-      int32_t target = hold_fp + (have_t ? dtemp * FH_FP : 0);
+      float lim_t = (float)(lim / FH_FP);
+      if (dtemp_t >  lim_t) dtemp_t =  lim_t;           // clamp BEFORE scaling
+      if (dtemp_t < -lim_t) dtemp_t = -lim_t;
+      int32_t target = hold_fp + (have_t ? (int32_t)lroundf(dtemp_t * (float)FH_FP) : 0);   // 1/16 tick: a tenth of a degree counts
       if (target >  lim) target =  lim;
       if (target < -lim) target = -lim;
       if (!was_on) { applied_fp = target; dither = 0; }
@@ -4699,6 +4728,9 @@ void measure_temp(void){
   // Factory-calibrated conversion (TS_CAL1/TS_CAL2 in flash). VREF taken as 3300 mV; absolute
   // accuracy isn't critical — the curve is fitted against GPS-measured ppm, not trusted raw.
   die_temp_c = (int16_t)__HAL_ADC_CALC_TEMPERATURE(3300, raw, ADC_RESOLUTION_12B);
+#ifndef __EMSCRIPTEN__                           // the calibration words live in system flash
+  die_temp_filter(die_temp_convert(raw, (int32_t)*TEMPSENSOR_CAL1_ADDR, (int32_t)*TEMPSENSOR_CAL2_ADDR, 3300.0f));
+#endif
 
   s.Channel = ADC_CHANNEL_VBAT;                  // restore so measure_vbat() keeps working
   HAL_ADC_ConfigChannel(&hadc3, &s);
