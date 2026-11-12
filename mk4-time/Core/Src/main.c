@@ -706,7 +706,33 @@ static _Bool zone2_parse_fixed(const char* s, int32_t* out){
   return 1;
 }
 
-void sendDate( _Bool now ){
+// ---- sendDate's private C-library context ---------------------------------------------------
+// newlib keeps the scratch state of float conversion (dtoa's result buffer and its free lists) in
+// ONE structure, reached through the global _impure_ptr. sendDate formats floats (the Julian, VBAT,
+// TEMPCOMP and ADEV rows) and runs from the SysTick, PendSV, DAC-DMA and GPS handlers, while the
+// main loop formats floats of its own: the tc_dump lines, $PMTXTC, $PMADEV, $PMHDEV. When a handler's
+// sendDate lands inside one of those prints, its conversion frees and reuses the buffer the main
+// loop is still reading, and the main loop's line goes out with WRONG DIGITS - no fault, a valid
+// checksum, a plausible number. Reproduced on this exact libc_nano under QEMU with a real SysTick:
+// 824 of 1912 interrupted prints were wrong, e.g. 18.68123 printed as 28.68123. A tc_dump line is
+// meant to be pasted back into config.txt.
+//
+// sendDate therefore swaps in a context of its own for its whole extent and restores the caller's on
+// the way out (saved in a local, so nested handlers unwind correctly). Nothing else changes: the same
+// library calls, the same bytes. With it, 0 of 1912 were wrong. It does not make sendDate itself
+// reentrant - two overlapping sendDate calls still share one context and one transmit buffer, which
+// is what the decisec != 9 guards on the main-loop callers are for.
+#ifdef __NEWLIB__
+#include <reent.h>
+static struct _reent sd_reent = _REENT_INIT(sd_reent);
+#define SD_CONTEXT_ENTER()  struct _reent *sd_saved_ = _impure_ptr; _impure_ptr = &sd_reent
+#define SD_CONTEXT_LEAVE()  _impure_ptr = sd_saved_
+#else                                   // the emulator and the native test twin do not run newlib
+#define SD_CONTEXT_ENTER()  do {} while (0)
+#define SD_CONTEXT_LEAVE()  do {} while (0)
+#endif
+
+static void sendDate_body( _Bool now ){
   if (waitingForLatch) {
     if (countMode==COUNT_HIDDEN) {
       // if we've entered count_hidden while waiting for latch, it will never happen
@@ -1148,6 +1174,13 @@ menu_send_term:
   }
   HAL_UART_Transmit_DMA(&huart2, uart2_tx_buffer, i+1);
 
+}
+
+// The public entry point: every caller, in every context, formats inside sendDate's own context.
+void sendDate( _Bool now ){
+  SD_CONTEXT_ENTER();
+  sendDate_body(now);
+  SD_CONTEXT_LEAVE();
 }
 
 void setNextTimestamp(time_t nextTime){
