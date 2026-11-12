@@ -49,4 +49,5 @@ void tc_housekeeping(void){
   tc_dump_step();
   menu_dump_step();
   menu_export_step();  // the menu's choices as config.txt lines, after a save or on request
+  cw_step();           // ...and written into config.txt by the clock itself, when no computer is there to do it
 }

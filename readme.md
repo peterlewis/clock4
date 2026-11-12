@@ -70,7 +70,7 @@ Menu changes are saved in a file on the clock's drive, `SETTINGS.BIN`, and survi
 
 So a brightness set at the clock survives an edit to the timezone line, and a line you change in the file always takes effect. This works the same whether the clock was running when you edited the file or was unplugged straight afterwards.
 
-The clock also sends its menu choices over USB as `config.txt` lines. With PCC's `pccd` running, they are written into `config.txt`, so the file shows what the clock is doing.
+The clock also sends its menu choices over USB as `config.txt` lines. With PCC's `pccd` running, they are written into `config.txt`, so the file shows what the clock is doing. With `config_write = on`, a clock on a charger writes them into the file itself.
 
 ### USB serial output
 
@@ -148,10 +148,11 @@ This is draft firmware. I run it on my own clock. Every change is tested in an e
 
 ## How it is tested
 
-- **Emulator suites** in the PCC repository (`web/emu/phase1`): 35 suites that drive the real firmware code, compiled to WebAssembly.
+- **Emulator suites** in the PCC repository (`web/emu/phase1`): 36 suites that drive the real firmware code, compiled to WebAssembly.
 - **Conformance:** 4,511 display checks against independently computed calendar and astronomy results, and 912 timezone checks against the host's timezone database.
 - **A native build** of the same source, whose output is compared byte for byte with the WebAssembly build's.
 - **A replay** of a capture from a real clock.
+- **A power cut at every flash operation** of the `config.txt` writer, in the emulator; and the code that finds the file's sectors run with the real file-system code against disk images (`mk4-time/test/config_locate_test.py`).
 
 ## The source
 

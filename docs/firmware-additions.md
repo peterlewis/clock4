@@ -363,6 +363,43 @@ Trims the star transit catalogue to stars brighter than this apparent magnitude,
 `STARS.BIN` is loaded. Smaller numbers mean fewer, more famous stars: 1.5 keeps roughly the two dozen
 first-magnitude stars, 2.5 admits the whole supplied file. Default 6.0 (no trim).
 
+### config_write
+
+```
+config_write = on
+```
+
+Lets the clock write its own menu choices into `config.txt`, so the file shows what the clock is
+doing without a computer running `pccd` (which otherwise does this: see `menu_export` under USB
+serial output). Default off.
+
+It writes only if no computer has connected since power-on, which in practice means on a charger. A
+computer that has the drive mounted keeps its own copy of the file and would not see a change made
+underneath it. With a computer attached, the choice stays in the store as before, and `pccd` writes
+it if it is running.
+
+What it does to the file:
+
+- A value that fits where the old one stands is written there.
+- Otherwise a new line is added at the end of the text and the old line is blanked. A setting made of
+  several keys (TEMPCOMP, BALANCE) is added as one block of lines.
+- Brightness on `AUTO` is written as `brightness = -1`.
+- A comment records it: `# synced 2026-11-12 08:45 by the clock`.
+- The file can only grow into the unused part of the 16 KB cluster it already ends in. When it does,
+  the gap up to the next 4 KB boundary is filled with spaces, which later lines replace, so the file
+  may end in a run of spaces. A choice there is no room for stays in the store.
+
+Everything else in the file is left byte for byte. After writing, the clock reads the file again and
+`config.txt` takes each setting back by the ordinary rule (see [Where settings
+live](#where-settings-live)), so the stored choice is deleted and the file is the one record.
+
+It is safe against a power cut at any moment. The clock rewrites the file's own 4 KB flash sectors,
+and a sector must be erased before it is written; so the new contents are first written to a spare
+page inside `SETTINGS.BIN` with a note of where they belong, and a rewrite that was interrupted is
+completed at the next power-on. That includes the one sector of the directory it ever writes (to
+record the file's new size), which it can recover even though the directory is how files are found.
+It needs a usable `SETTINGS.BIN`, and a FAT12 or FAT16 volume, which the clock's drive is.
+
 ### watchdog
 
 ```

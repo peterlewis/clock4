@@ -324,6 +324,8 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     // off switch), so "off" takes effect at the next reset.
     watchdog = truthy(value) ? 1 : 0;
     if (!from_serial) cfg_owns(KID_WATCHDOG);
+  } else if (strcasecmp(key, "config_write") == 0) {
+    config_write = truthy(value) ? 1 : 0;   // the clock may write its menu choices into config.txt itself (config_write.h)
   } else if (strcasecmp(key, "wdt_dump") == 0) {
     if (from_serial && truthy(value)) wdt_dump_pending = 1;   // serial-only: report the watchdog's state
   } else if (strcasecmp(key, "menu_dump") == 0) {
@@ -435,7 +437,7 @@ static const struct { const char *key, *def; } cfg_defaults[] = {
   {"colon_full_at","2048"}, {"colon_floor","20"}, {"tc_t0","40"}, {"tc_engage_s","2"},
   {"tc_max_ppm","100"}, {"tc_hse_b","nan"}, {"tc_hse_c","nan"}, {"tc_lse_a","nan"}, {"tc_lse_b","nan"},
   {"tc_lse_c","nan"}, {"tc_seed","off"}, {"tc_seed_lo","0"}, {"tc_seed_hi","0"}, {"star_max_mag","6"},
-  {"loop_diag","off"}, {"brightness_report","off"}, {"watchdog","off"}, {"BS1","0,0"},
+  {"loop_diag","off"}, {"brightness_report","off"}, {"watchdog","off"}, {"config_write","off"}, {"BS1","0,0"},
   {"BS2","131,365"}, {"BS3","1076,1422"}, {"BS4","2774,2665"}, {"BS5","3849,4095"},
 #ifdef NONCOMPLIANT_DATE_MODES
   {"MODE_DDMMYYYY","off"},
@@ -451,7 +453,7 @@ static int cfg_row(const char *key){
 }
 // A key nothing owns any more goes back to its default, unless the file now loaded sets it.
 // (menu_reconcile, in the store, calls this when config.txt takes a bundled setting back from the menu.)
-static void cfg_release(const char *key){
+static SMALL_CODE void cfg_release(const char *key){
   int row = cfg_row(key);
   if (row < 0 || !cfg_defaults[row].def || (cfg_from_file[row >> 5] & (1u << (row & 31)))) return;
   char v[32];

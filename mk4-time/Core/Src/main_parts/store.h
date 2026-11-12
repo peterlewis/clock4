@@ -79,7 +79,7 @@ static uint8_t cfg_tc_defined = 0;
 #define EE_MAGIC   0x4D4B3445u        // "MK4E"  (menu store)
 #define EE_SCHEMA  1u
 #define EE_REC_SZ  64u                // 8 doublewords; CRC16 lives in DW7 so it programs last
-#define EE_QSPI_PGSZ 4096u            // W25Q128 erase unit (one FAT cluster == one MSC block == one sector)
+#define EE_QSPI_PGSZ 4096u            // W25Q128 erase unit == one MSC block == one FAT sector (a cluster is csize of them: 4 on the clock's drive)
 #define EE_SLOTS   (EE_QSPI_PGSZ / EE_REC_SZ)
 #define EE2_MAGIC  0x4D4B3454u        // "MK4T"  (tempcomp store — distinct magic so the two never alias)
 #define EE2_SCHEMA 1u
@@ -120,13 +120,54 @@ static uint8_t ee_sfile[EE_SFILE_SZ];
 static uint8_t ee_sfile_attached = 1;   // SETTINGS.BIN present on the emulated card (tests can detach)
 static uint8_t ee_sfile_frag = 0;       // pretend the file is fragmented -> resolver must reject
 static uint8_t ee_sfile_rdfault = 0;    // every read fails, as a QSPI HAL error would (tests)
-static uint32_t ee_rd32(uint32_t a){ if (ee_sfile_rdfault){ ee_rd_fault = 1; return 0; } uint32_t v; memcpy(&v, &ee_sfile[a], 4); return v; }
-static void ee_rd(uint32_t a, void*d, uint32_t n){ if (ee_sfile_rdfault){ ee_rd_fault = 1; memset(d, 0, n); return; } memcpy(d, &ee_sfile[a], n); }
-static void ee_erase(uint32_t a){ memset(&ee_sfile[a & ~(EE_QSPI_PGSZ-1u)], 0xFF, EE_QSPI_PGSZ); }
-static void ee_prog_dw(uint32_t a, uint64_t v){
-  uint8_t s[8]; memcpy(s,&v,8);
-  for (int i=0;i<8;i++) ee_sfile[a+i] &= s[i];                    // NOR: 1->0 only
+// A small disk beside the settings file, for the config.txt writer (config_write.h): one root-directory
+// sector and EMU_DISK_DATA data sectors, at EMU_DISK_BASE in the emulated address space. emu_cw_chain
+// stands in for the FAT: the data sectors config.txt occupies, in file order.
+#define EMU_DISK_BASE 0x10000u
+#define EMU_DISK_DATA 10u
+#define EE_FLASH_END  (EMU_DISK_BASE + (1u + EMU_DISK_DATA) * EE_QSPI_PGSZ)
+static uint8_t emu_disk[(1u + EMU_DISK_DATA) * EE_QSPI_PGSZ];
+static uint8_t emu_disk_attached = 0;
+static uint8_t emu_cw_chain[8], emu_cw_n = 0;
+// Power cuts. Every erase and every program is one operation; the one that brings emu_cut_after to
+// zero is interrupted and nothing after it happens, until the test "powers on" again. How it is
+// interrupted is emu_cut_kind: 0 = an erase leaves the sector as noise and a program lands half its
+// bytes; 1 = the erase completes and the program lands nothing (the power went between the two).
+static uint8_t  emu_cut_kind = 0;
+static int32_t  emu_cut_after = -1;
+static uint8_t  emu_power_lost = 0;
+static uint32_t emu_flash_ops = 0;
+static int emu_flash_op(void){            // 0 = no power, 1 = do it, 2 = this is the one that is interrupted
+  if (emu_power_lost) return 0;
+  emu_flash_ops++;
+  if (emu_cut_after < 0) return 1;
+  if (emu_cut_after-- > 0) return 1;
+  emu_power_lost = 1; return 2;
 }
+static uint8_t *emu_fl(uint32_t a){
+  if (a < EE_SFILE_SZ) return &ee_sfile[a];
+  if (a >= EMU_DISK_BASE && a < EE_FLASH_END) return &emu_disk[a - EMU_DISK_BASE];
+  return NULL;
+}
+static void ee_rd(uint32_t a, void*d, uint32_t n){
+  if (ee_sfile_rdfault){ ee_rd_fault = 1; memset(d, 0, n); return; }
+  uint8_t *p = emu_fl(a);
+  if (p && emu_fl(a + n - 1)) memcpy(d, p, n); else memset(d, 0xFF, n);   // nothing there: reads as erased
+}
+static uint32_t ee_rd32(uint32_t a){ uint32_t v; ee_rd(a, &v, 4); if (ee_rd_fault) return 0; return v; }
+static void ee_erase(uint32_t a){
+  int op = emu_flash_op(); uint8_t *p = emu_fl(a & ~(EE_QSPI_PGSZ-1u));
+  if (!op || !p) return;
+  if (op == 1 || emu_cut_kind) memset(p, 0xFF, EE_QSPI_PGSZ);
+  else for (uint32_t i=0;i<EE_QSPI_PGSZ;i++) p[i] = (uint8_t)(p[i] | (uint8_t)(i*37u + (a>>12)*11u));   // bits rise unevenly
+}
+static void ee_prog(uint32_t a, const uint8_t *b, uint32_t n){          // NOR: 1->0 only
+  int op = emu_flash_op(); uint8_t *p = emu_fl(a);
+  if (!op || !p) return;
+  if (op == 2) n = emu_cut_kind ? 0 : n / 2;
+  for (uint32_t i=0;i<n;i++) p[i] &= b[i];
+}
+static void ee_prog_dw(uint32_t a, uint64_t v){ uint8_t s[8]; memcpy(s,&v,8); ee_prog(a, s, 8); }
 #else
 // Native: straight to the QSPI chip. Every caller holds a resolved SETTINGS.BIN (ee_avail/ee2_avail
 // gate them all). Reads retry through the driver's reentrancy self-abort the same way USER_read does
@@ -146,6 +187,10 @@ static void ee_rd(uint32_t a, void*d, uint32_t n){
 }
 static void ee_erase(uint32_t a){ QSPI_Erase_Sector(a); }
 static void ee_prog_dw(uint32_t a, uint64_t v){ uint8_t b[8]; memcpy(b,&v,8); QSPI_Program(b, a, 8); }
+static void ee_prog(uint32_t a, const uint8_t *b, uint32_t n){          // the chip programs at most one 256-byte page a call
+  for (uint32_t o=0;o<n;o+=256u) QSPI_Program((uint8_t*)b+o, a+o, (n-o) > 256u ? 256u : (n-o));
+}
+#define EE_FLASH_END 0x1000000u                                         // the 16 MB chip
 #endif
 // The store's one rule for a failed read: stop, and touch nothing. Returns 1 if a read has failed
 // since boot; both stores then run RAM-only until the next power-on (which retries), so no erase or
@@ -156,12 +201,12 @@ static _Bool ee_fault_check(void){
   return 1;
 }
 
-static uint16_t ee_crc16(const uint8_t*p, uint32_t n){   // CRC-16-CCITT (poly 0x1021, init 0xFFFF)
-  uint16_t c=0xFFFF;
+static uint16_t ee_crc16_upd(uint16_t c, const uint8_t*p, uint32_t n){   // CRC-16-CCITT (poly 0x1021)
   for (uint32_t i=0;i<n;i++){ c ^= (uint16_t)((uint16_t)p[i]<<8);
     for (int b=0;b<8;b++) c = (c&0x8000)?(uint16_t)((c<<1)^0x1021):(uint16_t)(c<<1); }
   return c;
 }
+static uint16_t ee_crc16(const uint8_t*p, uint32_t n){ return ee_crc16_upd(0xFFFF, p, n); }   // init 0xFFFF
 // Record byte layout: 0 magic u32 | 4 gen u32 | 8 schema u16 | 10 fdate u16 | 12 ftime u16 |
 // 14 simple_mask u16 | 16 modes_mask_lo u32 | 20 modes_val_lo u32 | 24 brightness i16 | 26 colon u8 |
 // 27 alt_colon u8 | 28 page_ms u16 | 30 sig_fade u8 | 31 pps u8 | 32 nmea u8 | 33 matrix_freq u32 | 37 tc u8 | 38 bal u8 | 39 cuckoo u8 |
@@ -229,6 +274,11 @@ static void ee_unpack(const uint8_t*r){
 #ifdef __EMSCRIPTEN__
 static _Bool settings_resolve(void){
   ee_sfile_state = ee_sfile_attached ? (ee_sfile_frag ? 2 : 1) : 0;
+  if (ee_sfile_state == 1 && emu_disk_attached) {     // the file is only there if the directory still lists it
+    _Bool listed = 0;
+    for (uint32_t o = 0; o < EE_QSPI_PGSZ; o += 32) if (!memcmp(&emu_disk[o], "SETTINGSBIN", 11)) listed = 1;
+    if (!listed) ee_sfile_state = 0;
+  }
   if (ee_sfile_state != 1) return 0;
   ee_page_a = 0x0000u; ee_page_b = 0x1000u;
   ee_backing = EE_BK_QSPI;
@@ -274,6 +324,104 @@ static _Bool ee_page_blank(uint32_t base){
   for (uint32_t o = 0; o < EE_QSPI_PGSZ; o += 4) if (ee_rd32(base + o) != 0xFFFFFFFFu) return 0;
   return 1;
 }
+// ---- A sector rewritten safely (for config_write.h) ---------------------------------------------
+// NOR flash rewrites a sector by erasing it first, and for about 60 ms there is nothing there. A power
+// cut in that gap would lose 4 KB of config.txt, or of the directory that lists every file. So the
+// new contents go somewhere else first:
+//   1. the image is written to the menu store's idle page (the page a later page swap erases anyway);
+//   2. a record in the active page says where the image belongs, and its checksums: the commit;
+//   3. the target sector is erased and written, and read back;
+//   4. the record is cancelled (its second doubleword programmed to zero: NOR needs no erase for that).
+// At boot a record that is still valid finishes step 3. Before step 2 completes, the target has not
+// been touched. Record: 0 magic "MK4J" | 4 target u32 | 8 schema u16 | 10 image crc16 |
+// 12 image page u32 | 16 image sum32 | 62 crc16. The store itself is not saved while a rewrite is
+// open: a page swap would erase the image. A page always starts with a menu record, so a record of
+// this kind is never first, and a build that does not know the magic steps over it.
+#define EE_JMAGIC  0x4D4B344Au        // "MK4J"
+#define EE_JSCHEMA 0x4A01u
+enum { J_IDLE=0, J_ERASE_IMG, J_PROG_IMG, J_RECORD, J_ERASE_TGT, J_PROG_TGT, J_VERIFY };
+static struct { uint8_t st, tries, ok; uint16_t i; uint32_t target, img, rec; const uint8_t *buf; } jx;
+static uint32_t ee_sum32_upd(uint32_t s, const uint8_t *p, uint32_t n){ for (uint32_t i=0;i<n;i++) s = s*31u + p[i]; return s; }
+static _Bool ee_same(uint32_t a, const uint8_t *b){            // does the sector at a hold b?
+  uint8_t t[64];
+  for (uint32_t o=0;o<EE_QSPI_PGSZ;o+=sizeof t){ ee_rd(a+o, t, sizeof t); if (memcmp(t, b+o, sizeof t)) return 0; }
+  return !ee_rd_fault;
+}
+static _Bool settings_mapping_ok(void);
+// Begin rewriting the sector at `target` with the 4096 bytes at img, which must stay put until done.
+static SMALL_CODE _Bool ee_j_begin(uint32_t target, const uint8_t *img){
+  if (jx.st || !ee_avail || !settings_mapping_ok()) return 0;
+  if (ee_next == 0 || ee_next >= EE_SLOTS || ee_rd32(ee_active) != EE_MAGIC) return 0;   // the idle page must be idle, and a slot free
+  jx.target = target; jx.buf = img; jx.img = (ee_active==ee_page_a) ? ee_page_b : ee_page_a;
+  jx.tries = 0; jx.ok = 0; jx.st = J_ERASE_IMG;
+  return 1;
+}
+// One bounded piece of the rewrite a call. Returns 1 while it is in progress; jx.ok says how it ended.
+static SMALL_CODE _Bool ee_j_step(void){
+  switch (jx.st) {
+    case J_IDLE: return 0;
+    case J_ERASE_IMG: ee_erase(jx.img); jx.i = 0; jx.st = J_PROG_IMG; break;
+    case J_PROG_IMG:  ee_prog(jx.img + jx.i, jx.buf + jx.i, 512); if ((jx.i += 512) >= EE_QSPI_PGSZ) jx.st = J_RECORD; break;
+    case J_RECORD: {
+      if (!ee_same(jx.img, jx.buf)) { jx.st = (++jx.tries < 3) ? J_ERASE_IMG : J_IDLE; break; }   // only a verified image is committed
+      while (ee_next < EE_SLOTS && ee_rd32(ee_active + (uint32_t)ee_next*EE_REC_SZ) != 0xFFFFFFFFu) ee_next++;
+      if (ee_next >= EE_SLOTS || ee_fault_check()) { jx.st = J_IDLE; break; }
+      uint8_t r[EE_REC_SZ]; memset(r, 0, sizeof r);
+      uint32_t mg = EE_JMAGIC, sum = ee_sum32_upd(0, jx.buf, EE_QSPI_PGSZ);
+      uint16_t sc = EE_JSCHEMA, ic = ee_crc16(jx.buf, EE_QSPI_PGSZ);
+      memcpy(r+0,&mg,4); memcpy(r+4,&jx.target,4); memcpy(r+8,&sc,2); memcpy(r+10,&ic,2); memcpy(r+12,&jx.img,4); memcpy(r+16,&sum,4);
+      uint16_t crc = ee_crc16(r, 62); memcpy(r+62,&crc,2);
+      jx.rec = ee_active + (uint32_t)ee_next*EE_REC_SZ;
+      ee_prog(jx.rec, r, EE_REC_SZ);                         // one page program: the checksum lands with the rest
+      ee_next++; jx.tries = 0; jx.st = J_ERASE_TGT;
+      break; }
+    case J_ERASE_TGT: ee_erase(jx.target); jx.i = 0; jx.st = J_PROG_TGT; break;
+    case J_PROG_TGT:  ee_prog(jx.target + jx.i, jx.buf + jx.i, 512); if ((jx.i += 512) >= EE_QSPI_PGSZ) jx.st = J_VERIFY; break;
+    case J_VERIFY:
+      if (!ee_same(jx.target, jx.buf)) { jx.st = (++jx.tries < 3) ? J_ERASE_TGT : J_IDLE; break; }   // left open: the next boot tries again
+      ee_prog_dw(jx.rec + 8, 0);                             // cancel the record
+      jx.ok = 1; jx.st = J_IDLE;
+      break;
+  }
+  if (ee_rd_fault) { ee_fault_check(); jx.st = J_IDLE; }
+  return jx.st != J_IDLE;
+}
+// Finish a rewrite that a power cut interrupted: look in `page` for a record that is still valid.
+// Returns 1 if a sector was rewritten.
+static SMALL_CODE _Bool ee_j_replay(uint32_t page){
+  uint8_t r[EE_REC_SZ], t[256];
+  for (uint16_t s=1; s<EE_SLOTS; s++){
+    uint32_t a = page + (uint32_t)s*EE_REC_SZ;
+    if (ee_rd32(a) != EE_JMAGIC) continue;
+    ee_rd(a, r, EE_REC_SZ);
+    uint16_t sc, ic, crc; uint32_t target, img, sum;
+    memcpy(&sc,r+8,2); memcpy(&crc,r+62,2);
+    if (sc != EE_JSCHEMA || ee_crc16(r,62) != crc || ee_rd_fault) continue;      // cancelled, torn, or unreadable
+    memcpy(&target,r+4,4); memcpy(&ic,r+10,2); memcpy(&img,r+12,4); memcpy(&sum,r+16,4);
+    uint16_t c = 0xFFFF; uint32_t sm = 0;
+    for (uint32_t o=0;o<EE_QSPI_PGSZ;o+=sizeof t){ ee_rd(img+o, t, sizeof t); c = ee_crc16_upd(c, t, sizeof t); sm = ee_sum32_upd(sm, t, sizeof t); }
+    _Bool good = !ee_rd_fault && c == ic && sm == sum &&
+                 !(target & (EE_QSPI_PGSZ-1u)) && !(img & (EE_QSPI_PGSZ-1u)) && target < EE_FLASH_END && img < EE_FLASH_END && target != img;
+    if (good) {
+      ee_erase(target);
+      for (uint32_t o=0;o<EE_QSPI_PGSZ;o+=sizeof t){ ee_rd(img+o, t, sizeof t); ee_prog(target+o, t, sizeof t); }
+    }
+    if (ee_rd_fault) return 0;
+    ee_prog_dw(a + 8, 0);                                    // done, or never whole: either way it is closed
+    return good;
+  }
+  return 0;
+}
+// The directory sector itself may be the one that was being rewritten, and then SETTINGS.BIN cannot be
+// found to look for the record. So look without the directory: a store page starts with a menu record,
+// which says so in its first word, at the start of some 4 KB sector on the chip.
+static SMALL_CODE _Bool ee_j_recover_raw(void){
+  for (uint32_t a = 0; a < EE_FLASH_END; a += EE_QSPI_PGSZ)
+    if (ee_rd32(a) == EE_MAGIC && ee_j_replay(a)) return 1;
+  ee_rd_fault = 0;                                           // a read fault here is the medium's, and ee_init_base starts afresh
+  return 0;
+}
+
 // Scan both pages for the highest-generation CRC-valid record; position the append cursor. Shared by
 // boot load (unpack=1) and the post-host-write remap rescan (unpack=0 — RAM state may be newer than
 // anything stored, so a rescan must never clobber ovr).
@@ -311,6 +459,7 @@ static void ee_scan(_Bool unpack){
     if (best_gen > ee_gen) ee_gen = best_gen;               // gen stays monotonic across remaps
   }
   if (ee_fault_check()) return;      // a read failed: "no record" may be a lie - never erase on it
+  if (unpack && found) ee_j_replay(ee_active);              // a sector rewrite a power cut interrupted: finish it
   if (!found && ee_backing == EE_BK_QSPI){
     // First use of a freshly-provisioned (or host-rewritten) file: NOR can only program 1->0, so a
     // 0x00-filled or garbage-filled file would AND every record into a CRC failure FOREVER. Erase the
@@ -333,6 +482,13 @@ void ee_load(void){
   ee_init_base();
   ovr.valid=0; ee_active=ee_page_a; ee_next=0; ee_gen=0;
   cfg_prev_known = 0; ee_ext_stored = 0;   // a boot: what the file last said comes from the store, if it is there
+  jx.st = J_IDLE;
+  if (!ee_avail && ee_j_recover_raw()) {   // the directory was mid-rewrite: now that it is whole, look again
+#ifndef __EMSCRIPTEN__
+    FATFS_remount();
+#endif
+    ee_init_base();
+  }
   if (!ee_avail) return;
   ee_scan(1);
 }
@@ -428,6 +584,7 @@ static _Bool ee_sentinel(uint32_t magic, uint32_t page_a, uint32_t page_b,
 // power loss mid-write just fails CRC and ee_load falls back to the prior generation). Caller gates.
 static _Bool ee_commit(void){
   if (!ee_avail || !ovr.valid) return 0;
+  if (jx.st) return 0;                                   // a sector rewrite is open: its image is in the idle page
   if (!settings_mapping_ok()) return 0;
   uint8_t rec[EE_REC_SZ];
   fatfs_busy = 1;          // eject-triggered reset must defer across the WHOLE multi-op commit
@@ -746,7 +903,7 @@ static void tc_forget_step(void){
 // have_file = 0: there is no config.txt to read. The stored choices apply and the memory of the last
 // real file is kept, so a file that reappears (an editor that saves by delete and rename) is compared
 // with the file before it, not with nothing.
-static void menu_reconcile(_Bool have_file){
+static SMALL_CODE void menu_reconcile(_Bool have_file){
   _Bool stamp_ok = (ovr.stamp_fdate || ovr.stamp_ftime) &&
                    ovr.stamp_fdate==config.fdate && ovr.stamp_ftime==config.ftime;
   uint64_t now_modes_val = 0;          // what the file says for each mode it mentions: the parser has just
@@ -877,7 +1034,7 @@ static const char *const mode_key[NUM_DISPLAY_MODES] = {
 };   // MODE_FIRMWARE_CRC_D has no key of its own: the one config.txt key sets both slots
 #define MX_SIMPLE 17u                    // the lines before the modes
 // Line `slot` of the export: 0 = the store does not hold it. val is at least 12 bytes.
-static const char *menu_export_item(uint16_t slot, char *val){
+static SMALL_CODE const char *menu_export_item(uint16_t slot, char *val){
   static const struct { uint8_t kid; const char *key; } sk[MX_SIMPLE] = {
     {KID_BRIGHTNESS,"brightness"}, {KID_COLON,"colon_mode"}, {KID_COLON_ALT,"colon_alt_mode"}, {KID_PAGE_MS,"page_ms"},
     {KID_SIG_FADE,"significance_fade"}, {KID_PPS,"pps"}, {KID_NMEA,"nmea"}, {KID_MATRIX_FREQ,"MATRIX_FREQUENCY"},
@@ -913,7 +1070,7 @@ static const char *menu_export_item(uint16_t slot, char *val){
   if (word) strcpy(val, word); else snprintf(val, 12, "%ld", num);
   return sk[slot].key;
 }
-static void menu_export_step(void){
+static SMALL_CODE void menu_export_step(void){
   static uint16_t slot = 0, sent = 0;
   static uint32_t gen = 0;
   static int      dn = -1;                // a formatted line is waiting to go

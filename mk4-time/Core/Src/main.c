@@ -164,6 +164,17 @@ uint8_t displayMode = 0, countMode = 0;
 #define is_alt_mode(m) ((m) == MODE_LST || (m) == MODE_SOLAR || (m) == MODE_ZONE2)
 uint8_t requestMode = 255;
 
+volatile uint8_t config_write = 0;   // "config_write = on": the parser sets it, config_write.h (below it) acts on it
+
+// This file is compiled -O3, for the interrupt handlers. Code that runs rarely and never on a timing
+// path (the settings store's merge, the menu export, the config.txt writer) is built for size instead,
+// and kept out of line: at -O3 it came to several kilobytes more than it needs.
+#if defined(__GNUC__) && !defined(__clang__)
+#define SMALL_CODE __attribute__((optimize("Os"), noinline))
+#else
+#define SMALL_CODE
+#endif
+
 // ---- The menu's public face --------------------------------------------------------------------
 // Two things other sections read: the layer the menu is on (the store commits to flash only at
 // L0_CLOCK) and the text it puts on the date row (sendDate shows it). The rest of the menu's state
@@ -255,6 +266,7 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 #include "main_parts/store.h"               // SETTINGS.BIN: the menu settings store and the tempcomp store
 #include "main_parts/menu.h"                // the two-button menu
 #include "main_parts/config.h"              // config.txt and serial config lines: the parser, the defaults table, the file loader
+#include "main_parts/config_write.h"        // the clock writes its menu choices into config.txt itself (opt-in)
 #include "main_parts/housekeeping.h"        // the timing subsystems' once-per-pass work in the main loop
 
 void generateDACbuffer(uint16_t * buf) {

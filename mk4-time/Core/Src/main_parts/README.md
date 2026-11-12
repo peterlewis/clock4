@@ -84,7 +84,8 @@ Their order in it follows the order of the sections here.
 | `modes.h` | Which digits may be shown (the precision ladder), changing display mode, the buttons |
 | `date_row.h` | `sendDate`: every display mode formatted for the date board, in its own C-library context |
 | `dumps.h` | The serial reports: tc_dump, $PMADEV, $PMHDEV, $PMSTAR |
-| `store.h` | SETTINGS.BIN: the menu settings store and the tempcomp store |
+| `store.h` | SETTINGS.BIN: the menu settings store, the tempcomp store, and the journal for a safe sector rewrite |
 | `menu.h` | The two-button menu |
 | `config.h` | `config.txt` and serial config lines: the parser, the defaults table, the file loader |
+| `config_write.h` | The clock writing its menu choices into `config.txt` itself (opt-in) |
 | `housekeeping.h` | The timing subsystems' once-per-pass work in the main loop |
