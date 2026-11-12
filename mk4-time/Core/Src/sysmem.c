@@ -25,6 +25,8 @@
 #include <errno.h>
 #include <stdio.h>
 #include <sys/types.h>
+#include <malloc.h>
+#include "main.h"
 
 /* Variables */
 extern int errno;
@@ -57,3 +59,37 @@ caddr_t _sbrk(int incr)
 	return (caddr_t) prev_heap_end;
 }
 
+/**
+ __malloc_lock / __malloc_unlock
+ newlib calls these around every heap operation; its own versions do nothing.
+ This firmware allocates from interrupts as well as from the main loop: any
+ printf of a float goes through dtoa, which mallocs, and sendDate() formats
+ floats from the SysTick, PendSV and DAC-DMA handlers (the Julian, VBAT,
+ TEMPCOMP and ADEV rows), while the main loop mallocs in ZoneDetect and in
+ its own float prints. An interrupt landing inside the main loop's malloc
+ walked a half-updated free list. Masking interrupts for the few
+ microseconds of a heap operation makes each one atomic.
+ PRIMASK is saved on the outermost lock and restored on the matching unlock,
+ so this is safe inside a handler and inside an existing critical section.
+ It does NOT make dtoa's per-thread scratch state private: a float print in
+ the main loop that is interrupted by a float print in a handler can still
+ come out with wrong digits. It can no longer corrupt the heap.
+**/
+static uint32_t malloc_lock_primask;
+static uint32_t malloc_lock_depth;
+
+void __malloc_lock(struct _reent *r)
+{
+	(void)r;
+	uint32_t primask = __get_PRIMASK();
+	__disable_irq();
+	if (malloc_lock_depth++ == 0)
+		malloc_lock_primask = primask;
+}
+
+void __malloc_unlock(struct _reent *r)
+{
+	(void)r;
+	if (--malloc_lock_depth == 0 && !malloc_lock_primask)
+		__enable_irq();
+}
