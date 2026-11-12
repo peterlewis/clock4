@@ -1,12 +1,9 @@
-// main_parts/holdover.h — the significance fade's bound, and the main loop's once-per-pass housekeeping.
+// main_parts/fade.h — the significance fade: the bound on the display's time error in a holdover.
 // A section of main.c, included there once and in order (the list is in main.c). It is not a header:
 // it defines code and state, relies on everything main.c declares above it, and must not be included
 // anywhere else. main_parts/README.md says why this is one translation unit.
 
-// "menu_dump = on" diagnostic — reports whether the override store is flash-backed or RAM-only.
-// Defined below the ee_* globals (needs ee_avail / ee_page_a / ee_gen); forward-declared here so the
-// main loop can call it.
-static void menu_dump_step(void);
+float holdover_u_us = 0.0f;                 // last computed 3σ time-interval-error bound U(τ), µs
 
 // SIGNIFICANCE FADE: the bound U(t) on the display's time error t seconds into a holdover. A
 // sub-second digit fades as U approaches half its place value and is dark once U passes it.
@@ -23,7 +20,7 @@ static void menu_dump_step(void);
 //    steering it out.
 //  - THE WANDER. With the offset removed, what remains grows as t^1.5, a random-walking frequency:
 //    err = a * t^1.5, with a = 1.5e-10 per root-second on that clock from minutes out to hours.
-//    Each clock learns its own a (fw_var above). The learned value is never trusted below
+//    Each clock learns its own a (fw_var, in freq_hold.h). The learned value is never trusted below
 //    FADE_A_FLOOR, that clock's long-run level: with no floor a quiet day talked the bound down and
 //    the next thermal event broke it in 0.7% of cases. Before 2.3 h of lock, twice that level.
 //  - THE FACTOR. FADE_K = 6.5, not 3: the wander is bursty, not Gaussian. With these constants the
@@ -34,7 +31,17 @@ static void menu_dump_step(void);
 // The temperature model's own residual still counts, as before, but only while tc_apply is actually
 // steering from it. One clock supplied the numbers; a noisier one widens its bound itself through
 // the learned wander, and only a quieter one is held to the floor.
-// (FADE_K and the other constants sit with the wander learner, above the governor: tc_dump prints them.)
+#define FADE_K           6.5f
+#define FADE_C0_US       1.0f                 // PPS edge jitter and scheduling at the moment of loss
+#define FADE_SE          0.25f                // ticks/s: how well an 80 s estimate knows the frequency
+#define FADE_A_FLOOR     0.1475f              // (ticks/s)^2 at 1024 s  ==  a = 1.5e-10 per root-second at 80 MHz
+#define FADE_A_DEFAULT   0.59f                // twice that level, until the clock has learned its own
+#define FADE_B_UNKNOWN   10.0f                // ppm: an oscillator never yet measured against GPS
+static float fade_wander_var(void){
+  if (fw_count < FW_MIN) return FADE_A_DEFAULT;
+  return fw_var > FADE_A_FLOOR ? fw_var : FADE_A_FLOOR;
+}
+
 static void computeHoldoverFade(void){
   uint32_t age = (uint32_t)currentTime - last_pps_time;              // holdover seconds
   float tau = (float)age;
@@ -77,51 +84,4 @@ static void computeHoldoverFade(void){
     digit_bright[k] = (uint8_t)(b * (float)FADE_MAX + 0.5f);
   }
   digit_bright[3] = digit_bright[0];   // the decimal point dies with the 0.1 s digit
-}
-
-// Main-loop entry point, called every pass. With every tc key at its default this reduces to
-// four flag checks — no measurable cost, no behaviour change.
-void tc_housekeeping(void){
-  if (!tc_nom_load) tc_nom_load = SysTick->LOAD;       // capture the nominal period once
-
-  // Serial warm-start (armed by the "tc_seed = on" line) + the evolving seed's freeze guard: with
-  // the seed applied, the same call just re-NANs any tc_hse_*/tc_lse_* coefficients a serial line
-  // reparsed, so the frozen path can't silently reactivate over the evolving model.
-  if (tc_seed_pending) { tc_seed_pending = 0; tc_seed_apply(); }
-  else if (tc_seed_done) tc_seed_apply();
-
-  if (tc_reset_pending) {
-    memset(tc_bins, 0, sizeof tc_bins);
-    tc_hse_valid = tc_lse_valid = 0;
-    tc_hse_prior = tc_lse_prior = 0;          // drop any held warm-start prior: reset is a cold restart
-    tc_n_hse = tc_n_lse = 0;
-    tc_e0_set = 0; tc_ema = 0;                // new origin rebase with the next sample
-    fw_break(); fw_var = 0; fw_count = 0;     // the learned wander too: the fade's bound returns to its default
-    tc_reset_pending = 0;
-    if (tc_persist) tc_forget_pending = 1;    // a reset also wipes the retained model from flash
-  }
-
-  if (tc_learn) {
-    tc_hse_learn();
-    tc_lse_learn();
-    static uint32_t last_fit = 0;
-    uint32_t now = (uint32_t)currentTime;
-    if (now - last_fit >= 300) { last_fit = now; tc_fit(); tc_model_check(); }   // refit at most every 5 min, then check whether to re-persist
-  }
-
-  // tc_steer_on in the gate: the governor owns DISENGAGE, so it must stay reachable even if
-  // the user turns every tc key off while steering is engaged mid-holdover — otherwise the
-  // tick ISR would keep applying a stale frozen correction forever.
-  if (freq_hold || significance_fade) fh_learn();   // the oscillator against GPS, one sample per locked second (the fade's bound needs it too)
-
-  if (tc_learn || tc_apply || tc_rtc || freq_hold || tc_steer_on || displayMode == MODE_TEMPCOMP) tc_governor();
-
-  if (significance_fade) {   // recompute the per-digit fade once per second while enabled
-    static uint32_t last_fade = 0;
-    uint32_t now = (uint32_t)currentTime;
-    if (now != last_fade) { last_fade = now; computeHoldoverFade(); }
-  }
-
-  tc_dump_step();
-  menu_dump_step();
 }

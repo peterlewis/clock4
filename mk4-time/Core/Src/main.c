@@ -103,17 +103,13 @@ static void MX_ADC3_Init(void);
 void tmToBcd(struct tm *in, bcdStamp_t *out );
 uint8_t loadRulesSingle(char * str);
 void nextMode(_Bool);
-static uint8_t adev_disp_noct(void);        // Allan-deviation display accessors (engine defined far below;
-static float   adev_disp_sigma(uint8_t k);  // sendDate() lives above the engine, so read via these)
-static volatile uint32_t adev_last_ms;      // uwTick of the last accepted sample (staleness/HOLD tell)
+static void menu_flash(const char *s);     // menu.h; the store calls it (a note on the date row after a factory reset)
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+// ---- State shared by several sections (a section's own state is declared in its own file) ------
 const uint8_t cLut[]= { cSegDecode0, cSegDecode1, cSegDecode2, cSegDecode3, cSegDecode4, cSegDecode5, cSegDecode6, cSegDecode7, cSegDecode8, cSegDecode9 };
-const uint16_t bLut[]={ bSegDecode0, bSegDecode1, bSegDecode2, bSegDecode3, bSegDecode4, bSegDecode5, bSegDecode6, bSegDecode7, bSegDecode8, bSegDecode9 };
-
-const char* wday_str[]={"Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"};
 
 buffer_c_t buffer_c[80] = {0};
 
@@ -124,14 +120,6 @@ uint8_t uart2_tx_buffer[32];
 volatile uint16_t buffer_adc[ADC_BUFFER_SIZE] = {0};
 uint16_t buffer_dac[DAC_BUFFER_SIZE] = {[0 ... DAC_BUFFER_SIZE-1] = 4095};
 float dac_target=4095;
-float vbat = 0.0;
-
-uint16_t buffer_colons_L[200] = {0};
-uint16_t buffer_colons_R[200] = {0};
-
-uint8_t nmea[NMEA_BUF_SIZE];
-uint8_t satview[SV_COUNT];
-uint8_t satview_stale = 0;
 
 time_t currentTime;
 bcdStamp_t nextBcd;
@@ -158,307 +146,31 @@ _Bool data_valid=0, had_pps=0, rtc_good=0, new_position=1;
 // second (starves the balance mirrors, widens the date-board byte-drop window). 999 = never yet.
 double zone_lat=999.0, zone_lon=999.0;
 
-// Astro pack — sun/moon/grid read-outs, computed once a second in the main loop
-// (astro_update) and formatted by the sendDate cases, the same compute-in-loop /
-// format-in-ISR split MODE_VBAT uses for vbat.
-struct astro_cache_s {
-  uint32_t epoch;          // currentTime this was computed for; 0 = never computed
-  _Bool    have_pos;       // a usable lat/lon was available
-  _Bool    sun_up_today;   // false = polar day/night (no rise/set this date)
-  int16_t  rise_min, set_min, noon_min;  // local minutes-of-day [0,1440)
-  int16_t  az, el;         // sun azimuth 0..359 / elevation, whole degrees
-  uint8_t  moon_idx, moon_pct;           // phase index 0..7 / illuminated %
-  char     grid[8];        // Maidenhead locator, or "----"
-  float    lat_show, lon_show;           // the snapshot lat/lon, for MODE_LATLON
-  // MODE_DARK twilight ladder — local minutes-of-day, -1 = not applicable (dashes).
-  int16_t  civ_dusk_min, nau_dusk_min;   // civil (-6) / nautical (-12) evening twilight
-  int16_t  ast_dusk_min, ast_dawn_min;   // astronomical (-18) darkness begins / ends
-  _Bool    dark_tonight;                 // astronomical darkness occurs this date
-  _Bool    always_dark;                  // polar night: sun below -18 now (dark round the clock)
-} astro = {0};
-#define rtc_last_write RTC->BKP30R
-#define rtc_last_calibration RTC->BKP31R
 uint32_t last_pps_time = 0;
-uint32_t time_till_first_fix = 0;
 
-struct tzrule {
-  uint32_t t;
-  int32_t offset;
-} rules[162], rules2[162];             // rules2 = ZONE 2's independent DST table
-#define MAX_RULES  (sizeof rules  / sizeof rules[0])
-#define MAX_RULES2 (sizeof rules2 / sizeof rules2[0])
-
-char loadedRulesString[32];
-char preloadRulesString[32];
-char textDisplay[32];
-// ZONE 2 (MODE_ZONE2): a second civil timezone, named by the `zone2` config key.
-int32_t offset2 = 0;                    // ZONE 2's resolved UTC->local offset (seconds)
-char loadedZone2[32];                   // active ZONE 2 label ("" = unset/unresolved -> dashes)
-char preloadZone2[32];                  // pending name from config, resolved in checkDelayedLoadRules
-_Bool delayedLoadZone2 = 0;
-_Bool zone2_fixed = 0;                  // 1 = offset2 is a literal (UTC / +HH:MM), no DST table walk
-_Bool delayedLoadRules = 0;
 _Bool delayedReadConfigFile = 0;
 _Bool delayedCheckOnEject = 0;
-_Bool delayedPostConfigCleanup = 0;
 // Set while the main loop is inside a (non-reentrant) FATFS operation, so the USB-ISR
 // firmware-eject check defers instead of corrupting FATFS state. volatile: ISR-visible.
 volatile uint8_t fatfs_busy = 0;
-uint32_t delayedDisplayFreq = 0;
 
 _Bool waitingForLatch = 0;
 _Bool resendDate = 0;
 
-uint32_t LPTIM1_high;
-
-uint8_t displayMode = 0, countMode = 0, colonMode = 0;
-// Civil vs alternate-timebase colon animation: colonMode is the ACTIVE selection that
-// loadColonAnimation() renders; the per-context choices live here and applyColonForMode()
-// swaps between them. The sidereal default must stay visually distinct from civil so an
-// alternate-timebase mode can never masquerade as civil time.
-uint8_t colonModeCivil = 0;
-uint8_t colonModeAlt = COLON_MODE_ALT_SAWTOOTH;
+uint8_t displayMode = 0, countMode = 0;
 // The alternate-timebase modes: the time row ticks another clock (sidereal, apparent solar, or the
 // ZONE 2 civil time), the date row keeps the local civil date, and the colons take colon_alt_mode.
 #define is_alt_mode(m) ((m) == MODE_LST || (m) == MODE_SOLAR || (m) == MODE_ZONE2)
-_Bool colonAltExplicit = 0;    // user explicitly set colon_alt_mode
-// §3.5 colon context-preview: while a colon-animation item is being EDITED, force the value under the
-// cursor onto the real colons regardless of the display context (so ALTCOLON is visible even from a
-// civil face). 0xFF = no preview -> applyColonForMode() uses the normal context choice.
-uint8_t colon_preview = 0xFF;
 uint8_t requestMode = 255;
 
-// ---- On-device menu FSM state (all thread-context except the ISR event ring) -------------------
+// ---- The menu's public face --------------------------------------------------------------------
+// Two things other sections read: the layer the menu is on (the store commits to flash only at
+// L0_CLOCK) and the text it puts on the date row (sendDate shows it). The rest of the menu's state
+// is in main_parts/menu.h.
 // v2 four layers: CLOCK -> SECTION ring -> ITEM ring (within a section) -> value EDITor.
 typedef enum { L0_CLOCK=0, L1_SECTION, L2_ITEM, L3_EDIT } MenuLayer;
 static MenuLayer menu_layer   = L0_CLOCK;
-static uint8_t   menu_section = 0;      // L1/L2 current section (SEC_*); preserved across exits (resume)
-static uint8_t   menu_idx     = 0;      // L2 cursor into menu_items[] (ABSOLUTE index; walk by .section)
-static int32_t   menu_val     = 0;      // L3 working value (already live via set-hook)
-static uint8_t   menu_chord   = 0;      // a chord gesture is in progress (>=1 stage seen)
-static uint8_t   menu_stage   = 0;      // 0..3 self-labeled chord stage currently shown
-static uint32_t  menu_last_ms = 0;      // uwTick of the last event (drives 15 s idle)
 static char      menu_text[11]= {0};    // non-empty => the menu OWNS the date row (see sendDate)
-static _Bool     menu_repaint = 0;      // a repaint was deferred out of the SysTick sendDate window
-// §3c hold-acceleration: a run of same-direction STEP taps within ACCEL_GAP_MS grows the increment
-// (main-loop-only state; never volatile / ISR-touched). Reset on enter-edit and on exit/idle.
-static uint32_t  menu_run_last_ms = 0;
-static int8_t    menu_run_dir = 0;
-static uint16_t  menu_run_len = 0;
-// ISR -> main-loop event ring (single-producer USART2 ISR, single-consumer menu_poll)
-#define MENU_EVQ 16
-static volatile uint8_t menu_evq[MENU_EVQ];
-static volatile uint8_t menu_ev_h = 0, menu_ev_t = 0;
-// Called from the USART2 ISR: O(1) enqueue only, so nextMode()/reset never run at ISR priority.
-void menu_isr_event(uint8_t evt){
-  uint8_t nh = (uint8_t)((menu_ev_h + 1u) & (MENU_EVQ - 1));
-  if (nh != menu_ev_t) { menu_evq[menu_ev_h] = evt; menu_ev_h = nh; }   // drop if full
-}
-
-// ---- Menu persistence: the RAM override store (mirrors the winning flash record) ----------------
-// Records ONLY what the user changed on-device (which keys, their values, and the config.txt mtime at
-// edit time), so the boot merge can honour config.txt precedence. cfg_*_defined marks which keys the
-// current config.txt actually set, rebuilt each readConfigFile().
-static struct {
-  _Bool    valid;
-  uint16_t stamp_fdate, stamp_ftime;   // config.txt mtime when the override was made
-  uint16_t simple_mask;                // bit per persisted KID (u16: KID_MATRIX_FREQ=8 and up overflow a u8)
-  int16_t  brightness; uint8_t colon, alt_colon; uint16_t page_ms;
-  uint8_t  sig_fade, pps, nmea;
-  uint32_t matrix_freq;                // KID_MATRIX_FREQ (u32: 100000 > u16)
-  uint8_t  tc;                         // KID_TEMPCOMP: 1 = learn+apply+persist armed
-  uint8_t  bal;                        // KID_BALANCE: 1 = seg+colon balance AUTO
-  uint8_t  cuckoo;                     // KID_CUCKOO: the hourly piece (CK_OFF..CK_TRUST)
-  uint64_t modes_mask, modes_val;      // bit per MODE_* ordinal (u64: MODE_STAR=31 filled a u32; ZONE2/RELATIV/HOLD need >=32)
-  uint8_t  brit;                       // KID_BRIT: 1 = the 1 Hz $PMBRIT dimmer report (brightness_report)
-} ovr;
-static uint16_t cfg_simple_defined;    // bit per KID set by config.txt this load
-static uint64_t cfg_modes_defined;     // bit per MODE_* ordinal set by config.txt this load
-static _Bool    menu_dirty = 0;        // a menu edit is awaiting flash commit
-
-uint8_t nmea_cdc_level=0;
-int debug_rtc_val = 0;
-
-// --- PPS host timestamping ----------------------------------------------------------------
-// Optional: emit one proprietary NMEA sentence ($PMTXTS) per PPS edge over the CDC port so a
-// host can measure the clock's timing stability (phase jitter, oscillator drift, holdover) —
-// things the plain NMEA stream cannot convey. Enabled by config "pps = on". Capture happens in
-// the PPS ISR (cheap, just snapshots); the sentence is formatted + sent from the main loop.
-volatile uint8_t pps_ts_enabled = 0;
-volatile _Bool   pps_record_pending = 0;
-int16_t die_temp_c = 0;  // latest STM32 die temperature (°C), a proxy for the crystal temperature
-// The same sensor, kept in fractions of a degree and low-pass filtered, for the holdover steering.
-// die_temp_c is the vendor's whole-degree conversion; the bins, the display and $PMTXTS keep using it.
-// Steering from it made every 1 degree flip of the reading a step in rate, and froze the temperature
-// "at loss" to the nearest degree: on recorded data tc_apply cut the large holdover errors but DOUBLED
-// the typical one (7.6 -> 15.6 us at an hour). Filtering the readings took that back to about 9 us and
-// improved the large errors further. One raw count is about 0.3 degC; the filter resolves finer.
-float die_temp_f = 0.0f;
-_Bool die_temp_f_ok = 0;                 // false until the first reading: the steering then falls back to die_temp_c
-#define DIE_TEMP_FILTER 32.0f            // readings in the filter's memory: one every 4 s, about 2 minutes
-
-// Raw sensor count -> degrees C, the vendor's two-point formula in floating point (no truncation).
-// cal1/cal2 are the factory counts at the two calibration temperatures, taken at 3.0 V; vdda_mv is
-// the supply the count was taken at.
-static float die_temp_convert(uint32_t raw, int32_t cal1, int32_t cal2, float vdda_mv){
-  if (cal2 == cal1) return 0.0f;
-  float scaled = (float)raw * vdda_mv / (float)TEMPSENSOR_CAL_VREFANALOG;
-  return (scaled - (float)cal1) * (float)(TEMPSENSOR_CAL2_TEMP - TEMPSENSOR_CAL1_TEMP) / (float)(cal2 - cal1)
-         + (float)TEMPSENSOR_CAL1_TEMP;
-}
-static void die_temp_filter(float t){
-  if (!isfinite(t)) return;
-  if (!die_temp_f_ok) { die_temp_f = t; die_temp_f_ok = 1; return; }   // the first reading is the estimate
-  die_temp_f += (t - die_temp_f) / DIE_TEMP_FILTER;
-}
-volatile struct {
-  uint32_t seq;        // increments every PPS edge (32-bit: no practical wrap; host detects gaps)
-  uint32_t systick;    // SysTick->VAL at the edge, captured BEFORE the reload (down-counter)
-  uint16_t subms;      // 0..999 modelled ms-of-second at the edge, BEFORE the counters reset
-  uint32_t epoch;      // currentTime at the edge (Unix seconds, UTC)
-  int32_t  calerr;     // debug_rtc_val: signed LSE cycle error over CAL_PERIOD s (=> ppm on host)
-  uint32_t sincecal;   // seconds since last successful RTC calibration (holdover age)
-  int16_t  temp;       // die temperature (°C) — for host-side ppm-vs-temperature characterisation
-  uint8_t  flags;      // bit0 data_valid, bit1 had_pps, bit2 rtc_good
-  uint32_t dwt_pps;    // DWT->CYCCNT (free-running 12.5ns) latched at the edge — SOF-correlation timebase
-} pps_cap;
-
-// --- SOF correlation (experimental: sub-ms USB timestamping without a hardware PPS wire) -----------
-// Latched by the USB SOF interrupt (PCD_SOFCallback, usbd_conf.c) every 1ms WHEN pps_ts_enabled: the
-// 11-bit USB frame number and the DWT count at that Start-Of-Frame. Emitted in $PMTXTS so a host —
-// which can read each USB frame's own arrival time in hardware — can place the PPS edge on its clock
-// via the frame, immune to the ~6ms host-driven read jitter. Written in the SOF ISR, read at emit
-// under __disable_irq. pps_sof_valid gates emission of the tail: it is 0 until the first SOF has
-// latched a real anchor (so the first PPS after enumeration, or with pps just toggled on, or the
-// emulator which has no SOF, emits the plain 9-field sentence rather than a stale (0,0) anchor).
-volatile uint32_t pps_sof_dwt   = 0;   // DWT->CYCCNT at the most recent SOF
-volatile uint16_t pps_sof_frame = 0;   // USB 11-bit frame number at that SOF (matches host frame mod 2048)
-volatile uint8_t  pps_sof_valid = 0;   // 1 once a real SOF anchor has been latched; 0 = emit 9-field only
-
-// --- Temperature compensation (opt-in) ------------------------------------------------------
-// Learns ppm-vs-die-temperature for both oscillators while GPS-locked (tc_learn), then during
-// GPS-loss holdover steers the SysTick timebase from the HSE model (tc_apply) and optionally
-// trims RTC->CALR from the LSE model (tc_rtc) so the battery RTC hands over better time across
-// a power loss. "tc_dump = on" over serial prints the learned coefficients as ready-to-paste
-// config lines; non-NAN tc_hse_a/tc_lse_a in config freeze the model (config overrides learning).
-// All defaults off: with none of the keys set, behaviour is identical to stock.
-// Config-key scalars are written from the USB OTG ISR (parseConfigString) and read by the
-// main loop: volatile, matching the pps_ts_enabled precedent.
-volatile _Bool tc_learn = 0, tc_apply = 0, tc_rtc = 0;
-// Frequency hold (opt-in, see the fh_ block): in holdover, also steer out the oscillator's own offset,
-// measured against GPS while locked. Independent of the tempcomp keys; the two corrections add.
-volatile _Bool freq_hold = 0;
-// Holdover fade (opt-in). A sub-second digit whose accuracy can no longer be held — its time
-// uncertainty during GPS-loss holdover has grown past that digit's place value — FADES to black by
-// its remaining significance instead of dashing, overriding the fixed Tolerance_time_* ladder.
-// digit_bright[] holds per-digit intensity 0..FADE_MAX for the [deciseconds, centiseconds,
-// milliseconds, decimal-point] positions (FADE_MAX = fully lit, i.e. certainly significant).
-// Default 0 = NOT significant: at power-on nothing is disciplined yet (had_pps=0, holdover age is
-// huge), so with significance_fade the sub-second digits must start DASHED and only light once the
-// first computeHoldoverFade() proves significance — else setPrecision() at boot reads a stale FADE_MAX
-// and flashes ticking numbers for ~1 s before the first per-second recompute dashes them.
-volatile _Bool significance_fade = 0;
-#define FADE_MAX 16
-uint8_t digit_bright[4] = { 0, 0, 0, 0 };
-float holdover_u_us = 0.0f;                 // last computed 3σ time-interval-error bound U(τ), µs
-volatile int16_t  tc_t0 = 40;              // model centre temperature (°C)
-volatile uint16_t tc_engage_s = 2;         // seconds of PPS absence before steering engages (min 2)
-volatile uint16_t tc_max_ppm = 100;        // hard clamp on the applied correction magnitude
-// Frozen coefficients (ppm units at tc_t0). Elements are single-word (atomic) reads/writes;
-// consumers snapshot each element once. HSE has NO 'a': its learned origin is arbitrary and
-// steering uses temperature differences only, so freezing needs just b (and optionally c).
-float tc_cfg_hse[3] = {NAN, NAN, NAN};     // [0] unused, [1] ppm/°C, [2] ppm/°C²
-float tc_cfg_lse[3] = {NAN, NAN, NAN};     // absolute: ppm, ppm/°C, ppm/°C²
-volatile _Bool tc_dump_pending = 0;        // set by the serial parser, serviced in the main loop
-volatile _Bool tc_reset_pending = 0;
-volatile _Bool adev_dump_pending = 0;      // "adev_dump = on" over serial -> emit one $PMADEV sentence
-volatile _Bool hdev_dump_pending = 0;      // "hdev_dump = on" over serial -> emit one $PMHDEV sentence (Hadamard)
-volatile _Bool factory_reset_pending = 0;     // "factory_reset = on" over serial -> factory-reset the menu store
-volatile _Bool star_dump_pending = 0;      // "star_dump = on" over serial -> emit one $PMSTAR sentence
-volatile _Bool menu_dump_pending = 0;      // "menu_dump = on" over serial -> emit the store-persistence diagnostic
-volatile uint8_t watchdog = 0;             // config "watchdog = on": arm the independent watchdog (see the watchdog block)
-volatile _Bool wdt_dump_pending = 0;       // "wdt_dump = on" over serial -> one line: armed or not, resets, where it hung
-
-// Validated coefficient parse: garbage/'----'/empty leaves the value untouched (a pasted-back
-// commented dump line must not freeze 0.0); an explicit "nan" parses and UNFREEZES the slot.
-static void tc_parse_coeff(const char *v, float *out){
-  char *end;
-  float f = strtof(v, &end);
-  if (end != v) *out = f;
-}
-
-// Steering handoff, governor (main loop) -> tick ISR. base/rem are written together under
-// IRQ-off; the ISR Bresenham distributes `rem` one-tick-longer periods per 1000 ms so the
-// average period is (tc_load_base+1) + rem/1000 ticks — fractional-ppm rate steering.
-volatile uint8_t tc_steer_on = 0;
-volatile int32_t tc_load_base = 0;         // SysTick->LOAD for the shorter of the two periods
-volatile int32_t tc_rem = 0;               // extra-tick remainder, always in [0,1000)
-volatile int32_t tc_acc = 0;               // Bresenham accumulator (ISR-owned)
-
-// Learned state (main-loop only). 2 °C bins spanning die temp -8..71 °C; sums are bounded by
-// the halving-at-32768 aging rule (max |sum| ~ 6400*32768 < 2^31), so int32 cannot overflow.
-struct tc_bin { int32_t hse_sum, lse_sum; uint16_t hse_n, lse_n; };
-struct tc_bin tc_bins[40];
-float tc_hse_m[3], tc_lse_m[3];            // learned models (ppm at powers of T - tc_t0)
-_Bool tc_hse_valid = 0, tc_lse_valid = 0;
-int16_t tc_hse_tmin = 0, tc_hse_tmax = 0;  // learned coverage: model is clamped to this range
-int16_t tc_lse_tmin = 0, tc_lse_tmax = 0;
-uint32_t tc_n_hse = 0, tc_n_lse = 0;       // lifetime sample counts (display + dump)
-// Weighted-RMS residual of each learned fit (model vs bin means): the model's OWN error, in its
-// fit units (HSE: SysTick ticks/s; LSE: ppm). This is the holdover-fade uncertainty's σ_temp source
-// — how far the temperature model actually is from the measured data, not a guess.
-float tc_hse_resid = 0, tc_lse_resid = 0;
-
-// ---- Auto-persist the learned model to flash retained memory (opt-in: tc_persist = on) ----------
-// The record stores exactly what tc_dump prints and tc_seed re-loads (ppm-domain coefficients), so
-// boot warm-starts through the UNCHANGED tc_seed_apply path — auto-persist = "auto tc_dump into
-// flash", auto-seed = "auto paste + tc_seed = on". tc2 is both the RAM shadow of the winning flash
-// record AND the "last persisted model" the change-detector compares against.
-volatile _Bool tc_persist = 0;              // config master opt-in (default off = stock behaviour)
-volatile _Bool tc_forget_pending = 0;       // "tc_forget = on" over serial -> erase the tempcomp store
-static   _Bool tc_model_dirty = 0;          // live model has moved beyond threshold since last persist
-static uint32_t tc_last_commit_ms = 0;      // uwTick at last commit (MONOTONIC — never GPS wall time)
-static _Bool   tc_persist_seeded = 0;       // a flash record seeded the model this boot (one-shot guard)
-static struct {
-  _Bool valid, hse_valid, lse_valid;
-  int16_t t0, lo, hi;
-  float hse_b, hse_c, lse_a, lse_b, lse_c, hse_resid, lse_resid;
-  uint32_t n_hse, n_lse;
-} tc2;
-// config.txt "which tempcomp keys were set this load" — for the auto-seed precedence (config wins).
-#define CFG_TC_SEED 1u
-#define CFG_TC_T0   2u
-#define CFG_TC_LO   4u
-#define CFG_TC_HI   8u
-static uint8_t cfg_tc_defined = 0;
-
-// Warm-start (seed-and-evolve). A previously-learned model — the last tc_dump, written back into
-// config.txt by the host (the firmware never writes the filesystem; the QSPI drive is host-owned) —
-// is reloaded at boot as an evolving PRIOR rather than a hard freeze. The clock is temperature-
-// compensated from the first second and keeps refining: tc_hse_prior/tc_lse_prior hold the model
-// ORDER (1 const, 2 linear, 3 quadratic) currently carried by the seed, and tc_fit keeps that model
-// until real learning supports a fit at least as rich, then hands over. tc_seed = off leaves the
-// existing freeze path (tc_hse_b/… as asserted constants) untouched.
-volatile _Bool   tc_seed = 0;                 // config: warm-start from the seeded coefficients + evolve
-volatile int16_t tc_seed_lo = 0, tc_seed_hi = 0;   // seed coverage (die °C): bounds the prior — never extrapolated
-uint8_t tc_hse_prior = 0, tc_lse_prior = 0;   // seed model order still held (0 = handed over to real data)
-_Bool tc_seed_done = 0;                        // one-shot: seed once per power-on (BSS-cleared at reset)
-// Serial "tc_seed = on" arms this (ISR-side single-word write); tc_housekeeping consumes it in the
-// MAIN LOOP, so the learned-state contract ("main-loop only") holds and a paste seeds exactly once,
-// after all its coefficient lines have parsed (send "tc_seed = on" last — the order tc_dump prints).
-volatile _Bool tc_seed_pending = 0;
-static void tc_seed_apply(void);              // defined by the tempcomp block; called after the config load
-void tc_seed_from_flash(void);                // retained-model auto-seed; runs just before tc_seed_apply
-void fw_restore_from_flash(void);             // retained wander level; runs just before it
-void tc_persist_after_seed(void);             // caps prior order + restores counts; runs just after it
-static void tc_model_check(void);             // change detector; called after tc_fit in tc_housekeeping
-
-// Display cache for MODE_TEMPCOMP. Written by the governor (main loop); read by sendDate,
-// which ALSO runs from the SysTick ISRs — each field is a single 32-bit (atomic) access, so
-// the worst case is a one-repaint-stale value pairing, never a torn read.
-float tc_disp_hse = 0, tc_disp_lse = 0;
-_Bool tc_disp_hse_ok = 0, tc_disp_lse_ok = 0;
-char  tc_disp_state = '-';                 // A applying · F frozen (config) · L learning · - idle
 
 #define CHECK_CONFIG_MTIME
 
@@ -479,6 +191,10 @@ struct {
   _Bool modes_enabled[NUM_DISPLAY_MODES];
 
 } config = {0};
+// Sub-screen dwell (ms) for every mode that pages its date row. Unset -> 5500 ms, a
+// subjectively-tuned cadence found by feel. Floored at 250 ms so a tiny value can't
+// flood the date-board UART.
+static uint32_t page_ms(void){ uint32_t m = config.page_ms; return m == 0 ? 5500 : (m < 250 ? 250 : m); }
 
 struct {
   float in;
@@ -502,35 +218,43 @@ void memcpyword(volatile uint32_t *dest, volatile uint32_t *src, size_t n){
   }
 }
 
+// The USB serial port, for every section that writes a sentence or a report to the host.
+// usbd_cdc_if.h isn't pulled into main.c; forward-declare the one symbol we need.
+extern uint8_t CDC_Copy_Transmit(uint8_t* buf, uint16_t Len);
+extern USBD_HandleTypeDef hUsbDeviceFS;
+
 // ---- The rest of the application, in sections --------------------------------------------------
-// main.c used to hold all of it in one 7,500-line file. The sections below are that same text, cut
-// along its existing boundaries and included in the same order, so this is still ONE translation
-// unit and the compiler sees exactly what it saw before: the linked image is byte-for-byte the same.
-// Each section may use anything declared above it. See main_parts/README.md.
-#include "main_parts/astro_rows.h"          // the sun, moon, grid and star-transit rows: what the main loop computes for them, and ZONE 2 offsets
-#include "main_parts/date_row.h"            // sendDate: every display mode formatted for the date board, in its own C-library context
+// main.c used to hold all of it in one 7,500-line file. It is still ONE translation unit: each section
+// is included here once, in dependency order, and may use anything declared above it. A section owns
+// its own state; what several sections share is declared above this list. The few calls that go UP
+// the list (a handler calling sendDate, the store putting a note on the row through the menu) use the
+// prototypes in main.h and in the PFP block near the top of this file. See main_parts/README.md.
+#include "main_parts/watchdog.h"            // the independent watchdog and its boot-loop guard
+#include "main_parts/diag.h"                // the $PMLOOP loop-latency marks and the $PMBRIT report state
+#include "main_parts/sensors.h"             // USB power, the backup cell voltage, the die temperature
+#include "main_parts/rtc_cal.h"             // calibrating the 32 kHz RTC crystal against GPS
+#include "main_parts/zones.h"               // timezone rules from TZRULES.BIN, and the second zone's offset
+#include "main_parts/astro_rows.h"          // the sun, moon, grid and star-transit rows: what the main loop computes for them
 #include "main_parts/time_row.h"            // the big digits: the next second, countdown, the sidereal / solar / second-zone timebases, the RTC write
 #include "main_parts/gps.h"                 // the NMEA sentences the clock reads: RMC for time and position, GSV for satellites in view
-#include "main_parts/scan.h"                // the display scan: on, off, and per-segment brightness balance (seg_balance)
+#include "main_parts/scan.h"                // the display scan: its length, the per-digit dimming inputs, and the per-segment balance maths (seg_balance)
 #include "main_parts/cuckoo.h"              // scheduled flourishes on the time row
-#include "main_parts/diag.h"                // the $PMLOOP loop-latency marks and the $PMBRIT report state
+#include "main_parts/scan_compose.h"        // the display on and off, and the balance, the fade and the cuckoo composed into the scan
 #include "main_parts/matrix_and_colons.h"   // the scan rate, and the colon animations and their brightness
-#include "main_parts/config.h"              // config.txt and serial config lines: the parser, the defaults table, the file loader
-#include "main_parts/rtc_cal.h"             // calibrating the 32 kHz RTC crystal against GPS
 #include "main_parts/adev.h"                // the Allan and Hadamard deviation engine
 #include "main_parts/pps.h"                 // the PPS edge: capture, the three edge handlers, and the $PMTXTS and $PMBRIT sentences
 #include "main_parts/tempcomp.h"            // learning the oscillators against temperature: samples, fits, seeds, the models
 #include "main_parts/freq_hold.h"           // the oscillator's measured offset and learned wander
 #include "main_parts/governor.h"            // once a second: steer the timebase in holdover, trim the RTC
-#include "main_parts/dumps.h"               // the serial reports: tc_dump, $PMADEV, $PMHDEV, $PMSTAR
-#include "main_parts/watchdog.h"            // the independent watchdog and its boot-loop guard
-#include "main_parts/holdover.h"            // the significance fade's bound, and the main loop's once-per-pass housekeeping
+#include "main_parts/fade.h"                // the significance fade: the bound on the display's time error in a holdover
 #include "main_parts/ticks.h"               // the 1 ms SysTick handlers: the sub-second digits and the .900 preparation of the next second
-#include "main_parts/sensors.h"             // USB power, the backup cell voltage, the die temperature
-#include "main_parts/zones.h"               // timezone rules from TZRULES.BIN
 #include "main_parts/modes.h"               // which digits may be shown (the precision ladder), changing display mode, the buttons
+#include "main_parts/date_row.h"            // sendDate: every display mode formatted for the date board, in its own C-library context
+#include "main_parts/dumps.h"               // the serial reports: tc_dump, $PMADEV, $PMHDEV, $PMSTAR
 #include "main_parts/store.h"               // SETTINGS.BIN: the menu settings store and the tempcomp store
 #include "main_parts/menu.h"                // the two-button menu
+#include "main_parts/config.h"              // config.txt and serial config lines: the parser, the defaults table, the file loader
+#include "main_parts/housekeeping.h"        // the timing subsystems' once-per-pass work in the main loop
 
 void generateDACbuffer(uint16_t * buf) {
 
@@ -809,7 +533,7 @@ int main(void)
   while (1)
   {
     wdt_poll();      // arm (if watchdog = on) and refresh the independent watchdog: the ONLY refresh
-    LP_MARK(1);      // $PMLOOP section marks — see the pmloop block above segbal_isr_refresh
+    LP_MARK(1);      // $PMLOOP section marks — see main_parts/diag.h
     if (loop_diag && (uint32_t)(uwTick - pmloop_win) >= 1000u) {
       pmloop_win = uwTick;
       char pl[40];

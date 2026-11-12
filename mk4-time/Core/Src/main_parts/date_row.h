@@ -3,6 +3,11 @@
 // it defines code and state, relies on everything main.c declares above it, and must not be included
 // anywhere else. main_parts/README.md says why this is one translation unit.
 
+const uint16_t bLut[]={ bSegDecode0, bSegDecode1, bSegDecode2, bSegDecode3, bSegDecode4, bSegDecode5, bSegDecode6, bSegDecode7, bSegDecode8, bSegDecode9 };
+const char* wday_str[]={"Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"};
+uint32_t time_till_first_fix = 0;   // seconds from power-on to the first PPS (MODE_TTFF)
+char textDisplay[32];               // config "text": what MODE_TEXT shows
+
 // 12 bytes at 115200 8E1 is 1.14ms, 32 bytes would be 3.06ms
 // ---- sendDate's private C-library context ---------------------------------------------------
 // newlib keeps the scratch state of float conversion (dtoa's result buffer and its free lists) in

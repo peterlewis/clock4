@@ -3,6 +3,24 @@
 // it defines code and state, relies on everything main.c declares above it, and must not be included
 // anywhere else. main_parts/README.md says why this is one translation unit.
 
+volatile uint16_t tc_engage_s = 2;         // seconds of PPS absence before steering engages (min 2)
+volatile uint16_t tc_max_ppm = 100;        // hard clamp on the applied correction magnitude
+
+// Steering handoff, governor (main loop) -> tick ISR. base/rem are written together under
+// IRQ-off; the ISR Bresenham distributes `rem` one-tick-longer periods per 1000 ms so the
+// average period is (tc_load_base+1) + rem/1000 ticks — fractional-ppm rate steering.
+volatile uint8_t tc_steer_on = 0;
+volatile int32_t tc_load_base = 0;         // SysTick->LOAD for the shorter of the two periods
+volatile int32_t tc_rem = 0;               // extra-tick remainder, always in [0,1000)
+volatile int32_t tc_acc = 0;               // Bresenham accumulator (ISR-owned)
+
+// Display cache for MODE_TEMPCOMP. Written by the governor (main loop); read by sendDate,
+// which ALSO runs from the SysTick ISRs — each field is a single 32-bit (atomic) access, so
+// the worst case is a one-repaint-stale value pairing, never a torn read.
+float tc_disp_hse = 0, tc_disp_lse = 0;
+_Bool tc_disp_hse_ok = 0, tc_disp_lse_ok = 0;
+char  tc_disp_state = '-';                 // A applying · F frozen (config) · L learning · - idle
+
 // What the governor is steering right now, for the significance-fade bound: the measured offset
 // (freq_hold) and/or the modelled temperature change (tc_apply). Main-loop only.
 static _Bool tc_hold_active = 0, tc_temp_active = 0;

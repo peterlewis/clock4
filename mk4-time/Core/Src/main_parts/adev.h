@@ -132,6 +132,6 @@ static uint8_t hdev_noct(void){                             // same 4m maturity 
   for (uint8_t k=0;k<ADEV_OCT;k++){ if (adev_valid < 4u*(1u<<k)) break; n=(uint8_t)(k+1); }
   return n;
 }
-// Display accessors — sendDate() is defined above the engine, so it reads through these.
+// Display accessors: sendDate reads the engine through these.
 static uint8_t adev_disp_noct(void){ return adev_noct; }
 static float   adev_disp_sigma(uint8_t k){ return (k < ADEV_OCT) ? adev_sigma_cache[k] : 0.0f; }

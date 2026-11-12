@@ -3,6 +3,52 @@
 // it defines code and state, relies on everything main.c declares above it, and must not be included
 // anywhere else. main_parts/README.md says why this is one translation unit.
 
+// ---- Menu persistence: the RAM override store (mirrors the winning flash record) ----------------
+// Records ONLY what the user changed on-device (which keys, their values, and the config.txt mtime at
+// edit time), so the boot merge can honour config.txt precedence. cfg_*_defined marks which keys the
+// current config.txt actually set, rebuilt each readConfigFile().
+static struct {
+  _Bool    valid;
+  uint16_t stamp_fdate, stamp_ftime;   // config.txt mtime when the override was made
+  uint16_t simple_mask;                // bit per persisted KID (u16: KID_MATRIX_FREQ=8 and up overflow a u8)
+  int16_t  brightness; uint8_t colon, alt_colon; uint16_t page_ms;
+  uint8_t  sig_fade, pps, nmea;
+  uint32_t matrix_freq;                // KID_MATRIX_FREQ (u32: 100000 > u16)
+  uint8_t  tc;                         // KID_TEMPCOMP: 1 = learn+apply+persist armed
+  uint8_t  bal;                        // KID_BALANCE: 1 = seg+colon balance AUTO
+  uint8_t  cuckoo;                     // KID_CUCKOO: the hourly piece (CK_OFF..CK_TRUST)
+  uint64_t modes_mask, modes_val;      // bit per MODE_* ordinal (u64: MODE_STAR=31 filled a u32; ZONE2/RELATIV/HOLD need >=32)
+  uint8_t  brit;                       // KID_BRIT: 1 = the 1 Hz $PMBRIT dimmer report (brightness_report)
+} ovr;
+static uint16_t cfg_simple_defined;    // bit per KID set by config.txt this load
+static uint64_t cfg_modes_defined;     // bit per MODE_* ordinal set by config.txt this load
+static _Bool    menu_dirty = 0;        // a menu edit is awaiting flash commit
+volatile _Bool factory_reset_pending = 0;     // "factory_reset = on" over serial -> factory-reset the menu store
+volatile _Bool menu_dump_pending = 0;      // "menu_dump = on" over serial -> emit the store-persistence diagnostic
+
+// ---- Auto-persist the learned model to flash retained memory (opt-in: tc_persist = on) ----------
+// The record stores exactly what tc_dump prints and tc_seed re-loads (ppm-domain coefficients), so
+// boot warm-starts through the UNCHANGED tc_seed_apply path — auto-persist = "auto tc_dump into
+// flash", auto-seed = "auto paste + tc_seed = on". tc2 is both the RAM shadow of the winning flash
+// record AND the "last persisted model" the change-detector compares against.
+volatile _Bool tc_persist = 0;              // config master opt-in (default off = stock behaviour)
+volatile _Bool tc_forget_pending = 0;       // "tc_forget = on" over serial -> erase the tempcomp store
+static   _Bool tc_model_dirty = 0;          // live model has moved beyond threshold since last persist
+static uint32_t tc_last_commit_ms = 0;      // uwTick at last commit (MONOTONIC — never GPS wall time)
+static _Bool   tc_persist_seeded = 0;       // a flash record seeded the model this boot (one-shot guard)
+static struct {
+  _Bool valid, hse_valid, lse_valid;
+  int16_t t0, lo, hi;
+  float hse_b, hse_c, lse_a, lse_b, lse_c, hse_resid, lse_resid;
+  uint32_t n_hse, n_lse;
+} tc2;
+// config.txt "which tempcomp keys were set this load" — for the auto-seed precedence (config wins).
+#define CFG_TC_SEED 1u
+#define CFG_TC_T0   2u
+#define CFG_TC_LO   4u
+#define CFG_TC_HI   8u
+static uint8_t cfg_tc_defined = 0;
+
 // ================= Menu persistence: firmware-owned emulated-EEPROM =============================
 // Two 4 KB pages, append-only ping-pong. Each 64-byte record: {magic, generation, schema, config.txt
 // mtime stamp, the packed override set, CRC16 in the LAST doubleword}. Boot picks the highest-
@@ -567,13 +613,6 @@ static void tc_model_check(void){
       if (d>0.2f){ tc_model_dirty=1; return; } }
   }
 }
-// A $PMTXTS timestamp is actually awaiting emission ONLY when PPS-out is enabled and a capture is
-// pending. pps_record_pending on its own is set on every PPS edge (it also feeds ADEV/RTC/tempcomp)
-// and is cleared only by the emit path, so on a GPS-locked clock with PPS-out off (the default) it
-// latches high forever — gating a flash commit on it directly wedges persistence permanently. Both
-// commit gates below defer a page erase around a real pending emit via this predicate.
-static inline _Bool pps_emit_pending(void){ return pps_ts_enabled && pps_record_pending; }
-
 // Main-loop: persist the model when dirty AND well-supported, throttled to >=30 min on a MONOTONIC
 // clock (uwTick, never GPS wall time), on the menu commit's PPS-safe / UART-idle / L0 gate.
 // The learned wander rides in the same record. It is worth a write when the level the bound USES has
@@ -682,7 +721,6 @@ static void menu_record_key(uint8_t key_id, int32_t v){
 // forget the RAM override store, then re-read config.txt so the clock returns to a config.txt-only
 // state immediately (no reboot). Serial-only + origin-guarded, like tc_reset. Serviced from the main
 // loop (flash erase stalls the CPU, and the config re-read touches the FAT + non-reentrant sendDate).
-static void menu_flash(const char *s);   // defined with the menu FSM below (transient date-row note)
 static void factory_reset_step(void){
   if (!factory_reset_pending) return;
   if (ee_avail && !settings_mapping_ok()) return;   // QSPI: never erase against a stale mapping; retry

@@ -3,6 +3,10 @@
 // it defines code and state, relies on everything main.c declares above it, and must not be included
 // anywhere else. main_parts/README.md says why this is one translation unit.
 
+// Frequency hold (opt-in; explained below): in holdover, also steer out the oscillator's own offset,
+// measured against GPS while locked. Independent of the tempcomp keys; the two corrections add.
+volatile _Bool freq_hold = 0;
+
 // ==================== Frequency hold (opt-in: freq_hold = on) ===================================
 // In holdover the display runs on the SysTick at its NOMINAL reload, so it drifts at the oscillator's
 // own offset from nominal. The tempcomp steering above only applies the CHANGE with temperature since
@@ -74,18 +78,6 @@ static void fw_block(int32_t block_sum){
   fw_prev_y = y; fw_have_prev = 1;
   fw_sum = 0; fw_n = 0;
 }
-// The constants of the significance-fade bound (derived and explained at computeHoldoverFade).
-#define FADE_K           6.5f
-#define FADE_C0_US       1.0f                 // PPS edge jitter and scheduling at the moment of loss
-#define FADE_SE          0.25f                // ticks/s: how well an 80 s estimate knows the frequency
-#define FADE_A_FLOOR     0.1475f              // (ticks/s)^2 at 1024 s  ==  a = 1.5e-10 per root-second at 80 MHz
-#define FADE_A_DEFAULT   0.59f                // twice that level, until the clock has learned its own
-#define FADE_B_UNKNOWN   10.0f                // ppm: an oscillator never yet measured against GPS
-static float fade_wander_var(void){
-  if (fw_count < FW_MIN) return FADE_A_DEFAULT;
-  return fw_var > FADE_A_FLOOR ? fw_var : FADE_A_FLOOR;
-}
-
 static void fh_learn(void){
   static uint32_t last_seq = 0;
 

@@ -3,7 +3,54 @@
 // it defines code and state, relies on everything main.c declares above it, and must not be included
 // anywhere else. main_parts/README.md says why this is one translation unit.
 
-// ==================== Temperature compensation (opt-in; state near pps_cap) ====================
+// --- Temperature compensation (opt-in) ------------------------------------------------------
+// Learns ppm-vs-die-temperature for both oscillators while GPS-locked (tc_learn), then during
+// GPS-loss holdover steers the SysTick timebase from the HSE model (tc_apply) and optionally
+// trims RTC->CALR from the LSE model (tc_rtc) so the battery RTC hands over better time across
+// a power loss. "tc_dump = on" over serial prints the learned coefficients as ready-to-paste
+// config lines; non-NAN tc_hse_a/tc_lse_a in config freeze the model (config overrides learning).
+// All defaults off: with none of the keys set, behaviour is identical to stock.
+// Config-key scalars are written from the USB OTG ISR (parseConfigString) and read by the
+// main loop: volatile, matching the pps_ts_enabled precedent.
+volatile _Bool tc_learn = 0, tc_apply = 0, tc_rtc = 0;
+volatile int16_t  tc_t0 = 40;              // model centre temperature (°C)
+// Frozen coefficients (ppm units at tc_t0). Elements are single-word (atomic) reads/writes;
+// consumers snapshot each element once. HSE has NO 'a': its learned origin is arbitrary and
+// steering uses temperature differences only, so freezing needs just b (and optionally c).
+float tc_cfg_hse[3] = {NAN, NAN, NAN};     // [0] unused, [1] ppm/°C, [2] ppm/°C²
+float tc_cfg_lse[3] = {NAN, NAN, NAN};     // absolute: ppm, ppm/°C, ppm/°C²
+volatile _Bool tc_reset_pending = 0;       // "tc_reset = on" over serial -> forget everything learned (serviced in the main loop)
+
+// Learned state (main-loop only). 2 °C bins spanning die temp -8..71 °C; sums are bounded by
+// the halving-at-32768 aging rule (max |sum| ~ 6400*32768 < 2^31), so int32 cannot overflow.
+struct tc_bin { int32_t hse_sum, lse_sum; uint16_t hse_n, lse_n; };
+struct tc_bin tc_bins[40];
+float tc_hse_m[3], tc_lse_m[3];            // learned models (ppm at powers of T - tc_t0)
+_Bool tc_hse_valid = 0, tc_lse_valid = 0;
+int16_t tc_hse_tmin = 0, tc_hse_tmax = 0;  // learned coverage: model is clamped to this range
+int16_t tc_lse_tmin = 0, tc_lse_tmax = 0;
+uint32_t tc_n_hse = 0, tc_n_lse = 0;       // lifetime sample counts (display + dump)
+// Weighted-RMS residual of each learned fit (model vs bin means): the model's OWN error, in its
+// fit units (HSE: SysTick ticks/s; LSE: ppm). This is the holdover-fade uncertainty's σ_temp source
+// — how far the temperature model actually is from the measured data, not a guess.
+float tc_hse_resid = 0, tc_lse_resid = 0;
+
+// Warm-start (seed-and-evolve). A previously-learned model — the last tc_dump, written back into
+// config.txt by the host (the firmware never writes the filesystem; the QSPI drive is host-owned) —
+// is reloaded at boot as an evolving PRIOR rather than a hard freeze. The clock is temperature-
+// compensated from the first second and keeps refining: tc_hse_prior/tc_lse_prior hold the model
+// ORDER (1 const, 2 linear, 3 quadratic) currently carried by the seed, and tc_fit keeps that model
+// until real learning supports a fit at least as rich, then hands over. tc_seed = off leaves the
+// existing freeze path (tc_hse_b/… as asserted constants) untouched.
+volatile _Bool   tc_seed = 0;                 // config: warm-start from the seeded coefficients + evolve
+volatile int16_t tc_seed_lo = 0, tc_seed_hi = 0;   // seed coverage (die °C): bounds the prior — never extrapolated
+uint8_t tc_hse_prior = 0, tc_lse_prior = 0;   // seed model order still held (0 = handed over to real data)
+_Bool tc_seed_done = 0;                        // one-shot: seed once per power-on (BSS-cleared at reset)
+// Serial "tc_seed = on" arms this (ISR-side single-word write); tc_housekeeping consumes it in the
+// MAIN LOOP, so the learned-state contract ("main-loop only") holds and a paste seeds exactly once,
+// after all its coefficient lines have parsed (send "tc_seed = on" last — the order tc_dump prints).
+volatile _Bool tc_seed_pending = 0;
+
 // Everything below runs in the MAIN LOOP only (float allowed, calibrateRTC precedent). The tick
 // ISRs see just three precomputed int32s via the tc_steer_* handoff in the timetick() hook.
 
@@ -169,7 +216,7 @@ static int tc_fit_one(_Bool lse, float scale, uint16_t n_quad, float m[3],
   return 0;
 }
 
-static float tc_poly(const float m[3], float x);   // fwd: the residual pass evaluates the just-fit model
+static float tc_poly(const float m[3], float x){ return m[0] + m[1]*x + m[2]*x*x; }
 
 // Weighted-RMS residual of a fitted model over every populated bin (not only the curve-eligible
 // ones): sqrt( Σ n·(bin_mean − model(T))² / Σ n ), in the fit's units. Runs as a second pass, so
@@ -222,8 +269,6 @@ static void tc_fit(void){
   if (tc_lse_valid) { float r = tc_fit_resid(1, lse_scale, tc_lse_m, 0); if (r > 0 || !tc_lse_prior) tc_lse_resid = r; }
   else tc_lse_resid = 0;
 }
-
-static float tc_poly(const float m[3], float x){ return m[0] + m[1]*x + m[2]*x*x; }
 
 // Warm-start the tempco model from the seeded coefficients (tc_seed = on). Loads tc_hse_b/c and
 // tc_lse_a/b/c — the last tc_dump, persisted in config.txt by the host — as the LIVE model so the

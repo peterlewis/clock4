@@ -3,6 +3,29 @@
 // it defines code and state, relies on everything main.c declares above it, and must not be included
 // anywhere else. main_parts/README.md says why this is one translation unit.
 
+// ---- The menu FSM's own state (the layer and the date-row text are in main.c: other sections read them) ----
+static uint8_t   menu_section = 0;      // L1/L2 current section (SEC_*); preserved across exits (resume)
+static uint8_t   menu_idx     = 0;      // L2 cursor into menu_items[] (ABSOLUTE index; walk by .section)
+static int32_t   menu_val     = 0;      // L3 working value (already live via set-hook)
+static uint8_t   menu_chord   = 0;      // a chord gesture is in progress (>=1 stage seen)
+static uint8_t   menu_stage   = 0;      // 0..3 self-labeled chord stage currently shown
+static uint32_t  menu_last_ms = 0;      // uwTick of the last event (drives 15 s idle)
+static _Bool     menu_repaint = 0;      // a repaint was deferred out of the SysTick sendDate window
+// §3c hold-acceleration: a run of same-direction STEP taps within ACCEL_GAP_MS grows the increment
+// (main-loop-only state; never volatile / ISR-touched). Reset on enter-edit and on exit/idle.
+static uint32_t  menu_run_last_ms = 0;
+static int8_t    menu_run_dir = 0;
+static uint16_t  menu_run_len = 0;
+// ISR -> main-loop event ring (single-producer USART2 ISR, single-consumer menu_poll)
+#define MENU_EVQ 16
+static volatile uint8_t menu_evq[MENU_EVQ];
+static volatile uint8_t menu_ev_h = 0, menu_ev_t = 0;
+// Called from the USART2 ISR: O(1) enqueue only, so nextMode()/reset never run at ISR priority.
+void menu_isr_event(uint8_t evt){
+  uint8_t nh = (uint8_t)((menu_ev_h + 1u) & (MENU_EVQ - 1));
+  if (nh != menu_ev_t) { menu_evq[menu_ev_h] = evt; menu_ev_h = nh; }   // drop if full
+}
+
 // ================= On-device 2-button menu (receiving FSM) ======================================
 // Runs entirely in the MAIN LOOP (menu_poll), fed button events from the USART2 ISR via menu_evq.
 // The 9-digit TIME row never leaves live GPS time; all menu chrome lives on the 10-char DATE row via

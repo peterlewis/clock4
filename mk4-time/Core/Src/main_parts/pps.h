@@ -3,6 +3,44 @@
 // it defines code and state, relies on everything main.c declares above it, and must not be included
 // anywhere else. main_parts/README.md says why this is one translation unit.
 
+// --- PPS host timestamping ----------------------------------------------------------------
+// Optional: emit one proprietary NMEA sentence ($PMTXTS) per PPS edge over the CDC port so a
+// host can measure the clock's timing stability (phase jitter, oscillator drift, holdover) —
+// things the plain NMEA stream cannot convey. Enabled by config "pps = on". Capture happens in
+// the PPS ISR (cheap, just snapshots); the sentence is formatted + sent from the main loop.
+volatile uint8_t pps_ts_enabled = 0;
+volatile _Bool   pps_record_pending = 0;
+volatile struct {
+  uint32_t seq;        // increments every PPS edge (32-bit: no practical wrap; host detects gaps)
+  uint32_t systick;    // SysTick->VAL at the edge, captured BEFORE the reload (down-counter)
+  uint16_t subms;      // 0..999 modelled ms-of-second at the edge, BEFORE the counters reset
+  uint32_t epoch;      // currentTime at the edge (Unix seconds, UTC)
+  int32_t  calerr;     // debug_rtc_val: signed LSE cycle error over CAL_PERIOD s (=> ppm on host)
+  uint32_t sincecal;   // seconds since last successful RTC calibration (holdover age)
+  int16_t  temp;       // die temperature (°C) — for host-side ppm-vs-temperature characterisation
+  uint8_t  flags;      // bit0 data_valid, bit1 had_pps, bit2 rtc_good
+  uint32_t dwt_pps;    // DWT->CYCCNT (free-running 12.5ns) latched at the edge — SOF-correlation timebase
+} pps_cap;
+
+// --- SOF correlation (experimental: sub-ms USB timestamping without a hardware PPS wire) -----------
+// Latched by the USB SOF interrupt (PCD_SOFCallback, usbd_conf.c) every 1ms WHEN pps_ts_enabled: the
+// 11-bit USB frame number and the DWT count at that Start-Of-Frame. Emitted in $PMTXTS so a host —
+// which can read each USB frame's own arrival time in hardware — can place the PPS edge on its clock
+// via the frame, immune to the ~6ms host-driven read jitter. Written in the SOF ISR, read at emit
+// under __disable_irq. pps_sof_valid gates emission of the tail: it is 0 until the first SOF has
+// latched a real anchor (so the first PPS after enumeration, or with pps just toggled on, or the
+// emulator which has no SOF, emits the plain 9-field sentence rather than a stale (0,0) anchor).
+volatile uint32_t pps_sof_dwt   = 0;   // DWT->CYCCNT at the most recent SOF
+volatile uint16_t pps_sof_frame = 0;   // USB 11-bit frame number at that SOF (matches host frame mod 2048)
+volatile uint8_t  pps_sof_valid = 0;   // 1 once a real SOF anchor has been latched; 0 = emit 9-field only
+
+// A $PMTXTS timestamp is actually awaiting emission ONLY when PPS-out is enabled and a capture is
+// pending. pps_record_pending on its own is set on every PPS edge (it also feeds ADEV/RTC/tempcomp)
+// and is cleared only by the emit path, so on a GPS-locked clock with PPS-out off (the default) it
+// latches high forever — gating a flash commit on it directly wedges persistence permanently. Both
+// commit gates in store.h defer a page erase around a real pending emit via this predicate.
+static inline _Bool pps_emit_pending(void){ return pps_ts_enabled && pps_record_pending; }
+
 // Snapshot the timing state at the instant of the PPS edge. MUST run before SysTick->VAL is
 // reloaded and before millisec/centisec/decisec are zeroed, so it captures the phase error
 // between the firmware's modelled second and the true GPS edge.
@@ -108,10 +146,6 @@ void PPS_Init(void){
 
   SetPPS( &PPS );
 }
-
-// usbd_cdc_if.h isn't pulled into main.c; forward-declare the one symbol we need.
-extern uint8_t CDC_Copy_Transmit(uint8_t* buf, uint16_t Len);
-extern USBD_HandleTypeDef hUsbDeviceFS;
 
 // Format + send one $PMTXTS sentence from the values captured at the last PPS edge.
 // Runs in the main loop (snprintf is fine here, never in the ISR). Clears pps_record_pending

@@ -1,10 +1,10 @@
 # main_parts: the sections of main.c
 
-`main.c` used to be one file of about 7,500 lines. These files are that same text, cut along the
-boundaries it already had and included from `main.c` once each, in the same order.
+`main.c` used to be one file of about 7,500 lines. These files are that text, one subsystem to a
+file, included from `main.c` once each.
 
-They are sections, not headers. Each one defines code and state, may use anything `main.c` declares
-above the point where it is included, and must not be included anywhere else.
+They are sections, not headers. Each one defines code and state, may use anything declared above the
+point where it is included, and must not be included anywhere else.
 
 ## Why one translation unit
 
@@ -13,8 +13,13 @@ firmware depends on functions being inlined across what would become module boun
 tick handlers, the date-row wrapper, the scan refresh. Compiled apart, the image grows and the timing
 of the interrupt paths changes, and neither can be checked without a clock on a bench.
 
-Kept as one translation unit, the split can be proven to change nothing. When it was made, the
-compiled `main.o` and the linked `mk4-time.bin` were byte-for-byte identical before and after.
+Kept as one translation unit, a rearrangement can be proven to change no code. Twice so far:
+
+- The first cut kept every line in its old order. The compiled `main.o` and the linked
+  `mk4-time.bin` were byte-for-byte identical before and after.
+- The sections were then put in dependency order and each given its own state. That moves functions
+  and variables to new addresses, so the image differs, but every function and every variable in
+  `main.o` compiled to the same bytes with the same references (`test/objeq.py`, below).
 
 The emulator in the PCC repository also relies on this: it includes `main.c` whole so that its tests
 can reach the firmware's internal state.
@@ -22,39 +27,64 @@ can reach the firmware's internal state.
 ## Rules
 
 - Order matters. A section can only use what is defined above it. The order is the list of
-  `#include` lines in `main.c`.
+  `#include` lines in `main.c`, and it runs from what everything needs (the watchdog marks, the
+  sensors, the timezone rules) to what needs everything (the date row, the store, the menu, the
+  config parser, the main loop's housekeeping).
+- A section owns its state: its settings, its working variables, the flags that ask it to do
+  something. They are declared at the top of its file.
+- State that a section needs from a section BELOW it cannot live with its owner. It is declared in
+  `main.c`, above the list: the time, the position, the display buffers, the `config` structure, the
+  display mode, and the two things the menu shows the rest of the firmware.
+- A call that goes up the list needs a prototype. They are in `main.h` (`sendDate`, `setPrecision`,
+  the PPS handlers) and in the `PFP` block of `main.c`. Do not declare another section's function
+  inside a section to get round the order, and do not define a variable twice: move the code instead.
 - A new subsystem gets a new file here and one `#include` line in `main.c`, placed after everything
   it uses.
-- State shared by several sections lives at the top of `main.c`, as before.
-- Moving code between sections is safe when the order of definitions does not change. To check a
-  move, build before and after with the same `build_id.h` and compare `mk4-time.bin`:
-  `make main-build` in `Release/` relinks without stamping a new build id.
+
+## Checking a rearrangement
+
+Moving code must not change it. Keep the old `main.o`, rebuild, and compare:
+
+    cp Release/Core/Src/main.o /tmp/main_before.o
+    (cd Release && rm Core/Src/main.o && make Core/Src/main.o)
+    python3 test/objeq.py /tmp/main_before.o Release/Core/Src/main.o
+
+`objeq.py` compares the two objects function by function and variable by variable, whatever order
+they are in: the same bytes, and the same references by name. It prints `EQUIVALENT`, or the
+functions that differ. If nothing moved to a new place, the stronger check also applies: build with
+the same `build_id.h` (`make main-build` in `Release/` relinks without stamping a new one) and
+compare `mk4-time.bin`.
+
+Two variables share the named section `.ram2`: the watchdog's record and the Allan-deviation ring.
+Their order in it follows the order of the sections here.
 
 ## The sections, in order
 
 | File | What it holds |
 |---|---|
-| `astro_rows.h` | Sun, moon, grid and star-transit rows; ZONE 2 offsets |
-| `date_row.h` | `sendDate`: every display mode formatted for the date board |
-| `time_row.h` | The big digits: next second, countdown, sidereal / solar / second zone, the RTC write |
-| `gps.h` | The NMEA sentences the clock reads |
-| `scan.h` | The display scan and per-segment brightness balance |
-| `cuckoo.h` | Scheduled flourishes on the time row |
-| `diag.h` | `$PMLOOP` marks and `$PMBRIT` state |
-| `matrix_and_colons.h` | The scan rate; colon animations and their brightness |
-| `config.h` | `config.txt` and serial config: parser, defaults table, file loader |
-| `rtc_cal.h` | Calibrating the RTC crystal against GPS |
-| `adev.h` | The Allan and Hadamard deviation engine |
-| `pps.h` | The PPS edge and the `$PMTXTS` / `$PMBRIT` sentences |
-| `tempcomp.h` | Learning the oscillators against temperature |
-| `freq_hold.h` | The oscillator's measured offset and learned wander |
-| `governor.h` | Holdover steering and the RTC trim, once a second |
-| `dumps.h` | The serial reports |
 | `watchdog.h` | The independent watchdog and its boot-loop guard |
-| `holdover.h` | The significance fade's bound; the main loop's housekeeping |
-| `ticks.h` | The 1 ms SysTick handlers |
-| `sensors.h` | USB power, backup cell voltage, die temperature |
-| `zones.h` | Timezone rules from `TZRULES.BIN` |
-| `modes.h` | The precision ladder, changing display mode, the buttons |
-| `store.h` | `SETTINGS.BIN`: the menu store and the tempcomp store |
+| `diag.h` | The $PMLOOP loop-latency marks and the $PMBRIT report state |
+| `sensors.h` | USB power, the backup cell voltage, the die temperature |
+| `rtc_cal.h` | Calibrating the 32 kHz RTC crystal against GPS |
+| `zones.h` | Timezone rules from TZRULES.BIN, and the second zone's offset |
+| `astro_rows.h` | The sun, moon, grid and star-transit rows: what the main loop computes for them |
+| `time_row.h` | The big digits: the next second, countdown, the sidereal / solar / second-zone timebases, the RTC write |
+| `gps.h` | The NMEA sentences the clock reads: RMC for time and position, GSV for satellites in view |
+| `scan.h` | The display scan: its length, the per-digit dimming inputs, and the per-segment balance maths (seg_balance) |
+| `cuckoo.h` | Scheduled flourishes on the time row |
+| `scan_compose.h` | The display on and off, and the balance, the fade and the cuckoo composed into the scan |
+| `matrix_and_colons.h` | The scan rate, and the colon animations and their brightness |
+| `adev.h` | The Allan and Hadamard deviation engine |
+| `pps.h` | The PPS edge: capture, the three edge handlers, and the $PMTXTS and $PMBRIT sentences |
+| `tempcomp.h` | Learning the oscillators against temperature: samples, fits, seeds, the models |
+| `freq_hold.h` | The oscillator's measured offset and learned wander |
+| `governor.h` | Once a second: steer the timebase in holdover, trim the RTC |
+| `fade.h` | The significance fade: the bound on the display's time error in a holdover |
+| `ticks.h` | The 1 ms SysTick handlers: the sub-second digits and the .900 preparation of the next second |
+| `modes.h` | Which digits may be shown (the precision ladder), changing display mode, the buttons |
+| `date_row.h` | `sendDate`: every display mode formatted for the date board, in its own C-library context |
+| `dumps.h` | The serial reports: tc_dump, $PMADEV, $PMHDEV, $PMSTAR |
+| `store.h` | SETTINGS.BIN: the menu settings store and the tempcomp store |
 | `menu.h` | The two-button menu |
+| `config.h` | `config.txt` and serial config lines: the parser, the defaults table, the file loader |
+| `housekeeping.h` | The timing subsystems' once-per-pass work in the main loop |

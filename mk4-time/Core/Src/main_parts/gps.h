@@ -3,6 +3,11 @@
 // it defines code and state, relies on everything main.c declares above it, and must not be included
 // anywhere else. main_parts/README.md says why this is one translation unit.
 
+uint8_t nmea[NMEA_BUF_SIZE];     // the sentence being received from the GPS module
+uint8_t satview[SV_COUNT];       // satellites in view, from GSV (MODE_SATVIEW)
+uint8_t satview_stale = 0;
+uint8_t nmea_cdc_level=0;        // config "nmea": how much of the GPS stream is copied to USB serial (NMEA_NONE / NMEA_RMC / NMEA_ALL)
+
 void decodeRMC(void){
 
   // do checksum

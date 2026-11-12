@@ -31,12 +31,19 @@ enum { CK_OFF = 0, CK_TRUST, CK_PIECES };
 #define CK_NOD 0xFE
 volatile uint8_t cuckoo = CK_OFF;      // the one config key: off, or the hourly piece
 static uint8_t ck_menu_prev = 0;       // the menu's CUCKOO editor is open and previewing choices
-// (CK_GAMMA — the intent->duty perceptual curve — lives with the forward block above displayOff,
-//  because segbal_poll's compose reads it before this section is reached.)
+
+// Perceptual gamma: pieces write INTENT levels (0..16, meaning perceived lightness); the segbal
+// compose maps them to dither DUTY through this table. Light output is linear in lit cycles but
+// the eye is not (lightness ~ luminance^(1/2.2)): duties 13/16 and 16/16 differ by barely 7%
+// perceived, which is why the bench found carry and pendulum nearly invisible while trust (a
+// 2->16 swing) read fine. duty = 16*(L/16)^2.2, floored at 1 for any lit intent, so intent
+// differences read evenly across the whole range. THE bench-tuning knob is this curve, not
+// per-piece numbers.
+static const uint8_t CK_GAMMA[17] = {0,1,1,1,1,1,2,3,4,5,6,7,9,10,12,14,16};
 
 // element rows: 0..4 = port-B big-digit categories (10h h 10m m 10s), 5 = seconds units
 // (port-C column 0), 6..8 = ds/cs/ms (port-C columns 1..3). Left-to-right = rows 0..5.
-// (CK_ROWS + the tentative ck_bright declaration live above displayOff.)
+#define CK_ROWS 9
 static uint8_t ck_bright[CK_ROWS] = {16,16,16,16,16,16,16,16,16};
 static uint8_t  ck_anim = 0xFF;        // 0xFF idle; else CK_* piece or CK_NOD
 static uint8_t  ck_phase = 0;          // per-piece state-machine step

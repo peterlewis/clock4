@@ -3,6 +3,10 @@
 // it defines code and state, relies on everything main.c declares above it, and must not be included
 // anywhere else. main_parts/README.md says why this is one translation unit.
 
+#define rtc_last_calibration RTC->BKP31R   // when the RTC was last calibrated against GPS (a backup register: it survives a reset)
+uint32_t LPTIM1_high;                       // overflows of the 16-bit LPTIM1 count during a calibration (counted in its interrupt)
+int debug_rtc_val = 0;                      // the last calibration's result: 32 kHz cycles gained or lost over CAL_PERIOD seconds
+
 void calibrateRTC(void){
   // Called by PPS EXTI
 

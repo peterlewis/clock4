@@ -3,6 +3,15 @@
 // it defines code and state, relies on everything main.c declares above it, and must not be included
 // anywhere else. main_parts/README.md says why this is one translation unit.
 
+_Bool delayedPostConfigCleanup = 0;   // a serial config line arrived (in the USB interrupt): the main loop runs postConfigCleanup
+// Validated coefficient parse: garbage/'----'/empty leaves the value untouched (a pasted-back
+// commented dump line must not freeze 0.0); an explicit "nan" parses and UNFREEZES the slot.
+static void tc_parse_coeff(const char *v, float *out){
+  char *end;
+  float f = strtof(v, &end);
+  if (end != v) *out = f;
+}
+
 _Bool truthy(char const* str){
   if (strcasecmp(str, "on")==0) return 1;
   if (strcasecmp(str, "enabled")==0) return 1;

@@ -3,6 +3,33 @@
 // it defines code and state, relies on everything main.c declares above it, and must not be included
 // anywhere else. main_parts/README.md says why this is one translation unit.
 
+float vbat = 0.0;       // the backup cell, volts (measure_vbat)
+int16_t die_temp_c = 0;  // latest STM32 die temperature (°C), a proxy for the crystal temperature
+// The same sensor, kept in fractions of a degree and low-pass filtered, for the holdover steering.
+// die_temp_c is the vendor's whole-degree conversion; the bins, the display and $PMTXTS keep using it.
+// Steering from it made every 1 degree flip of the reading a step in rate, and froze the temperature
+// "at loss" to the nearest degree: on recorded data tc_apply cut the large holdover errors but DOUBLED
+// the typical one (7.6 -> 15.6 us at an hour). Filtering the readings took that back to about 9 us and
+// improved the large errors further. One raw count is about 0.3 degC; the filter resolves finer.
+float die_temp_f = 0.0f;
+_Bool die_temp_f_ok = 0;                 // false until the first reading: the steering then falls back to die_temp_c
+#define DIE_TEMP_FILTER 32.0f            // readings in the filter's memory: one every 4 s, about 2 minutes
+
+// Raw sensor count -> degrees C, the vendor's two-point formula in floating point (no truncation).
+// cal1/cal2 are the factory counts at the two calibration temperatures, taken at 3.0 V; vdda_mv is
+// the supply the count was taken at.
+static float die_temp_convert(uint32_t raw, int32_t cal1, int32_t cal2, float vdda_mv){
+  if (cal2 == cal1) return 0.0f;
+  float scaled = (float)raw * vdda_mv / (float)TEMPSENSOR_CAL_VREFANALOG;
+  return (scaled - (float)cal1) * (float)(TEMPSENSOR_CAL2_TEMP - TEMPSENSOR_CAL1_TEMP) / (float)(cal2 - cal1)
+         + (float)TEMPSENSOR_CAL1_TEMP;
+}
+static void die_temp_filter(float t){
+  if (!isfinite(t)) return;
+  if (!die_temp_f_ok) { die_temp_f = t; die_temp_f_ok = 1; return; }   // the first reading is the estimate
+  die_temp_f += (t - die_temp_f) / DIE_TEMP_FILTER;
+}
+
 // We cannot use hardware vbus monitoring since the pin is occupied by USART1 TX
 // We can't use EXTI on PA8 as it's in the same group as PPS
 void monitor_vbus(void){

@@ -1,7 +1,26 @@
-// main_parts/astro_rows.h — the sun, moon, grid and star-transit rows: what the main loop computes for them, and ZONE 2 offsets.
+// main_parts/astro_rows.h — the sun, moon, grid and star-transit rows: what the main loop computes for them.
 // A section of main.c, included there once and in order (the list is in main.c). It is not a header:
 // it defines code and state, relies on everything main.c declares above it, and must not be included
 // anywhere else. main_parts/README.md says why this is one translation unit.
+
+// Astro pack — sun/moon/grid read-outs, computed once a second in the main loop
+// (astro_update) and formatted by the sendDate cases, the same compute-in-loop /
+// format-in-ISR split MODE_VBAT uses for vbat.
+struct astro_cache_s {
+  uint32_t epoch;          // currentTime this was computed for; 0 = never computed
+  _Bool    have_pos;       // a usable lat/lon was available
+  _Bool    sun_up_today;   // false = polar day/night (no rise/set this date)
+  int16_t  rise_min, set_min, noon_min;  // local minutes-of-day [0,1440)
+  int16_t  az, el;         // sun azimuth 0..359 / elevation, whole degrees
+  uint8_t  moon_idx, moon_pct;           // phase index 0..7 / illuminated %
+  char     grid[8];        // Maidenhead locator, or "----"
+  float    lat_show, lon_show;           // the snapshot lat/lon, for MODE_LATLON
+  // MODE_DARK twilight ladder — local minutes-of-day, -1 = not applicable (dashes).
+  int16_t  civ_dusk_min, nau_dusk_min;   // civil (-6) / nautical (-12) evening twilight
+  int16_t  ast_dusk_min, ast_dawn_min;   // astronomical (-18) darkness begins / ends
+  _Bool    dark_tonight;                 // astronomical darkness occurs this date
+  _Bool    always_dark;                  // polar night: sun below -18 now (dark round the clock)
+} astro = {0};
 
 // --- Astro pack helpers ----------------------------------------------------
 // A usable position is held in latitude/longitude from either a GPS fix or the
@@ -10,10 +29,6 @@
 static _Bool astro_pos_ok(float lat, float lon){
   return lat >= -90.0f && lat <= 90.0f && lon >= -180.0f && lon <= 180.0f;
 }
-// Sub-screen dwell (ms) for every mode that pages its date row. Unset -> 5500 ms, a
-// subjectively-tuned cadence found by feel. Floored at 250 ms so a tiny value can't
-// flood the date-board UART.
-static uint32_t page_ms(void){ uint32_t m = config.page_ms; return m == 0 ? 5500 : (m < 250 ? 250 : m); }
 // Decimal UTC hour (sun_times may return <0 or >24) -> local minutes-of-day [0,1440).
 static int astro_local_minutes(double utc_h){
   double h = fmod(utc_h + currentOffset / 3600.0, 24.0);
@@ -206,30 +221,4 @@ static void star_update(void){
   }
   star_ncache = n;
   __enable_irq();
-}
-
-// ZONE 2 offset resolver — mirrors setNextTimestamp()'s DST walk but on rules2[].
-static int32_t zone2_offset_at(time_t t){
-  if (zone2_fixed) return offset2;      // literal offset: no table walk
-  int32_t off = 0;
-  for (uint8_t i=0; i<MAX_RULES2; i++){
-    if (rules2[i].t <= (uint32_t)t) off = rules2[i].offset;   // sentinel t==-1 (0xFFFFFFFF) never matches -> break
-    else break;
-  }
-  return off;
-}
-// Parse a ZONE 2 fixed-offset literal ("UTC"/"GMT" or [+-]HH[:MM]) into seconds. Returns 0 on no match.
-static _Bool zone2_parse_fixed(const char* s, int32_t* out){
-  if (!strcasecmp(s,"UTC") || !strcasecmp(s,"GMT")) { *out = 0; return 1; }
-  if (s[0] != '+' && s[0] != '-') return 0;
-  int sign = (s[0]=='-') ? -1 : 1;
-  const char* p = s + 1;
-  if (*p < '0' || *p > '9') return 0;
-  int hh = 0; while (*p>='0' && *p<='9'){ hh = hh*10 + (*p-'0'); p++; if (hh > 14) return 0; }
-  int mm = 0;
-  if (*p == ':'){ p++; if (*p<'0'||*p>'9') return 0; while (*p>='0'&&*p<='9'){ mm = mm*10 + (*p-'0'); p++; } }
-  if (*p) return 0;                     // trailing garbage -> not a literal
-  if (mm > 59) return 0;
-  *out = sign * (hh*3600 + mm*60);
-  return 1;
 }

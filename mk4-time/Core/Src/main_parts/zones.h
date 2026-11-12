@@ -1,7 +1,24 @@
-// main_parts/zones.h — timezone rules from TZRULES.BIN.
+// main_parts/zones.h — timezone rules from TZRULES.BIN, and the second zone's offset.
 // A section of main.c, included there once and in order (the list is in main.c). It is not a header:
 // it defines code and state, relies on everything main.c declares above it, and must not be included
 // anywhere else. main_parts/README.md says why this is one translation unit.
+
+struct tzrule {
+  uint32_t t;
+  int32_t offset;
+} rules[162], rules2[162];             // rules2 = ZONE 2's independent DST table
+#define MAX_RULES  (sizeof rules  / sizeof rules[0])
+#define MAX_RULES2 (sizeof rules2 / sizeof rules2[0])
+
+char loadedRulesString[32];
+char preloadRulesString[32];
+_Bool delayedLoadRules = 0;
+// ZONE 2 (MODE_ZONE2): a second civil timezone, named by the `zone2` config key.
+int32_t offset2 = 0;                    // ZONE 2's resolved UTC->local offset (seconds)
+char loadedZone2[32];                   // active ZONE 2 label ("" = unset/unresolved -> dashes)
+char preloadZone2[32];                  // pending name from config, resolved in checkDelayedLoadRules
+_Bool delayedLoadZone2 = 0;
+_Bool zone2_fixed = 0;                  // 1 = offset2 is a literal (UTC / +HH:MM), no DST table walk
 
 uint8_t f_getzcmp(FIL* fp, char * str){
   unsigned int rc;
@@ -143,4 +160,30 @@ void checkDelayedLoadRules(){
     zone2_fixed = 0;
     if (loadZone2Single(preloadZone2) != RULES_OK) loadedZone2[0] = 0;   // unresolved -> dashes
   }
+}
+
+// ZONE 2 offset resolver — mirrors setNextTimestamp()'s DST walk but on rules2[].
+static int32_t zone2_offset_at(time_t t){
+  if (zone2_fixed) return offset2;      // literal offset: no table walk
+  int32_t off = 0;
+  for (uint8_t i=0; i<MAX_RULES2; i++){
+    if (rules2[i].t <= (uint32_t)t) off = rules2[i].offset;   // sentinel t==-1 (0xFFFFFFFF) never matches -> break
+    else break;
+  }
+  return off;
+}
+// Parse a ZONE 2 fixed-offset literal ("UTC"/"GMT" or [+-]HH[:MM]) into seconds. Returns 0 on no match.
+static _Bool zone2_parse_fixed(const char* s, int32_t* out){
+  if (!strcasecmp(s,"UTC") || !strcasecmp(s,"GMT")) { *out = 0; return 1; }
+  if (s[0] != '+' && s[0] != '-') return 0;
+  int sign = (s[0]=='-') ? -1 : 1;
+  const char* p = s + 1;
+  if (*p < '0' || *p > '9') return 0;
+  int hh = 0; while (*p>='0' && *p<='9'){ hh = hh*10 + (*p-'0'); p++; if (hh > 14) return 0; }
+  int mm = 0;
+  if (*p == ':'){ p++; if (*p<'0'||*p>'9') return 0; while (*p>='0'&&*p<='9'){ mm = mm*10 + (*p-'0'); p++; } }
+  if (*p) return 0;                     // trailing garbage -> not a literal
+  if (mm > 59) return 0;
+  *out = sign * (hh*3600 + mm*60);
+  return 1;
 }

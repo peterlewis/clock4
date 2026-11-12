@@ -3,6 +3,23 @@
 // it defines code and state, relies on everything main.c declares above it, and must not be included
 // anywhere else. main_parts/README.md says why this is one translation unit.
 
+uint16_t buffer_colons_L[200] = {0};
+uint16_t buffer_colons_R[200] = {0};
+uint32_t delayedDisplayFreq = 0;
+
+uint8_t colonMode = 0;
+// Civil vs alternate-timebase colon animation: colonMode is the ACTIVE selection that
+// loadColonAnimation() renders; the per-context choices live here and applyColonForMode()
+// swaps between them. The sidereal default must stay visually distinct from civil so an
+// alternate-timebase mode can never masquerade as civil time.
+uint8_t colonModeCivil = 0;
+uint8_t colonModeAlt = COLON_MODE_ALT_SAWTOOTH;
+_Bool colonAltExplicit = 0;    // user explicitly set colon_alt_mode
+// §3.5 colon context-preview: while a colon-animation item is being EDITED, force the value under the
+// cursor onto the real colons regardless of the display context (so ALTCOLON is visible even from a
+// civil face). 0xFF = no preview -> applyColonForMode() uses the normal context choice.
+uint8_t colon_preview = 0xFF;
+
 static uint32_t matrix_freq_hz = 20000;   // §4 shadow of the display refresh rate (menu MATRIX reads/writes this)
 void setDisplayFreq(uint32_t freq){
   if (waitingForLatch) {

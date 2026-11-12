@@ -3,6 +3,11 @@
 // it defines code and state, relies on everything main.c declares above it, and must not be included
 // anywhere else. main_parts/README.md says why this is one translation unit.
 
+volatile _Bool tc_dump_pending = 0;        // set by the serial parser, serviced in the main loop
+volatile _Bool adev_dump_pending = 0;      // "adev_dump = on" over serial -> emit one $PMADEV sentence
+volatile _Bool hdev_dump_pending = 0;      // "hdev_dump = on" over serial -> emit one $PMHDEV sentence (Hadamard)
+volatile _Bool star_dump_pending = 0;      // "star_dump = on" over serial -> emit one $PMSTAR sentence
+
 // "tc_dump = on" over serial: emit the learned model as ready-to-paste config.txt lines plus
 // two checksummed $PMTXTC sentences (H and L — split so each fits NMEA_BUF_SIZE). One line per
 // main-loop pass; each line is FORMATTED ONCE and only the CDC submit is retried on BUSY (float

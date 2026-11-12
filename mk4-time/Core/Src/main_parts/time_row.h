@@ -3,6 +3,8 @@
 // it defines code and state, relies on everything main.c declares above it, and must not be included
 // anywhere else. main_parts/README.md says why this is one translation unit.
 
+#define rtc_last_write RTC->BKP30R   // when the RTC was last written (a backup register: it survives a reset)
+
 void setNextTimestamp(time_t nextTime){
 
   int32_t offset = 0;

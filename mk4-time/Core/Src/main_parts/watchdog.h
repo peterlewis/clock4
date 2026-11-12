@@ -3,6 +3,9 @@
 // it defines code and state, relies on everything main.c declares above it, and must not be included
 // anywhere else. main_parts/README.md says why this is one translation unit.
 
+volatile uint8_t watchdog = 0;             // config "watchdog = on": arm the independent watchdog (explained below)
+volatile _Bool wdt_dump_pending = 0;       // "wdt_dump = on" over serial -> one line: armed or not, resets, where it hung
+
 // ==================== Watchdog (opt-in: watchdog = on) ==========================================
 // The time row is painted by the SysTick handler and the scan runs on DMA, so a main loop that has
 // hung - or a HardFault, whose handler spins - leaves a display that still looks alive: the last
