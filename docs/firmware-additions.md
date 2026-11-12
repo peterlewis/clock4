@@ -1,13 +1,11 @@
 # Mk IV firmware additions
 
-This section documents the features added by the proposed firmware PR series (#5–#10 plus the three
-follow-ons: the Allan deviation display, the star transit predictor and the on-device menu). It
-describes the **rollup firmware** — the tested union of the whole series, which is exactly what the
-ready-to-flash images linked from each PR contain. That build currently carries version
-`0.0.5+<build>` on the time board and `0.0.2+<build>` on the date board; nothing here should be
-read as describing any other 0.0.5 build. Everything is
-opt-in: with none of the new config keys set, and a stock date board, behaviour is identical to the
-stock firmware.
+This documents the features this firmware adds to the stock Mk IV firmware. It describes the
+`rollup` branch, which is what the ready-to-flash images in `qspi/output` are built from. That build
+carries version `0.0.5+<build>` on the time board and `0.0.2+<build>` on the date board; nothing here
+should be read as describing any other 0.0.5 build. Everything is opt-in: with none of the new
+config keys set, and a stock date board, behaviour is that of the stock firmware, apart from the
+fixes listed in the [readme](../readme.md).
 
 ## New modes
 
@@ -876,7 +874,7 @@ the 7-segment font — every letter renders, though I, O, S, Z read as 1, 0, 5, 
 ## Version numbers
 
 The version train for this series: the time board is **0.0.5** (upstream's latest release being
-0.0.4) and the date board is **0.0.2** — those are the versions the linked rollup images carry and
+0.0.4) and the date board is **0.0.2** — those are the versions the images in `qspi/output` carry and
 the versions this documentation describes.
 
 Both boards' reported versions carry a per-build tag: `0.0.5+1783851034` / `0.0.2+1783835902`, where
