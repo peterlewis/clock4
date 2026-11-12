@@ -19,6 +19,8 @@ static struct {
   uint8_t  cuckoo;                     // KID_CUCKOO: the hourly piece (CK_OFF..CK_TRUST)
   uint64_t modes_mask, modes_val;      // bit per MODE_* ordinal (u64: MODE_STAR=31 filled a u32; ZONE2/RELATIV/HOLD need >=32)
   uint8_t  brit;                       // KID_BRIT: 1 = the 1 Hz $PMBRIT dimmer report (brightness_report)
+  uint8_t  fh;                         // KID_FREQ_HOLD: 1 = freq_hold on
+  uint8_t  wdt;                        // KID_WATCHDOG: 1 = watchdog on
 } ovr;
 static uint16_t cfg_simple_defined;    // bit per KID set by config.txt this load
 static uint64_t cfg_modes_defined;     // bit per MODE_* ordinal set by config.txt this load
@@ -146,9 +148,9 @@ static uint16_t ee_crc16(const uint8_t*p, uint32_t n){   // CRC-16-CCITT (poly 0
 // Record byte layout: 0 magic u32 | 4 gen u32 | 8 schema u16 | 10 fdate u16 | 12 ftime u16 |
 // 14 simple_mask u16 | 16 modes_mask_lo u32 | 20 modes_val_lo u32 | 24 brightness i16 | 26 colon u8 |
 // 27 alt_colon u8 | 28 page_ms u16 | 30 sig_fade u8 | 31 pps u8 | 32 nmea u8 | 33 matrix_freq u32 | 37 tc u8 | 38 bal u8 | 39 cuckoo u8 |
-// 40 modes_mask_hi u32 | 44 modes_val_hi u32 | 48 brit u8 | 49..61 rsvd | 62 crc16.
-// (bytes 15, 33..36, 37, 38, 39, 40..47 and 48 were zeroed padding in every prior record, so widening simple_mask
-//  u8->u16, adding matrix_freq u32 + tc u8 + bal u8 + cuckoo u8 + brit u8, and splitting the mode masks u32->u64
+// 40 modes_mask_hi u32 | 44 modes_val_hi u32 | 48 brit u8 | 49 freq_hold u8 | 50 watchdog u8 | 51..61 rsvd | 62 crc16.
+// (bytes 15, 33..36, 37, 38, 39, 40..47 and 48..50 were zeroed padding in every prior record, so widening simple_mask
+//  u8->u16, adding matrix_freq u32 + tc u8 + bal u8 + cuckoo u8 + brit u8 + freq_hold u8 + watchdog u8, and splitting the mode masks u32->u64
 //  with their high words at 40/44 all round-trip old records with those fields clear -> modes >=32 read disabled;
 //  EE_SCHEMA stays 1.)
 static void ee_pack(uint8_t*r, uint32_t gen){
@@ -164,7 +166,7 @@ static void ee_pack(uint8_t*r, uint32_t gen){
   memcpy(r+28,&ovr.page_ms,2); r[30]=ovr.sig_fade; r[31]=ovr.pps; r[32]=ovr.nmea;
   memcpy(r+33,&ovr.matrix_freq,4); r[37]=ovr.tc; r[38]=ovr.bal; r[39]=ovr.cuckoo;
   memcpy(r+40,&mm_hi,4); memcpy(r+44,&mv_hi,4);
-  r[48]=ovr.brit;
+  r[48]=ovr.brit; r[49]=ovr.fh; r[50]=ovr.wdt;
   uint16_t crc=ee_crc16(r,62); memcpy(r+62,&crc,2);
 }
 static void ee_unpack(const uint8_t*r){
@@ -172,7 +174,7 @@ static void ee_unpack(const uint8_t*r){
   memcpy(&ovr.simple_mask,r+14,2);
   uint32_t mm_lo,mv_lo,mm_hi,mv_hi;
   memcpy(&mm_lo,r+16,4); memcpy(&mv_lo,r+20,4);
-  memcpy(&mm_hi,r+40,4); memcpy(&mv_hi,r+44,4); ovr.brit=r[48];
+  memcpy(&mm_hi,r+40,4); memcpy(&mv_hi,r+44,4); ovr.brit=r[48]; ovr.fh=r[49]; ovr.wdt=r[50];
   ovr.modes_mask=((uint64_t)mm_hi<<32)|mm_lo; ovr.modes_val=((uint64_t)mv_hi<<32)|mv_lo;
   memcpy(&ovr.brightness,r+24,2); ovr.colon=r[26]; ovr.alt_colon=r[27];
   memcpy(&ovr.page_ms,r+28,2); ovr.sig_fade=r[30]; ovr.pps=r[31]; ovr.nmea=r[32];
@@ -677,6 +679,8 @@ void menu_apply_overrides(void){
   OVR_S(KID_SIG_FADE,   significance_fade=ovr.sig_fade)
   OVR_S(KID_PPS,        pps_ts_enabled=ovr.pps)
   OVR_S(KID_BRIT,       brightness_report=ovr.brit?1:0)
+  OVR_S(KID_FREQ_HOLD,  freq_hold=ovr.fh?1:0)
+  OVR_S(KID_WATCHDOG,   watchdog=ovr.wdt?1:0)   // on arms it on the next main-loop pass; off waits for the next reset
   OVR_S(KID_NMEA,       nmea_cdc_level=ovr.nmea)
   OVR_S(KID_MATRIX_FREQ,setDisplayFreq(ovr.matrix_freq))   // clamping setter (never ARR-direct) -> a bad stored value can't brick
   OVR_S(KID_TEMPCOMP,   tc_learn=tc_apply=tc_persist=ovr.tc?1:0)
@@ -709,6 +713,8 @@ static void menu_record_key(uint8_t key_id, int32_t v){
     case KID_SIG_FADE:   ovr.sig_fade=(uint8_t)v; break;
     case KID_PPS:        ovr.pps=(uint8_t)v; break;
     case KID_BRIT:       ovr.brit=(uint8_t)(v?1:0); break;
+    case KID_FREQ_HOLD:  ovr.fh=(uint8_t)(v?1:0); break;
+    case KID_WATCHDOG:   ovr.wdt=(uint8_t)(v?1:0); break;
     case KID_NMEA:       ovr.nmea=(uint8_t)v; break;
     case KID_MATRIX_FREQ:ovr.matrix_freq=(uint32_t)v; break;
     case KID_TEMPCOMP:   ovr.tc=(uint8_t)(v?1:0); break;

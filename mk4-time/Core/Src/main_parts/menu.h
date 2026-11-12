@@ -107,6 +107,14 @@ static void    s_bal   (const MItem*m,int32_t v){ (void)m;
   else  { seg_balance = colon_balance = 0; }
   colonForce = 1;
 }
+// F HOLD: in holdover, run at the oscillator frequency measured while locked (freq_hold). It sits
+// beside TEMPCOMP: both decide what the clock does when GPS goes away.
+static int32_t g_fh    (const MItem*m){ (void)m; return freq_hold ? 1 : 0; }
+static void    s_fh    (const MItem*m,int32_t v){ (void)m; freq_hold = v?1:0; }
+// WATCHDOG: ON arms it on the next main-loop pass. The hardware has no off switch, so OFF (and an
+// abandoned edit that had turned it on) takes effect at the next reset; until then it keeps being fed.
+static int32_t g_wdt   (const MItem*m){ (void)m; return watchdog ? 1 : 0; }
+static void    s_wdt   (const MItem*m,int32_t v){ (void)m; watchdog = v?1:0; }
 static int32_t g_mode  (const MItem*m){ return config.modes_enabled[m->lo]; }
 static void    s_mode  (const MItem*m,int32_t v){ menuSetMode((uint8_t)m->lo, v?1:0); }
 static void    s_fwcrc (const MItem*m,int32_t v){ (void)m; menuSetMode(MODE_FIRMWARE_CRC_T,v?1:0); config.modes_enabled[MODE_FIRMWARE_CRC_D]=v?1:0; if (!config.modes_enabled[displayMode]) nextMode(0); }  // mirror menuSetMode's guard: never strand the view on a just-disabled mode
@@ -143,8 +151,10 @@ static const MItem menu_items[] = {
   { KID_BRIT,       MIT_TOGGLE,"BRT MSG",  0,1,1,      NULL,     g_brit,   s_brit,   SEC_SYS  },   // the $PMBRIT dimmer report (brightness_report)
   { KID_NMEA,       MIT_ENUM,  "NMEA",     0,2,1,      en_nmea,  g_nmea,   s_nmea,   SEC_SYS  },
   { KID_MATRIX_FREQ,MIT_STEP,  "MATRIX",   8000,100000,1000,NULL,g_matrix, s_matrix, SEC_SYS  },   // menu floor 8000 (flicker); config MATRIX_FREQUENCY reaches the 1000 hw floor
+  { KID_WATCHDOG,   MIT_TOGGLE,"WATCHDOG", 0,1,1,      NULL,     g_wdt,    s_wdt,    SEC_SYS  },   // the independent watchdog (config: watchdog)
   { KID_RESET,      MIT_ACTION,"RESET",    0,0,0,       NULL,     g_reset,  s_reset,  SEC_SYS  },   // factory-reset the on-device settings (confirm required)
   { KID_TEMPCOMP,   MIT_TOGGLE,"TEMPCOMP", 0,1,1,      NULL,     g_tc,     s_tc,     SEC_DIAG },   // arms learn+apply+persist; the TC DATA mode below just displays the model
+  { KID_FREQ_HOLD,  MIT_TOGGLE,"F HOLD",   0,1,1,      NULL,     g_fh,     s_fh,     SEC_DIAG },   // holdover at the measured oscillator frequency (config: freq_hold)
   MODE_ROW(MODE_ISO8601_STD,SEC_CAL,"ISO 8601"), MODE_ROW(MODE_ISO_ORDINAL,SEC_CAL,"ISO ORD"),
   MODE_ROW(MODE_ISO_WEEK,SEC_CAL,"ISO WEEK"),     MODE_ROW(MODE_UNIX,SEC_CAL,"UNIX"),
   MODE_ROW(MODE_JULIAN_DATE,SEC_CAL,"JULIAN"),    MODE_ROW(MODE_MODIFIED_JD,SEC_CAL,"MOD JD"),

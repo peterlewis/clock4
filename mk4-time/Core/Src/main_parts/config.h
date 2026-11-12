@@ -269,6 +269,7 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     colonForce = 1;
   } else if (strcasecmp(key, "freq_hold") == 0) {
     freq_hold = truthy(value);        // in holdover, run at the frequency measured while locked
+    if (!from_serial) cfg_simple_defined |= (1u<<KID_FREQ_HOLD);
   } else if (strcasecmp(key, "tc_rtc") == 0) {
     tc_rtc = truthy(value);           // additionally trim RTC->CALR while GPS is absent
   } else if (strcasecmp(key, "tc_t0") == 0) {
@@ -322,6 +323,7 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     // Opt-in. Arms on the next main-loop pass. It cannot be stopped once armed (the hardware has no
     // off switch), so "off" takes effect at the next reset.
     watchdog = truthy(value) ? 1 : 0;
+    if (!from_serial) cfg_simple_defined |= (1u<<KID_WATCHDOG);
   } else if (strcasecmp(key, "wdt_dump") == 0) {
     if (from_serial && truthy(value)) wdt_dump_pending = 1;   // serial-only: report the watchdog's state
   } else if (strcasecmp(key, "menu_dump") == 0) {

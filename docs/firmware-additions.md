@@ -381,7 +381,8 @@ The watchdog is armed only once the clock is running, never during a firmware up
 always stops it, so the bootloader is unaffected. If it fires three times in a row it stands down
 for that boot rather than reboot forever, and re-arms after a minute of normal running. Once armed
 it cannot be switched off: `watchdog = off` takes effect at the next reset. `wdt_dump = on` over
-serial (below) says whether it has ever fired. Default off.
+serial (below) says whether it has ever fired. Default off. Also settable from the menu (SYS >
+WATCHDOG), under the same rule: on arms it at once, off waits for the next reset.
 
 ### pps
 
@@ -502,7 +503,8 @@ add, and `tc_engage_s` and `tc_max_ppm` apply to the total. `tc_dump` prints the
 
 Measured on one production clock over 24 days: the offset was +0.12 ppm, steady to within 0.015 ppm.
 Replaying 44,000 GPS losses on that recording, the typical error after an hour of holdover fell from
-386 µs to 7 µs, and after six hours from 2.4 ms to 0.15 ms. Default off.
+386 µs to 7 µs, and after six hours from 2.4 ms to 0.15 ms. Default off. Also settable from the menu
+(DIAG > F HOLD).
 
 ## USB serial output
 
@@ -734,13 +736,15 @@ civil and alternate-timebase colon animations: `SLOWFADE`, `HEARTBt`, `1PPS SAW`
 mode row.
 
 **DIAG** — diagnostics: `TEMPCOMP` (arms the temperature-compensation learn + apply + persist trio — this is the
-enable; the read-out is the row beside it), `SATVIEW`, `ADEV`, `TC DATA` (the `MODE_TEMPCOMP`
-read-out), `FW CRC`, `VBAT`, plus a read-only `PPS` row.
+enable; the read-out is `TC DATA`), `F HOLD` (`freq_hold`: hold the measured oscillator frequency when
+GPS is lost), `SATVIEW`, `ADEV`, `TC DATA` (the `MODE_TEMPCOMP` read-out), `FW CRC`, `VBAT`, plus a
+read-only `PPS` row.
 
 **SYS** — system: `PPS MSG` (the `$PMTXTS` timestamp sentence — not a hardware 1PPS output), `BRT MSG`
 (the `$PMBRIT` dimmer report), `NMEA` (`ALL` / `RMC` / `NONE`), `MATRIX` (the matrix frequency in kHz,
 floored at 8 kHz here to keep the display flicker-free while you scrub; `config.txt` can still reach the
-1 kHz hardware floor), and `RESET` (factory reset, below).
+1 kHz hardware floor), `WATCHDOG` (the independent watchdog; on arms it at once, off waits for the
+next reset), and `RESET` (factory reset, below).
 
 ### Editing values
 
