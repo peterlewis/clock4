@@ -4653,7 +4653,11 @@ static _Bool    ee2_avail=0;
 // layout: +0x0000 menu page A | +0x1000 menu page B | +0x2000 tempcomp page A | +0x3000 tempcomp page B.
 typedef enum { EE_BK_NONE=0, EE_BK_QSPI } EEBacking;
 static EEBacking ee_backing = EE_BK_NONE;
-static uint8_t   ee_sfile_state = 0;          // 0 no SETTINGS.BIN | 1 ok | 2 fragmented/too small
+static uint8_t   ee_sfile_state = 0;          // 0 no SETTINGS.BIN | 1 ok | 2 fragmented/too small | 3 QSPI read fault
+// Set by ee_rd32/ee_rd when a QSPI read fails. A failed read returns zeros, and zeros look exactly
+// like "no record here, page not blank" - the state that licenses an ERASE. So every path that is
+// about to erase or program checks ee_fault_check() after its reads and before the first write.
+static _Bool     ee_rd_fault = 0;
 // Host-write generation: STORAGE_Write_FS bumps it on EVERY host MSC write. A commit whose mapping
 // generation is stale must re-resolve the file's physical base first — the host may have moved,
 // rewritten or deleted SETTINGS.BIN, and a blind write against the old base could hit fwt.bin or the
@@ -4669,8 +4673,9 @@ static uint32_t   settings_map_seen = 0;
 static uint8_t ee_sfile[EE_SFILE_SZ];
 static uint8_t ee_sfile_attached = 1;   // SETTINGS.BIN present on the emulated card (tests can detach)
 static uint8_t ee_sfile_frag = 0;       // pretend the file is fragmented -> resolver must reject
-static uint32_t ee_rd32(uint32_t a){ uint32_t v; memcpy(&v, &ee_sfile[a], 4); return v; }
-static void ee_rd(uint32_t a, void*d, uint32_t n){ memcpy(d, &ee_sfile[a], n); }
+static uint8_t ee_sfile_rdfault = 0;    // every read fails, as a QSPI HAL error would (tests)
+static uint32_t ee_rd32(uint32_t a){ if (ee_sfile_rdfault){ ee_rd_fault = 1; return 0; } uint32_t v; memcpy(&v, &ee_sfile[a], 4); return v; }
+static void ee_rd(uint32_t a, void*d, uint32_t n){ if (ee_sfile_rdfault){ ee_rd_fault = 1; memset(d, 0, n); return; } memcpy(d, &ee_sfile[a], n); }
 static void ee_erase(uint32_t a){ memset(&ee_sfile[a & ~(EE_QSPI_PGSZ-1u)], 0xFF, EE_QSPI_PGSZ); }
 static void ee_prog_dw(uint32_t a, uint64_t v){
   uint8_t s[8]; memcpy(s,&v,8);
@@ -4687,15 +4692,23 @@ static QSPI_STATUS ee_qspi_rd(uint32_t a, void*d, uint32_t n){
 }
 static uint32_t ee_rd32(uint32_t a){
   uint32_t v;
-  if (ee_qspi_rd(a, &v, 4) != QSPI_STATUS_OK) return 0;   // read fault reads as garbage -> callers abort, never erase
+  if (ee_qspi_rd(a, &v, 4) != QSPI_STATUS_OK) { ee_rd_fault = 1; return 0; }   // zeros + the fault flag: callers must check before any erase
   return v;
 }
 static void ee_rd(uint32_t a, void*d, uint32_t n){
-  if (ee_qspi_rd(a, d, n) != QSPI_STATUS_OK) memset(d, 0, n);
+  if (ee_qspi_rd(a, d, n) != QSPI_STATUS_OK) { ee_rd_fault = 1; memset(d, 0, n); }
 }
 static void ee_erase(uint32_t a){ QSPI_Erase_Sector(a); }
 static void ee_prog_dw(uint32_t a, uint64_t v){ uint8_t b[8]; memcpy(b,&v,8); QSPI_Program(b, a, 8); }
 #endif
+// The store's one rule for a failed read: stop, and touch nothing. Returns 1 if a read has failed
+// since boot; both stores then run RAM-only until the next power-on (which retries), so no erase or
+// program can ever be decided from bytes that were never read.
+static _Bool ee_fault_check(void){
+  if (!ee_rd_fault) return 0;
+  ee_backing = EE_BK_NONE; ee_avail = 0; ee2_avail = 0; ee_sfile_state = 3;
+  return 1;
+}
 
 static uint16_t ee_crc16(const uint8_t*p, uint32_t n){   // CRC-16-CCITT (poly 0x1021, init 0xFFFF)
   uint16_t c=0xFFFF;
@@ -4778,6 +4791,7 @@ static _Bool settings_resolve(void){
 #endif
 static void ee_init_base(void){
   ee_backing = EE_BK_NONE;
+  ee_rd_fault = 0;                                   // a new boot retries the medium
 #ifdef __EMSCRIPTEN__
   settings_resolve();                                // emu: the same file, attachable/detachable by tests
 #else
@@ -4796,7 +4810,7 @@ static _Bool ee_page_blank(uint32_t base){
 // boot load (unpack=1) and the post-host-write remap rescan (unpack=0 — RAM state may be newer than
 // anything stored, so a rescan must never clobber ovr).
 static void ee_scan(_Bool unpack){
-  uint8_t rec[EE_REC_SZ];
+  uint8_t rec[EE_REC_SZ], best[EE_REC_SZ];           // best = the CRC-verified bytes of the winner (never re-read)
   int found=0; uint32_t best_gen=0, best_page=ee_page_a; uint16_t best_slot=0;
   ee_active=ee_page_a; ee_next=0;
   for (int pg=0; pg<2; pg++){
@@ -4808,18 +4822,22 @@ static void ee_scan(_Bool unpack){
       uint16_t sc; memcpy(&sc,rec+8,2); if (sc!=EE_SCHEMA) continue;
       uint16_t crc; memcpy(&crc,rec+62,2); if (ee_crc16(rec,62)!=crc) continue;   // torn write -> reject
       uint32_t gen; memcpy(&gen,rec+4,4);
-      if (!found || gen>best_gen){ found=1; best_gen=gen; best_page=base; best_slot=s; }
+      if (!found || gen>best_gen){ found=1; best_gen=gen; best_page=base; best_slot=s; memcpy(best,rec,EE_REC_SZ); }
     }
   }
   if (found){
-    if (unpack){ ee_rd(best_page + (uint32_t)best_slot*EE_REC_SZ, rec, EE_REC_SZ); ee_unpack(rec); }
+    if (unpack) ee_unpack(best);                            // a record that passed its CRC is safe to apply, fault or not
     ee_active=best_page; ee_next=(uint16_t)(best_slot+1);   // append after the winner
     if (best_gen > ee_gen) ee_gen = best_gen;               // gen stays monotonic across remaps
-  } else if (ee_backing == EE_BK_QSPI){
+  }
+  if (ee_fault_check()) return;      // a read failed: "no record" may be a lie - never erase on it
+  if (!found && ee_backing == EE_BK_QSPI){
     // First use of a freshly-provisioned (or host-rewritten) file: NOR can only program 1->0, so a
     // 0x00-filled or garbage-filled file would AND every record into a CRC failure FOREVER. Erase the
     // pair to true 0xFF before the first append. Mapping is fresh here (boot or just-revalidated).
-    if (!ee_page_blank(ee_page_a) || !ee_page_blank(ee_page_b)){
+    _Bool blank = ee_page_blank(ee_page_a) && ee_page_blank(ee_page_b);
+    if (ee_fault_check()) return;    // "not blank" from a failed read is not a reason to erase
+    if (!blank){
       ee_erase(ee_page_a); ee_erase(ee_page_b);
       ee_active=ee_page_a; ee_next=0;
     }
@@ -4828,6 +4846,7 @@ static void ee_scan(_Bool unpack){
   // into unpredictable bytes). Cursor may land == EE_SLOTS -> the next commit rolls over onto an
   // erased page.
   while (ee_next < EE_SLOTS && ee_rd32(ee_active + (uint32_t)ee_next*EE_REC_SZ) != 0xFFFFFFFFu) ee_next++;
+  ee_fault_check();
 }
 // Boot: derive the base, scan both pages, unpack the highest-generation CRC-valid record into ovr.
 void ee_load(void){
@@ -4859,6 +4878,7 @@ static void menu_dump_step(void){
     static const char *bk_nm[2] = { "NONE", "QSPI" };
     const char *verdict =
         (ee_backing == EE_BK_QSPI)     ? "QSPI SETTINGS.BIN (settings persist)" :
+        (ee_sfile_state == 3)          ? "RAM-ONLY (QSPI read fault - file left untouched, power-cycle to retry)" :
         (ee_sfile_state == 2)          ? "RAM-ONLY (SETTINGS.BIN fragmented/too small - reformat + recreate it first)" :
                                          "RAM-ONLY (no SETTINGS.BIN on the drive)";
     int nn = snprintf(dline, sizeof dline,
@@ -4902,6 +4922,7 @@ static _Bool settings_mapping_ok(void){
   if (ee_page_a != old_a){                               // file moved: rebase both stores + rescan
     ee2_page_a = ee_page_a + 2u*EE_QSPI_PGSZ; ee2_page_b = ee_page_a + 3u*EE_QSPI_PGSZ;
     ee_scan(0); ee2_scan(0);
+    if (!ee_avail) return 0;                             // a read failed during the rescan: RAM-only now
   }
   settings_map_seen = snap;
   return 1;
@@ -4915,10 +4936,12 @@ static _Bool ee_sentinel(uint32_t magic, uint32_t page_a, uint32_t page_b,
                          uint32_t *active, uint16_t *next){
   if (ee_backing != EE_BK_QSPI) return 1;
   uint32_t s0 = ee_rd32(*active);
+  if (ee_fault_check()) return 0;                        // could not read the sentinel: not "garbage", unknown
   if (s0 == magic || s0 == 0xFFFFFFFFu) return 1;
   ee_erase(page_a); ee_erase(page_b);
   *active = page_a; *next = 0;
-  return ee_rd32(page_a) == 0xFFFFFFFFu;                 // erase verified (a read fault fails here)
+  _Bool erased = ee_rd32(page_a) == 0xFFFFFFFFu;         // erase verified
+  return !ee_fault_check() && erased;
 }
 // Write ovr as the next record. Erase + switch page when the active one is full (CRC lands last, so a
 // power loss mid-write just fails CRC and ee_load falls back to the prior generation). Caller gates.
@@ -4930,6 +4953,7 @@ static _Bool ee_commit(void){
   if (!ee_sentinel(EE_MAGIC, ee_page_a, ee_page_b, &ee_active, &ee_next)){ fatfs_busy = 0; return 0; }
   // Never program a non-blank slot (NOR AND-merges): skip past strays.
   while (ee_next < EE_SLOTS && ee_rd32(ee_active + (uint32_t)ee_next*EE_REC_SZ) != 0xFFFFFFFFu) ee_next++;
+  if (ee_fault_check()){ fatfs_busy = 0; return 0; }   // "every slot is used" from failed reads must not erase the other page
   if (ee_next >= EE_SLOTS){
     uint32_t other = (ee_active==ee_page_a)? ee_page_b : ee_page_a;
     ee_erase(other); ee_active=other; ee_next=0;
@@ -4990,7 +5014,7 @@ static void tc_unpack(const uint8_t*r){
 }
 // Scan/position for the tempcomp pair — twin of ee_scan (same NOR first-use + skip-to-blank rules).
 static void ee2_scan(_Bool unpack){
-  uint8_t rec[EE_REC_SZ];
+  uint8_t rec[EE_REC_SZ], best[EE_REC_SZ];
   int found=0; uint32_t best_gen=0, best_page=ee2_page_a; uint16_t best_slot=0;
   ee2_active=ee2_page_a; ee2_next=0;
   for (int pg=0; pg<2; pg++){
@@ -5002,20 +5026,25 @@ static void ee2_scan(_Bool unpack){
       uint16_t sc; memcpy(&sc,rec+8,2); if (sc!=EE2_SCHEMA) continue;
       uint16_t crc; memcpy(&crc,rec+62,2); if (ee_crc16(rec,62)!=crc) continue;
       uint32_t gen; memcpy(&gen,rec+4,4);
-      if (!found || gen>best_gen){ found=1; best_gen=gen; best_page=base; best_slot=s; }
+      if (!found || gen>best_gen){ found=1; best_gen=gen; best_page=base; best_slot=s; memcpy(best,rec,EE_REC_SZ); }
     }
   }
   if (found){
-    if (unpack){ ee_rd(best_page + (uint32_t)best_slot*EE_REC_SZ, rec, EE_REC_SZ); tc_unpack(rec); }
+    if (unpack) tc_unpack(best);
     ee2_active=best_page; ee2_next=(uint16_t)(best_slot+1);
     if (best_gen > ee2_gen) ee2_gen = best_gen;
-  } else if (ee_backing == EE_BK_QSPI){
-    if (!ee_page_blank(ee2_page_a) || !ee_page_blank(ee2_page_b)){
+  }
+  if (ee_fault_check()) return;      // same rule as ee_scan: a failed read never licenses an erase
+  if (!found && ee_backing == EE_BK_QSPI){
+    _Bool blank = ee_page_blank(ee2_page_a) && ee_page_blank(ee2_page_b);
+    if (ee_fault_check()) return;
+    if (!blank){
       ee_erase(ee2_page_a); ee_erase(ee2_page_b);
       ee2_active=ee2_page_a; ee2_next=0;
     }
   }
   while (ee2_next < EE_SLOTS && ee_rd32(ee2_active + (uint32_t)ee2_next*EE_REC_SZ) != 0xFFFFFFFFu) ee2_next++;
+  ee_fault_check();
 }
 void ee2_load(void){
   ee2_init_base();
@@ -5031,6 +5060,7 @@ static _Bool ee2_commit(void){
   fatfs_busy = 1;
   if (!ee_sentinel(EE2_MAGIC, ee2_page_a, ee2_page_b, &ee2_active, &ee2_next)){ fatfs_busy = 0; return 0; }
   while (ee2_next < EE_SLOTS && ee_rd32(ee2_active + (uint32_t)ee2_next*EE_REC_SZ) != 0xFFFFFFFFu) ee2_next++;
+  if (ee_fault_check()){ fatfs_busy = 0; return 0; }
   if (ee2_next >= EE_SLOTS){
     uint32_t other = (ee2_active==ee2_page_a)? ee2_page_b : ee2_page_a;
     ee_erase(other); ee2_active=other; ee2_next=0;
