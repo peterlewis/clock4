@@ -330,6 +330,24 @@ Trims the star transit catalogue to stars brighter than this apparent magnitude,
 `STARS.BIN` is loaded. Smaller numbers mean fewer, more famous stars: 1.5 keeps roughly the two dozen
 first-magnitude stars, 2.5 admits the whole supplied file. Default 6.0 (no trim).
 
+### watchdog
+
+```
+watchdog = on
+```
+
+Arms the microcontroller's independent watchdog. The time row is drawn from an interrupt, so a
+firmware hang does not look like one: the digits can freeze on a believable time, or keep counting
+while the timezone, the menu and USB are dead behind them, until someone cycles the power. With the
+watchdog armed, a main loop that stops for 8 seconds resets the clock instead. It comes back from
+the battery-backed RTC in about a second and re-locks to GPS.
+
+The watchdog is armed only once the clock is running, never during a firmware update, and a reset
+always stops it, so the bootloader is unaffected. If it fires three times in a row it stands down
+for that boot rather than reboot forever, and re-arms after a minute of normal running. Once armed
+it cannot be switched off: `watchdog = off` takes effect at the next reset. `wdt_dump = on` over
+serial (below) says whether it has ever fired. Default off.
+
 ### pps
 
 ```
@@ -506,6 +524,31 @@ RAM-only, and if RAM-only, why (no `SETTINGS.BIN`, or the file is fragmented or 
 for checking whether your settings will survive a power cycle. The line also gives the
 microcontroller's flash size, `flash=256KB` for an STM32L476RC or `flash=1024KB` for an STM32L476RG,
 which is the easiest way to find out which one your clock was built with.
+
+```
+wdt_dump = on
+```
+Prints one line reporting the watchdog (see `watchdog` above): whether it is armed, how many times
+it has reset the clock since power was applied (`resets`), how many of those were in a row
+(`consecutive`), and `last_tag`, the part of the main loop that was running when it last fired.
+`-` means it has not fired. All of these are forgotten when power is removed.
+
+| `last_tag` | the main loop was in |
+|---|---|
+| 0 | start-up, before the main loop |
+| 1 | the menu |
+| 2 | display balance, colons, the brightness report |
+| 3 | the timezone lookup |
+| 4 | config and file housekeeping |
+| 5 | USB power sensing, the temperature reading |
+| 6 | serial output, temperature compensation, the settings store |
+| 7 | battery voltage, sun and moon |
+| 8 | the paged display modes, star transits |
+| 9 | the sidereal, solar and second-zone time row |
+
+```
+# watchdog: cfg=1 armed=1 timeout=8000ms resets=0 consecutive=0 last_tag=- -- ARMED
+```
 
 ```
 factory_reset = on

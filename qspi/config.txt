@@ -297,6 +297,15 @@ page_ms = 5500
 # live; off by default, so the stock serial output is unchanged.
 #brightness_report = on
 
+# Watchdog: reset the clock if its firmware hangs. The time row is drawn from an interrupt, so a
+# hang can leave the digits frozen on a believable time, or still counting with everything behind
+# them dead, until the power is cycled. With this on, a main loop that stops for 8 seconds resets
+# the clock; it comes back from the RTC in about a second. Never armed during a firmware update.
+# Three resets in a row and it stands down for that boot. Once armed it cannot be switched off:
+# "off" takes effect at the next reset. Send "wdt_dump = on" over USB serial to see whether it has
+# fired. Off by default.
+#watchdog = on
+
 # Factory reset: send "factory_reset = on" over USB serial (ignored in this file) to erase every
 # setting you changed with the two-button menu AND the learned temperature-compensation model,
 # returning the clock to exactly this config.txt. Note the on-device RESET chord only REBOOTS —
