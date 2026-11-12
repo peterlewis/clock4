@@ -321,6 +321,9 @@ volatile uint8_t  pps_sof_valid = 0;   // 1 once a real SOF anchor has been latc
 // Config-key scalars are written from the USB OTG ISR (parseConfigString) and read by the
 // main loop: volatile, matching the pps_ts_enabled precedent.
 volatile _Bool tc_learn = 0, tc_apply = 0, tc_rtc = 0;
+// Frequency hold (opt-in, see the fh_ block): in holdover, also steer out the oscillator's own offset,
+// measured against GPS while locked. Independent of the tempcomp keys; the two corrections add.
+volatile _Bool freq_hold = 0;
 // Holdover fade (opt-in). A sub-second digit whose accuracy can no longer be held — its time
 // uncertainty during GPS-loss holdover has grown past that digit's place value — FADES to black by
 // its remaining significance instead of dashing, overriding the fixed Tolerance_time_* ladder.
@@ -2551,6 +2554,8 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     // Per-hardware anchor: the AUTO colon scale (of 256) at the dimmest rail. Overrides the baked default.
     int v = atoi(value); colon_floor = v < 0 ? 0 : (v > 256 ? 256 : v);
     colonForce = 1;
+  } else if (strcasecmp(key, "freq_hold") == 0) {
+    freq_hold = truthy(value);        // in holdover, run at the frequency measured while locked
   } else if (strcasecmp(key, "tc_rtc") == 0) {
     tc_rtc = truthy(value);           // additionally trim RTC->CALR while GPS is absent
   } else if (strcasecmp(key, "tc_t0") == 0) {
@@ -3525,11 +3530,98 @@ static _Bool tc_hse_delta(int t_now, int t_ref, int32_t *dticks){
   return 1;
 }
 
+// ==================== Frequency hold (opt-in: freq_hold = on) ===================================
+// In holdover the display runs on the SysTick at its NOMINAL reload, so it drifts at the oscillator's
+// own offset from nominal. The tempcomp steering above only applies the CHANGE with temperature since
+// GPS loss; the offset the oscillator already had at that moment was left in. Yet the firmware
+// measures that offset exactly, every locked second: DWT->CYCCNT is latched at each PPS edge and is
+// never re-pinned, so (this edge - last edge) - nominal is the oscillator's error in ticks per GPS
+// second. freq_hold keeps the measurement and, in holdover, steers it out.
+//
+// Measured on a production Mk IV from 24 days of 1 Hz records (pccd): the offset sat at +0.12 ppm,
+// steady to +-0.015 ppm from day to day. Replaying 44,000 GPS losses on that data, median / 95th
+// percentile holdover error:
+//                      10 min          1 h             6 h              24 h
+//   unsteered        64 / 100 us     386 / 593 us    2.4 / 3.5 ms     10.6 / 10.9 ms
+//   freq_hold       0.5 / 3.8 us     6.9 / 75 us     0.15 / 1.0 ms     2.0 / 3.8 ms
+//
+// THE ESTIMATE: 16 s blocks. A block's sum of per-second errors depends only on its two end edges
+// (the inner edges cancel), so PPS jitter averages out, and a 16 s sum IS the mean in 1/16 tick per
+// second: no division, and the fixed point the steering then uses. The estimate is the MEDIAN of the
+// last five completed blocks (80 s), which shrugs off one bad block; the block in progress is never
+// used, so the last seconds before a loss - when a failing fix may already be bending the PPS - stay
+// out. Longer windows were no better on the data. Only edges with a valid fix count, the first ten
+// after (re)acquisition are skipped while the receiver settles, and a >100 ppm step restarts the block.
+//
+// RESOLUTION: the tick ISR spreads whole ticks per second across the milliseconds. 1 tick/s is
+// 12.5 ns/s, 45 us an hour - worth having, the data says (13.9 -> 6.9 us median at 1 h). So the
+// governor carries the 1/16 remainder from second to second and adds a tick when it overflows.
+#define FH_BLOCK_S  16u               // seconds per block
+#define FH_BLOCKS   5u                // completed blocks kept
+#define FH_MIN      3u                // completed blocks needed before there is an estimate (48 s of lock)
+#define FH_FP       16                // steering fixed point: 1/16 tick per second (== FH_BLOCK_S)
+static int32_t  fh_ring[FH_BLOCKS];   // completed block sums; a sum is that block's mean in 1/16 tick/s
+static uint8_t  fh_count = 0, fh_head = 0;
+static int32_t  fh_sum = 0;           // the block in progress
+static uint8_t  fh_n = 0;
+static uint32_t fh_prev_dwt = 0;
+static _Bool    fh_have_prev = 0;
+static uint8_t  fh_warm = 0;
+
+static void fh_learn(void){
+  static uint32_t last_seq = 0;
+
+  __disable_irq();                            // tear-free copy (tc_hse_learn pattern)
+  uint32_t seq   = pps_cap.seq;
+  uint32_t dwt   = pps_cap.dwt_pps;
+  uint8_t  flags = pps_cap.flags;
+  __enable_irq();
+
+  if (seq == last_seq) return;                // no new edge since last pass
+  _Bool contiguous = (seq == last_seq + 1);
+  last_seq = seq;
+
+  if ((flags & 0x3) != 0x3 || !contiguous) {  // no valid fix at this edge, or edges were missed
+    fh_have_prev = 0; fh_warm = 0; fh_sum = 0; fh_n = 0;
+    return;                                   // completed blocks are kept: an old measurement beats none
+  }
+  if (!fh_have_prev) { fh_prev_dwt = dwt; fh_have_prev = 1; return; }
+  int32_t d = (int32_t)((uint32_t)(dwt - fh_prev_dwt) - (tc_nom_load + 1u) * 1000u);   // wrap-exact
+  fh_prev_dwt = dwt;
+  if (fh_warm < 10) { fh_warm++; return; }    // settle after (re)acquisition
+
+  int32_t tpp = tc_tpp();
+  if (d > 100 * tpp || d < -100 * tpp) { fh_sum = 0; fh_n = 0; return; }   // >100 ppm: a glitch, not the oscillator
+  fh_sum += d;
+  if (++fh_n >= FH_BLOCK_S) {
+    fh_ring[fh_head] = fh_sum;
+    fh_head = (uint8_t)((fh_head + 1u) % FH_BLOCKS);
+    if (fh_count < FH_BLOCKS) fh_count++;
+    fh_sum = 0; fh_n = 0;
+  }
+}
+// The current estimate, in 1/16 tick per second: the median of the completed blocks.
+static _Bool fh_estimate(int32_t *e_fp){
+  if (fh_count < FH_MIN) return 0;
+  int32_t v[FH_BLOCKS];
+  uint8_t n = fh_count;
+  for (uint8_t i = 0; i < n; i++) {           // insertion sort, n <= 5
+    int32_t x = fh_ring[i]; uint8_t j = i;
+    while (j > 0 && v[j-1] > x) { v[j] = v[j-1]; j--; }
+    v[j] = x;
+  }
+  *e_fp = (n & 1u) ? v[n/2] : (v[n/2 - 1] + v[n/2]) / 2;
+  return 1;
+}
+
 // Once-per-second control: evaluate the models at the current die temperature, refresh the
 // display cache, engage/disengage SysTick steering, and (optionally) trim RTC->CALR.
 static void tc_governor(void){
   static uint32_t last_run = 0;
-  static int32_t  applied_E = 0;              // ticks/second currently steered
+  static int32_t  applied_fp = 0;             // rate currently steered, 1/16 tick per second
+  static int32_t  hold_fp = 0;                // freq_hold's estimate, frozen when steering engaged
+  static _Bool    hold_ok = 0;
+  static int32_t  dither = 0;                 // carried 1/16-tick remainder, [0,16)
   static _Bool    was_on = 0;
   static int16_t  t_loss = 0;                 // die temp captured when steering engaged
   static int32_t  last_steps = 0x7FFF;        // last CALR trim written (sentinel: none)
@@ -3558,61 +3650,80 @@ static void tc_governor(void){
   _Bool have_h = tc_hse_delta(t, was_on ? t_loss : t, &dt_now);
 
   // display cache (clamped so "HSE -99.99" never exceeds the 10-char row).
-  // HSE page shows the ACTIVE steering correction in ppm (0.00 while locked — the PPS
-  // discipline owns the phase then); LSE page shows the absolute model ppm.
-  float dh = was_on ? (float)applied_E / (float)tpp : 0.0f;
+  // HSE page shows the ACTIVE steering correction in ppm. While locked the PPS discipline owns the
+  // phase and nothing is steered: the page then shows 0.00, or with freq_hold on, the offset it is
+  // measuring - the rate it will apply at the next GPS loss. LSE page shows the absolute model ppm.
+  int32_t live_fp = 0;
+  _Bool live_ok = freq_hold && fh_estimate(&live_fp);
+  float fp_per_ppm = (float)(tpp * FH_FP);
+  float dh = was_on ? (float)applied_fp / fp_per_ppm : live_ok ? (float)live_fp / fp_per_ppm : 0.0f;
   float dl = lp;
   if (dh >  99.99f) dh =  99.99f;
   if (dh < -99.99f) dh = -99.99f;
   if (dl >  99.99f) dl =  99.99f;
   if (dl < -99.99f) dl = -99.99f;
-  tc_disp_hse = dh;  tc_disp_hse_ok = have_h;
+  tc_disp_hse = dh;  tc_disp_hse_ok = have_h || (was_on ? hold_ok : live_ok);
   tc_disp_lse = dl;  tc_disp_lse_ok = have_l;
   tc_disp_state = tc_steer_on ? 'A'
                 : (!isnan(tc_cfg_hse[1]) || !isnan(tc_cfg_lse[0])) ? 'F'
                 : (tc_hse_prior || tc_lse_prior) ? 'S'          // running on the warm-start seed (evolving)
                 : (tc_learn && fresh < 5) ? 'L' : '-';
 
-  // --- HSE steering: engage only in holdover, after first-ever fix, with a usable model.
-  // The correction is the temperature-driven CHANGE since GPS loss (origin cancels; see
-  // tc_hse_delta). At the loss instant the delta is 0 by construction and grows only as the
-  // die temperature moves, so engage is glitch-free and re-lock needs no unwinding beyond
-  // the LOAD restore (the per-edge phase snap owns lock).
-  if (tc_apply && had_pps && fresh >= tc_engage_s) {
-    if (!was_on) t_loss = (int16_t)t;         // remember the temperature we lost GPS at
-    int32_t target = 0;
-    if (tc_hse_delta(t, t_loss, &target)) {
-      int32_t lim = (int32_t)tc_max_ppm * tpp;
+  // --- HSE steering: engage only in holdover, after first-ever fix, with something to apply.
+  // Two corrections add, each optional:
+  //  - freq_hold: the offset measured while locked (fh_estimate), frozen at the moment of loss. It is
+  //    a step in RATE from the first steered second; the phase was true at the loss, so nothing jumps.
+  //  - tc_apply: the temperature-driven CHANGE since loss (origin cancels; see tc_hse_delta). It is 0
+  //    at the loss instant by construction and grows only as the die temperature moves.
+  // Re-lock needs no unwinding beyond the LOAD restore (the per-edge phase snap owns lock).
+  if ((tc_apply || freq_hold) && had_pps && fresh >= tc_engage_s) {
+    if (!was_on) {
+      t_loss = (int16_t)t;                    // remember the temperature we lost GPS at
+      hold_ok = freq_hold && fh_estimate(&hold_fp);
+      if (!hold_ok) hold_fp = 0;
+    }
+    int32_t lim = (int32_t)tc_max_ppm * tpp * FH_FP;    // 200 ppm * 80 * 16 = 256000: no overflow
+    int32_t dtemp = 0;
+    _Bool have_t = tc_apply && tc_hse_delta(t, t_loss, &dtemp);
+    if (have_t || hold_ok) {
+      if (dtemp >  lim / FH_FP) dtemp =  lim / FH_FP;   // clamp BEFORE scaling
+      if (dtemp < -lim / FH_FP) dtemp = -lim / FH_FP;
+      int32_t target = hold_fp + (have_t ? dtemp * FH_FP : 0);
       if (target >  lim) target =  lim;
       if (target < -lim) target = -lim;
-      if (!was_on) applied_E = target;        // 0 at engage by construction...
-      else {                                  // ...then gentle slew (temp-quantisation steps)
-        int32_t slew = tpp / 4;               // 0.25 ppm per second
-        int32_t d = target - applied_E;
+      if (!was_on) { applied_fp = target; dither = 0; }
+      else {                                  // gentle slew (temp-quantisation steps)
+        int32_t slew = tpp * FH_FP / 4;       // 0.25 ppm per second
+        int32_t d = target - applied_fp;
         if (d >  slew) d =  slew;
         if (d < -slew) d = -slew;
-        applied_E += d;
+        applied_fp += d;
       }
-      int32_t base = applied_E >= 0 ? applied_E / 1000 : -((-applied_E + 999) / 1000);
-      int32_t rem  = applied_E - base * 1000; // floor-division remainder, always [0,1000)
+      // Whole ticks for THIS second: the floor, plus one when the carried 1/16 remainders overflow,
+      // so the long-run mean is applied_fp/16 ticks per second exactly.
+      int32_t whole = applied_fp >= 0 ? applied_fp / FH_FP : -((-applied_fp + FH_FP - 1) / FH_FP);
+      dither += applied_fp - whole * FH_FP;   // remainder, always [0,16)
+      if (dither >= FH_FP) { dither -= FH_FP; whole++; }
+      int32_t base = whole >= 0 ? whole / 1000 : -((-whole + 999) / 1000);
+      int32_t rem  = whole - base * 1000;     // floor-division remainder, always [0,1000)
       __disable_irq();
       tc_load_base = (int32_t)tc_nom_load + base;
       tc_rem = rem;
       tc_steer_on = 1;
       __enable_irq();
       was_on = 1;
-    } else if (was_on) {                      // model became unusable mid-holdover
+    } else if (was_on) {                      // nothing left to apply mid-holdover
       tc_steer_on = 0;
       SysTick->LOAD = tc_nom_load;
       tc_acc = 0;
-      applied_E = 0;
+      applied_fp = 0; dither = 0; hold_ok = 0;
       was_on = 0;
     }
   } else if (was_on) {
     tc_steer_on = 0;                          // flag first: the ISR stops writing LOAD...
     SysTick->LOAD = tc_nom_load;              // ...then restore the nominal period
     tc_acc = 0;
-    applied_E = 0;
+    applied_fp = 0; dither = 0; hold_ok = 0;
     was_on = 0;
   }
 
@@ -3710,6 +3821,17 @@ static void tc_dump_step(void){
         break;
       }
     }
+    if (idx == 10) {                          // freq_hold: the measured oscillator offset (a comment line: nothing to paste)
+      int32_t e_fp = 0;
+      if (!freq_hold)                 n = snprintf(dline, sizeof dline, "# freq_hold: off\r\n");
+      else if (!fh_estimate(&e_fp))   n = snprintf(dline, sizeof dline, "# freq_hold: ---- (needs 48 s of GPS lock)\r\n");
+      else {                                  // ppm to 4 places, in integers (no float printf here)
+        int32_t fp1 = tc_tpp() * FH_FP;       // 1/16 ticks per ppm
+        long q = fp1 > 0 ? ((long)(e_fp < 0 ? -e_fp : e_fp) * 10000L + fp1 / 2) / fp1 : 0;
+        n = snprintf(dline, sizeof dline, "# freq_hold: %c%ld.%04ld ppm over %u s of lock\r\n",
+                     e_fp < 0 ? '-' : '+', q / 10000L, q % 10000L, (unsigned)(fh_count * FH_BLOCK_S));
+      }
+    }
     if (n <= 0 || n >= (int)sizeof dline) { tc_dump_pending = 0; idx = 0; dn = -1; return; }
     dn = n;
     busy_ct = 0;
@@ -3723,7 +3845,7 @@ static void tc_dump_step(void){
     return;
   }
   dn = -1;
-  if (++idx > 9) { idx = 0; tc_dump_pending = 0; }
+  if (++idx > 10) { idx = 0; tc_dump_pending = 0; }
 }
 
 // "adev_dump = on" over serial: emit the whole live Allan-deviation curve as ONE checksummed
@@ -4066,7 +4188,9 @@ void tc_housekeeping(void){
   // tc_steer_on in the gate: the governor owns DISENGAGE, so it must stay reachable even if
   // the user turns every tc key off while steering is engaged mid-holdover — otherwise the
   // tick ISR would keep applying a stale frozen correction forever.
-  if (tc_learn || tc_apply || tc_rtc || tc_steer_on || displayMode == MODE_TEMPCOMP) tc_governor();
+  if (freq_hold) fh_learn();                // the oscillator's offset against GPS, one sample per locked second
+
+  if (tc_learn || tc_apply || tc_rtc || freq_hold || tc_steer_on || displayMode == MODE_TEMPCOMP) tc_governor();
 
   if (significance_fade) {   // recompute the per-digit fade once per second while enabled
     static uint32_t last_fade = 0;

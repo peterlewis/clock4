@@ -89,7 +89,9 @@ MODE_TEMPCOMP = enabled
 A diagnostic read-out for the temperature compensation system (see its own section below), paging
 four sub-screens on the date row: the die temperature (`tC  32C`), the active timebase steering
 correction in ppm (`HSE -0.25` — this reads `0.00` while GPS-locked, since the PPS owns the phase
-then, and `----` with no usable model), the RTC crystal's absolute model value in ppm (`rtC  18.68`),
+then, and `----` with no usable model; with `freq_hold = on` it instead shows the oscillator offset
+being measured while locked, which is the rate applied at the next GPS loss), the RTC crystal's
+absolute model value in ppm (`rtC  18.68`),
 and the sample count with a state letter (`n   159 L`). The state letter is `A` applying (steering
 engaged), `F` frozen from config, `S` running on a warm-start seed, `L` learning, `-` idle.
 
@@ -443,6 +445,27 @@ coverage, a believable fit — at most once every 30 minutes and only when it ha
 so the flash lasts decades. On boot the stored model loads as an evolving seed; `config.txt` still
 wins per-key, so pasted coefficients override it. The store lives inside `SETTINGS.BIN` (see Flash
 memory files below). Default off.
+
+### freq_hold
+
+```
+freq_hold = on
+```
+
+Holds the oscillator's measured frequency through a GPS outage. In holdover the display runs on the
+main oscillator at its nominal rate, so it drifts at that oscillator's own offset from nominal: a
+fixed error, usually larger than anything temperature does. The clock measures the offset exactly
+while locked, by counting core clock cycles between PPS pulses, and with `freq_hold = on` it steers
+that offset out as soon as GPS is lost. Only the rate changes; the displayed time does not jump.
+
+The estimate is the median of the last five 16-second blocks, about 80 seconds of lock, and needs at
+least 48 seconds before it is used. The seconds just before a loss, when a failing fix may already be
+disturbing the PPS, are left out. It works alone or together with `tc_apply`: the two corrections
+add, and `tc_engage_s` and `tc_max_ppm` apply to the total. `tc_dump` prints the measured offset.
+
+Measured on one production clock over 24 days: the offset was +0.12 ppm, steady to within 0.015 ppm.
+Replaying 44,000 GPS losses on that recording, the typical error after an hour of holdover fell from
+386 µs to 7 µs, and after six hours from 2.4 ms to 0.15 ms. Default off.
 
 ## USB serial output
 
