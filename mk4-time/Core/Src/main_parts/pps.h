@@ -6,9 +6,9 @@
 // --- PPS host timestamping ----------------------------------------------------------------
 // Optional: emit one proprietary NMEA sentence ($PMTXTS) per PPS edge over the CDC port so a
 // host can measure the clock's timing stability (phase jitter, oscillator drift, holdover) —
-// things the plain NMEA stream cannot convey. Enabled by config "pps = on". Capture happens in
+// things the plain NMEA stream cannot convey. On by default; "pps = off" stops it. Capture happens in
 // the PPS ISR (cheap, just snapshots); the sentence is formatted + sent from the main loop.
-volatile uint8_t pps_ts_enabled = 0;
+volatile uint8_t pps_ts_enabled = 1;
 volatile _Bool   pps_record_pending = 0;
 volatile struct {
   uint32_t seq;        // increments every PPS edge (32-bit: no practical wrap; host detects gaps)

@@ -3,11 +3,11 @@
 // it defines code and state, relies on everything main.c declares above it, and must not be included
 // anywhere else. main_parts/README.md says why this is one translation unit.
 
-// Frequency hold (opt-in; explained below): in holdover, also steer out the oscillator's own offset,
+// Frequency hold (on by default; explained below): in holdover, also steer out the oscillator's own offset,
 // measured against GPS while locked. Independent of the tempcomp keys; the two corrections add.
-volatile _Bool freq_hold = 0;
+volatile _Bool freq_hold = 1;
 
-// ==================== Frequency hold (opt-in: freq_hold = on) ===================================
+// ==================== Frequency hold (default on; freq_hold = off) ===================================
 // In holdover the display runs on the SysTick at its NOMINAL reload, so it drifts at the oscillator's
 // own offset from nominal. The tempcomp steering above only applies the CHANGE with temperature since
 // GPS loss; the offset the oscillator already had at that moment was left in. Yet the firmware

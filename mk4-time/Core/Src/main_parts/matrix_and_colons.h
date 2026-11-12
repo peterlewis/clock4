@@ -61,12 +61,12 @@ void setDisplayFreq(uint32_t freq){
 // Colon brightness tracking. The colons are TIM2 PWM (buffer_colons_L/R), NOT part of the segment
 // scan and NOT coupled to dac_target — so out of the box they hold their animation brightness while
 // the digits dim around them, blazing at low rail. colon_balance ties the colon PWM to the rail:
-//   0/off (default) = stock (colons at full animation brightness)
-//   1/on            = AUTO: scale the colon PWM by the calibrated rail curve (see colon_scale_for)
+//   0/off           = stock (colons at full animation brightness)
+//   1/on (default)  = AUTO: scale the colon PWM by the calibrated rail curve (see colon_scale_for)
 //   2..256          = fixed manual scale (of 256) for eyeball calibration across the rail
 // The scale is folded into the animation buffer by loadColonAnimation and re-applied by
 // colon_balance_poll() from the main loop when the rail moves — never from the DMA/scan ISR.
-volatile uint16_t colon_balance = 0;
+volatile uint16_t colon_balance = 1;   // AUTO by default (this fork); 0/off = stock
 static   uint16_t colonScale    = 256;   // applied fixed-point scale, 256 = full animation brightness
 static volatile uint8_t colonForce = 0;  // config set colon_balance — apply once even if within the AUTO hysteresis
 

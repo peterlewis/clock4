@@ -44,12 +44,12 @@ volatile _Bool factory_reset_pending = 0;     // "factory_reset = on" over seria
 volatile _Bool menu_dump_pending = 0;      // "menu_dump = on" over serial -> emit the store-persistence diagnostic
 volatile _Bool menu_export_pending = 0;    // a saved menu change, or "menu_export = on" over serial -> send the choices as config lines
 
-// ---- Auto-persist the learned model to flash retained memory (opt-in: tc_persist = on) ----------
+// ---- Auto-persist the learned model to flash retained memory (default on; tc_persist = off) ----------
 // The record stores exactly what tc_dump prints and tc_seed re-loads (ppm-domain coefficients), so
 // boot warm-starts through the UNCHANGED tc_seed_apply path — auto-persist = "auto tc_dump into
 // flash", auto-seed = "auto paste + tc_seed = on". tc2 is both the RAM shadow of the winning flash
 // record AND the "last persisted model" the change-detector compares against.
-volatile _Bool tc_persist = 0;              // config master opt-in (default off = stock behaviour)
+volatile _Bool tc_persist = 1;              // on by default: needs a usable SETTINGS.BIN (ee2_avail), else RAM-only
 volatile _Bool tc_forget_pending = 0;       // "tc_forget = on" over serial -> erase the tempcomp store
 static   _Bool tc_model_dirty = 0;          // live model has moved beyond threshold since last persist
 static uint32_t tc_last_commit_ms = 0;      // uwTick at last commit (MONOTONIC — never GPS wall time)
@@ -770,7 +770,7 @@ static _Bool tc2_sane(void){
 }
 // Boot: seed the learned model from flash THROUGH the existing tc_seed path (config.txt still wins).
 SMALL_CODE void tc_seed_from_flash(void){
-  if (!tc_persist) return;                                   // opt-in (default off)
+  if (!tc_persist) return;                                   // tc_persist = off in config.txt
   if (tc_seed_done) return;                                  // first boot pass only (live-reload = no-op)
   if (!ee2_avail || !tc2.valid) return;
   if (!tc2_sane()) { tc2.valid = 0; return; }                // reject implausible/corrupt model
@@ -1033,15 +1033,17 @@ static const char *const mode_key[NUM_DISPLAY_MODES] = {
   [MODE_SOLAR]="MODE_SOLAR", [MODE_ADEV]="MODE_ADEV", [MODE_STAR]="MODE_STAR", [MODE_ZONE2]="MODE_ZONE2",
 };   // MODE_FIRMWARE_CRC_D has no key of its own: the one config.txt key sets both slots
 #define MX_SIMPLE 17u                    // the lines before the modes
+// The config.txt key behind each simple menu setting, in export order (a setting of several keys has a
+// row for each). The export sends them; a factory reset releases them.
+static const struct { uint8_t kid; const char *key; } menu_cfg_keys[MX_SIMPLE] = {
+  {KID_BRIGHTNESS,"brightness"}, {KID_COLON,"colon_mode"}, {KID_COLON_ALT,"colon_alt_mode"}, {KID_PAGE_MS,"page_ms"},
+  {KID_SIG_FADE,"significance_fade"}, {KID_PPS,"pps"}, {KID_NMEA,"nmea"}, {KID_MATRIX_FREQ,"MATRIX_FREQUENCY"},
+  {KID_TEMPCOMP,"tc_learn"}, {KID_TEMPCOMP,"tc_apply"}, {KID_TEMPCOMP,"tc_persist"},
+  {KID_BALANCE,"seg_balance"}, {KID_BALANCE,"colon_balance"}, {KID_CUCKOO,"cuckoo"},
+  {KID_BRIT,"brightness_report"}, {KID_FREQ_HOLD,"freq_hold"}, {KID_WATCHDOG,"watchdog"},
+};
 // Line `slot` of the export: 0 = the store does not hold it. val is at least 12 bytes.
 static SMALL_CODE const char *menu_export_item(uint16_t slot, char *val){
-  static const struct { uint8_t kid; const char *key; } sk[MX_SIMPLE] = {
-    {KID_BRIGHTNESS,"brightness"}, {KID_COLON,"colon_mode"}, {KID_COLON_ALT,"colon_alt_mode"}, {KID_PAGE_MS,"page_ms"},
-    {KID_SIG_FADE,"significance_fade"}, {KID_PPS,"pps"}, {KID_NMEA,"nmea"}, {KID_MATRIX_FREQ,"MATRIX_FREQUENCY"},
-    {KID_TEMPCOMP,"tc_learn"}, {KID_TEMPCOMP,"tc_apply"}, {KID_TEMPCOMP,"tc_persist"},
-    {KID_BALANCE,"seg_balance"}, {KID_BALANCE,"colon_balance"}, {KID_CUCKOO,"cuckoo"},
-    {KID_BRIT,"brightness_report"}, {KID_FREQ_HOLD,"freq_hold"}, {KID_WATCHDOG,"watchdog"},
-  };
   long num = -1; const char *word = NULL;
   if (slot >= MX_SIMPLE) {
     uint16_t m = (uint16_t)(slot - MX_SIMPLE);
@@ -1049,7 +1051,7 @@ static SMALL_CODE const char *menu_export_item(uint16_t slot, char *val){
     strcpy(val, ((ovr.modes_val>>m)&1ull) ? "enabled" : "disabled");
     return mode_key[m];
   }
-  if (!(ovr.simple_mask & (1u<<sk[slot].kid))) return NULL;
+  if (!(ovr.simple_mask & (1u<<menu_cfg_keys[slot].kid))) return NULL;
   switch (slot) {
     case 0:  if (ovr.brightness >= 0) num = 4095 - ovr.brightness; else word = ""; break;   // the key is read inverted; AUTO is "no line"
     case 1:  word = colon_key[ovr.colon     < 6 ? ovr.colon     : 0]; break;
@@ -1068,7 +1070,7 @@ static SMALL_CODE const char *menu_export_item(uint16_t slot, char *val){
     default: word = ovr.wdt  ? "on" : "off"; break;
   }
   if (word) strcpy(val, word); else snprintf(val, 12, "%ld", num);
-  return sk[slot].key;
+  return menu_cfg_keys[slot].key;
 }
 static SMALL_CODE void menu_export_step(void){
   static uint16_t slot = 0, sent = 0;
@@ -1107,10 +1109,22 @@ static SMALL_CODE void menu_export_step(void){
 // forget the RAM override store, then re-read config.txt so the clock returns to a config.txt-only
 // state immediately (no reboot). Serial-only + origin-guarded, like tc_reset. Serviced from the main
 // loop (flash erase stalls the CPU, and the config re-read touches the FAT + non-reentrant sendDate).
+// Every setting the menu holds goes back to its built-in value where config.txt has no line for it.
+// cfg_release leaves a key the file sets alone; the forced re-read in factory_reset_step puts the
+// file's value back on those. brightness and the colons are reset by every load anyway, and
+// MATRIX_FREQUENCY at the next power-on.
+static SMALL_CODE void menu_release_all(void){
+  for (uint16_t i = 0; i < MX_SIMPLE; i++)
+    if (ovr.simple_mask & (1u<<menu_cfg_keys[i].kid)) cfg_release(menu_cfg_keys[i].key);
+  for (uint8_t m = 0; m < NUM_DISPLAY_MODES; m++)
+    if (mode_key[m] && (ovr.modes_mask & (1ull<<m))) cfg_release(mode_key[m]);
+}
 static SMALL_CODE void factory_reset_step(void){
   if (!factory_reset_pending) return;
   if (ee_avail && !settings_mapping_ok()) return;   // QSPI: never erase against a stale mapping; retry
   factory_reset_pending = 0;
+  menu_release_all();                   // the menu's values go now, not at the next power-on
+  config.fdate = 0; config.ftime = 0;   // so the re-read below is a full one, not skipped as "unchanged"
   memset(&ovr, 0, sizeof ovr);          // drop the RAM override store (also covers the no-SETTINGS.BIN case)
   menu_dirty = 0;
   if (ee_avail){

@@ -297,7 +297,7 @@ SMALL_CODE void parseConfigString(char *key, char *value, _Bool from_serial) {
     tc_seed_hi = (int16_t)atoi(value);
     if (!from_serial) cfg_tc_defined |= CFG_TC_HI;
   } else if (strcasecmp(key, "tc_persist") == 0) {
-    tc_persist = truthy(value);       // opt-in: auto-save the learned model to its retained flash store
+    tc_persist = truthy(value);       // default on: auto-save the learned model to its retained flash store
     if (!from_serial) cfg_owns(KID_TEMPCOMP);   // menu TEMPCOMP bundles this too — a file that defines it wins
   } else if (strcasecmp(key, "tc_forget") == 0) {
     if (from_serial && truthy(value)) tc_forget_pending = 1;   // serial-only: erase the retained model (keeps live learning)
@@ -320,7 +320,7 @@ SMALL_CODE void parseConfigString(char *key, char *value, _Bool from_serial) {
     brightness_report = truthy(value) ? 1 : 0;   // 1 Hz $PMBRIT auto-dimmer operating point
     if (!from_serial) cfg_owns(KID_BRIT);
   } else if (strcasecmp(key, "watchdog") == 0) {
-    // Opt-in. Arms on the next main-loop pass. It cannot be stopped once armed (the hardware has no
+    // Default on. Arms on the next main-loop pass. It cannot be stopped once armed (the hardware has no
     // off switch), so "off" takes effect at the next reset.
     watchdog = truthy(value) ? 1 : 0;
     if (!from_serial) cfg_owns(KID_WATCHDOG);
@@ -431,13 +431,13 @@ static const struct { const char *key, *def; } cfg_defaults[] = {
   {"MODE_SUN_AZEL","off"}, {"MODE_MOON","off"}, {"MODE_GRID","off"}, {"MODE_LATLON","off"},
   {"MODE_TEMPCOMP","off"}, {"MODE_LST","off"}, {"MODE_SOLAR","off"}, {"MODE_ADEV","off"},
   {"MODE_STAR","off"}, {"MODE_ZONE2","off"}, {"MODE_DARK","off"}, {"page_ms","0"},
-  {"fake_longitude","0"}, {"fake_latitude","0"}, {"nmea","on"}, {"pps","off"}, {"cuckoo","off"},
-  {"tc_learn","off"}, {"tc_apply","off"}, {"tc_rtc","off"}, {"tc_persist","off"}, {"freq_hold","off"},
-  {"significance_fade","off"}, {"seg_balance","off"}, {"colon_balance","off"},
+  {"fake_longitude","0"}, {"fake_latitude","0"}, {"nmea","on"}, {"pps","on"}, {"cuckoo","off"},
+  {"tc_learn","on"}, {"tc_apply","on"}, {"tc_rtc","off"}, {"tc_persist","on"}, {"freq_hold","on"},
+  {"significance_fade","on"}, {"seg_balance","on"}, {"colon_balance","on"},
   {"colon_full_at","2048"}, {"colon_floor","20"}, {"tc_t0","40"}, {"tc_engage_s","2"},
   {"tc_max_ppm","100"}, {"tc_hse_b","nan"}, {"tc_hse_c","nan"}, {"tc_lse_a","nan"}, {"tc_lse_b","nan"},
   {"tc_lse_c","nan"}, {"tc_seed","off"}, {"tc_seed_lo","0"}, {"tc_seed_hi","0"}, {"star_max_mag","6"},
-  {"loop_diag","off"}, {"brightness_report","off"}, {"watchdog","off"}, {"config_write","off"}, {"BS1","0,0"},
+  {"loop_diag","off"}, {"brightness_report","off"}, {"watchdog","on"}, {"config_write","off"}, {"BS1","0,0"},
   {"BS2","131,365"}, {"BS3","1076,1422"}, {"BS4","2774,2665"}, {"BS5","3849,4095"},
 #ifdef NONCOMPLIANT_DATE_MODES
   {"MODE_DDMMYYYY","off"},

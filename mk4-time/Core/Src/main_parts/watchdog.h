@@ -3,10 +3,10 @@
 // it defines code and state, relies on everything main.c declares above it, and must not be included
 // anywhere else. main_parts/README.md says why this is one translation unit.
 
-volatile uint8_t watchdog = 0;             // config "watchdog = on": arm the independent watchdog (explained below)
+volatile uint8_t watchdog = 1;             // on by default; "watchdog = off" in config.txt: never arm the independent watchdog (explained below)
 volatile _Bool wdt_dump_pending = 0;       // "wdt_dump = on" over serial -> one line: armed or not, resets, where it hung
 
-// ==================== Watchdog (opt-in: watchdog = on) ==========================================
+// ==================== Watchdog (default on; watchdog = off) ==========================================
 // The time row is painted by the SysTick handler and the scan runs on DMA, so a main loop that has
 // hung - or a HardFault, whose handler spins - leaves a display that still looks alive: the last
 // second frozen, or digits still counting with the timezone, menu, USB config and RTC writes dead
@@ -31,7 +31,8 @@ volatile _Bool wdt_dump_pending = 0;       // "wdt_dump = on" over serial -> one
 // re-arms once the clock has run WDT_HEALTHY_MS. It also keeps the main-loop section (the LP_MARK
 // tag) that was running at the last watchdog reset: `wdt_dump = on` reports it.
 //
-// Off by default: with the key unset the IWDG is never started and behaviour is identical to stock.
+// On by default. config.txt (and the menu store) are read before the main loop, so "watchdog = off"
+// in the file means the IWDG is never started that boot, as in stock.
 #define WDT_MAGIC       0x57445431u   // "WDT1"
 #define WDT_TIMEOUT_MS  8000u
 #define WDT_STANDDOWN   3u            // consecutive watchdog resets before standing down

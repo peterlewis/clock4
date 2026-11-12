@@ -3,9 +3,15 @@
 This documents the features this firmware adds to the stock Mk IV firmware. It describes the
 `rollup` branch, which is what the ready-to-flash images in `qspi/output` are built from. That build
 carries version `0.0.5+<build>` on the time board and `0.0.2+<build>` on the date board; nothing here
-should be read as describing any other 0.0.5 build. Everything is opt-in: with none of the new
-config keys set, and a stock date board, behaviour is that of the stock firmware, apart from the
-fixes listed in the [readme](../readme.md).
+should be read as describing any other 0.0.5 build.
+
+Some additions are on by default, because they only make the clock more accurate or more robust:
+`significance_fade`, `freq_hold`, `tc_learn`, `tc_apply`, `tc_persist`, `seg_balance`,
+`colon_balance`, `pps` and `watchdog`. Set any of them to `off` in `config.txt` for the stock
+behaviour. Everything else is opt-in: the new display modes, `cuckoo`, `tc_rtc`,
+`brightness_report`, `config_write` and the diagnostics. With those defaults switched off and a stock
+date board, behaviour is that of the stock firmware, apart from the fixes listed in the
+[readme](../readme.md).
 
 ## New modes
 
@@ -193,7 +199,8 @@ continuously computes a bound on its holdover time error, and each sub-second di
 smoothly as the bound passes through its place value, rather than being dashed at a fixed time. A
 digit that is still significant keeps ticking at partial brightness on its way out. At power-on the
 sub-second digits start dark and only light once the clock can prove they're significant. Default
-off. Also settable from the menu (DISP > SIG FADE).
+on; `significance_fade = off` restores the stock `Tolerance_time_*` ladder. Also settable from the menu
+(DISP > SIG FADE).
 
 The bound has two parts, both measured by the clock itself while it is locked:
 
@@ -238,7 +245,7 @@ proportionally less duty, on both boards, with no change to the scan timing.
 intended setting. A number from 2 to 300 pins a fixed manual strength instead, for experiments:
 values up to 100 are a linear blend (100 = exactly duty-proportional), and 101 to 300 overdrive it
 with a power law, useful at the dimmest settings where the LED response is exponential and a linear
-map under-corrects. Default off (stock behaviour). Requires a matrix frequency of at least ~4 kHz;
+map under-corrects. Default on (the automatic curve); `seg_balance = off` is the stock scan. Requires a matrix frequency of at least ~4 kHz;
 below that the balancing dither would visibly strobe and is disabled.
 
 Balancing the date row requires the updated date-board firmware (`fwd.bin`); with a stock date board
@@ -254,8 +261,8 @@ The colons are driven by their own PWM rail, not the segment scan, so out of the
 brightness while the digits dim around them. `colon_balance` ties the colon brightness to the display
 brightness: `on` (or `1`) applies a calibrated curve — full brightness over the bright half of the
 range, tapering linearly to a dim floor at the darkest — and a number from 2 to 256 pins a fixed
-scale (of 256) for calibration sweeps. Default off. Leave it off until the digit brightness is
-dialled in, then switch on.
+scale (of 256) for calibration sweeps. Default on (the automatic curve); `colon_balance = off` keeps
+the colons at full animation brightness, as stock.
 
 Two anchors of the automatic curve are overridable per-hardware, exactly like the `BS` brightness
 stops:
@@ -416,7 +423,8 @@ The watchdog is armed only once the clock is running, never during a firmware up
 always stops it, so the bootloader is unaffected. If it fires three times in a row it stands down
 for that boot rather than reboot forever, and re-arms after a minute of normal running. Once armed
 it cannot be switched off: `watchdog = off` takes effect at the next reset. `wdt_dump = on` over
-serial (below) says whether it has ever fired. Default off. Also settable from the menu (SYS >
+serial (below) says whether it has ever fired. Default on: `config.txt` is read before the main loop
+starts, so `watchdog = off` in the file means it is never armed that boot. Also settable from the menu (SYS >
 WATCHDOG), under the same rule: on arms it at once, off waits for the next reset.
 
 ### pps
@@ -429,8 +437,9 @@ Outputs one `$PMTXTS` timing sentence over USB serial on each GPS PPS pulse, car
 sub-millisecond phase measurement made at the edge, for host-side jitter and drift analysis. When on,
 the sentence also carries a USB SOF-correlation tail that lets a host place the edge on its own clock
 to around a microsecond despite USB delivery jitter; a host that only needs the phase can ignore the
-extra fields. Enabling this turns on the USB start-of-frame interrupt (a cheap 1 kHz latch). Default
-off. Also settable from the menu (SYS > PPS MSG). The sentence format is documented under USB serial
+extra fields. The USB start-of-frame interrupt (a cheap 1 kHz latch) is always enabled; this key only
+decides whether it records. With no computer attached the sentence is dropped before it is formatted.
+Default on; `pps = off` stops the sentence. Also settable from the menu (SYS > PPS MSG). The sentence format is documented under USB serial
 output below.
 
 ### Temperature compensation
@@ -442,7 +451,8 @@ existing 63-second RTC calibration. The temperature compensation system learns a
 temperature model for both oscillators, then uses it during a GPS outage to steer the display
 timebase and to keep the battery RTC trimmed for the next power-up.
 
-Everything defaults off; with none of the keys set the behaviour is stock.
+`tc_learn`, `tc_apply` and `tc_persist` default on; `tc_rtc` defaults off. Set the first three to
+`off` for the stock behaviour.
 
 ```
 tc_learn = on
@@ -517,7 +527,8 @@ coverage, a believable fit — at most once every 30 minutes and only when it ha
 so the flash lasts decades. On boot the stored model loads as an evolving seed; `config.txt` still
 wins per-key, so pasted coefficients override it. The store lives inside `SETTINGS.BIN` (see Flash
 memory files below). The same record also keeps the wander level learned for `significance_fade`,
-whether or not a temperature model is stored. Default off.
+whether or not a temperature model is stored. Default on. With no usable `SETTINGS.BIN` the model is
+kept in RAM only, as the menu store is.
 
 ### freq_hold
 
@@ -538,7 +549,7 @@ add, and `tc_engage_s` and `tc_max_ppm` apply to the total. `tc_dump` prints the
 
 Measured on one production clock over 24 days: the offset was +0.12 ppm, steady to within 0.015 ppm.
 Replaying 44,000 GPS losses on that recording, the typical error after an hour of holdover fell from
-386 µs to 7 µs, and after six hours from 2.4 ms to 0.15 ms. Default off. Also settable from the menu
+386 µs to 7 µs, and after six hours from 2.4 ms to 0.15 ms. Default on. Also settable from the menu
 (DIAG > F HOLD).
 
 ## USB serial output

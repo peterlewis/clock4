@@ -13,7 +13,7 @@ void setDisplayPWM(uint32_t bright){
   HAL_DMA_Start(&hdma_tim7_up, (uint32_t)buffer_c, (uint32_t)&GPIOC->ODR, bright);
 }
 
-// Holdover fade (opt-in). A sub-second digit whose accuracy can no longer be held — its time
+// Holdover fade (on by default; significance_fade = off for the stock ladder). A sub-second digit whose accuracy can no longer be held — its time
 // uncertainty during GPS-loss holdover has grown past that digit's place value — FADES to black by
 // its remaining significance instead of dashing, overriding the fixed Tolerance_time_* ladder.
 // digit_bright[] holds per-digit intensity 0..FADE_MAX for the [deciseconds, centiseconds,
@@ -22,7 +22,7 @@ void setDisplayPWM(uint32_t bright){
 // huge), so with significance_fade the sub-second digits must start DASHED and only light once the
 // first computeHoldoverFade() proves significance — else setPrecision() at boot reads a stale FADE_MAX
 // and flashes ticking numbers for ~1 s before the first per-second recompute dashes them.
-volatile _Bool significance_fade = 0;
+volatile _Bool significance_fade = 1;
 #define FADE_MAX 16
 uint8_t digit_bright[4] = { 0, 0, 0, 0 };
 
@@ -69,8 +69,8 @@ uint8_t digit_bright[4] = { 0, 0, 0, 0 };
 // in the shared return), mild in between. "seg_balance = on" applies that measured curve,
 // interpolated by the live rail (dac_target, 4095 = dimmest); it is the whole intended interface.
 // A numeric value (2..300) instead applies a fixed manual strength for experiments.
-// seg_balance = 0/off (the default) keeps the stock scan and stock timing untouched.
-volatile uint16_t seg_balance = 0;     // 0 = off (stock) · 1/on = AUTO (calibrated curve) · 2..300 = fixed manual strength
+// seg_balance = 0/off keeps the stock scan and stock timing untouched. AUTO is the default.
+volatile uint16_t seg_balance = 1;     // 0 = off (stock) · 1/on = AUTO (calibrated curve, default) · 2..300 = fixed manual strength
 
 #define SEGBAL_BSEG_MASK 0x01FCu       // GPIOB word: bits 2..8 are segments; everything else
                                        // (bCat column selects etc.) passes through unmasked

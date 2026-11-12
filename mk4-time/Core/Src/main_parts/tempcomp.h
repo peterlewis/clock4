@@ -3,16 +3,16 @@
 // it defines code and state, relies on everything main.c declares above it, and must not be included
 // anywhere else. main_parts/README.md says why this is one translation unit.
 
-// --- Temperature compensation (opt-in) ------------------------------------------------------
+// --- Temperature compensation (learn + apply on by default) ------------------------------------------------------
 // Learns ppm-vs-die-temperature for both oscillators while GPS-locked (tc_learn), then during
 // GPS-loss holdover steers the SysTick timebase from the HSE model (tc_apply) and optionally
 // trims RTC->CALR from the LSE model (tc_rtc) so the battery RTC hands over better time across
 // a power loss. "tc_dump = on" over serial prints the learned coefficients as ready-to-paste
 // config lines; non-NAN tc_hse_a/tc_lse_a in config freeze the model (config overrides learning).
-// All defaults off: with none of the keys set, behaviour is identical to stock.
+// tc_learn and tc_apply default on (tc_persist too, in store.h); tc_rtc defaults off.
 // Config-key scalars are written from the USB OTG ISR (parseConfigString) and read by the
 // main loop: volatile, matching the pps_ts_enabled precedent.
-volatile _Bool tc_learn = 0, tc_apply = 0, tc_rtc = 0;
+volatile _Bool tc_learn = 1, tc_apply = 1, tc_rtc = 0;
 volatile int16_t  tc_t0 = 40;              // model centre temperature (°C)
 // Frozen coefficients (ppm units at tc_t0). Elements are single-word (atomic) reads/writes;
 // consumers snapshot each element once. HSE has NO 'a': its learned origin is arbitrary and
