@@ -221,6 +221,10 @@ them. Past a few hours the bound is deliberately loose, by 3 to 6 times at 12 to
 with a noisier oscillator widens its own bound through the wander it learns. `tc_dump` prints the
 wander level in use and the bound at one hour.
 
+With `tc_persist = on` the learned wander is saved alongside the temperature model and restored at
+power-on, so the clock does not spend its first 2.3 hours on the default. It is written when first
+learned and again only when the level in use moves by a quarter. `tc_reset` forgets it.
+
 ### seg_balance
 
 ```
@@ -473,7 +477,8 @@ waiting to re-learn. Only a well-supported model is saved — enough samples, re
 coverage, a believable fit — at most once every 30 minutes and only when it has moved meaningfully,
 so the flash lasts decades. On boot the stored model loads as an evolving seed; `config.txt` still
 wins per-key, so pasted coefficients override it. The store lives inside `SETTINGS.BIN` (see Flash
-memory files below). Default off.
+memory files below). The same record also keeps the wander level learned for `significance_fade`,
+whether or not a temperature model is stored. Default off.
 
 ### freq_hold
 

@@ -425,6 +425,7 @@ _Bool tc_seed_done = 0;                        // one-shot: seed once per power-
 volatile _Bool tc_seed_pending = 0;
 static void tc_seed_apply(void);              // defined by the tempcomp block; called after the config load
 void tc_seed_from_flash(void);                // retained-model auto-seed; runs just before tc_seed_apply
+void fw_restore_from_flash(void);             // retained wander level; runs just before it
 void tc_persist_after_seed(void);             // caps prior order + restores counts; runs just after it
 static void tc_model_check(void);             // change detector; called after tc_fit in tc_housekeeping
 
@@ -2886,6 +2887,7 @@ void readConfigFile(void){
    else requestMode=255;
 
    postConfigCleanup();
+   fw_restore_from_flash();   // if tc_persist is on, the stored wander level becomes the fade bound's starting point
    tc_seed_from_flash();   // if tc_persist is on, load the retained learned model as this boot's seed (config.txt still wins per-key)
    tc_seed_apply();   // warm-start the tempco model from a persisted seed (tc_seed = on), else no-op
    tc_persist_after_seed();   // cap prior order + restore sample counts; no-op unless a flash model seeded this boot
@@ -3668,6 +3670,7 @@ static float    fw_prev_y = 0;        // the previous window's mean, ticks per s
 static _Bool    fw_have_prev = 0;
 static float    fw_var = 0;           // learned Allan variance at 1024 s, (ticks/s)^2
 static uint16_t fw_count = 0;         // window pairs behind it
+static _Bool    fw_new_pair = 0;      // a pair was just learned: the store checks whether it is worth saving
 
 static void fw_break(void){ fw_sum = 0; fw_n = 0; fw_have_prev = 0; }
 static void fw_block(int32_t block_sum){
@@ -3678,6 +3681,7 @@ static void fw_block(int32_t block_sum){
     float dy = y - fw_prev_y;
     if (fw_count < 0xFFFFu) fw_count++;
     fw_var += (0.5f * dy * dy - fw_var) / (float)(fw_count < FW_MEMORY ? fw_count : FW_MEMORY);
+    fw_new_pair = 1;
   }
   fw_prev_y = y; fw_have_prev = 1;
   fw_sum = 0; fw_n = 0;
@@ -4342,6 +4346,7 @@ void tc_housekeeping(void){
     tc_hse_prior = tc_lse_prior = 0;          // drop any held warm-start prior: reset is a cold restart
     tc_n_hse = tc_n_lse = 0;
     tc_e0_set = 0; tc_ema = 0;                // new origin rebase with the next sample
+    fw_break(); fw_var = 0; fw_count = 0;     // the learned wander too: the fade's bound returns to its default
     tc_reset_pending = 0;
     if (tc_persist) tc_forget_pending = 1;    // a reset also wipes the retained model from flash
   }
@@ -5442,7 +5447,10 @@ static _Bool ee_commit(void){
 // and framing (magic @0, gen @4, CRC @62 -> programs last -> torn write fails CRC -> prior gen wins).
 // Record byte layout: 0 magic | 4 gen | 8 schema | 10 flags(b0 hse,b1 lse) | 12 t0 i16 | 14 hse_b f32 |
 // 18 hse_c f32 | 22 lse_a f32 | 26 lse_b f32 | 30 lse_c f32 | 34 lo i16 | 36 hi i16 | 38 hse_resid f32 |
-// 42 lse_resid f32 | 46 n_hse u32 | 50 n_lse u32 | 54..61 rsvd | 62 crc16.
+// 42 lse_resid f32 | 46 n_hse u32 | 50 n_lse u32 | 54 wander variance f32 | 58 wander windows u16 |
+// 60..61 rsvd | 62 crc16.
+// (54..61 were zeroed padding in every earlier record, so an old record reads as "no wander stored"
+//  and EE2_SCHEMA stays 1. The wander is the fade bound's learned level: fw_var / fw_count.)
 static void ee2_init_base(void){
   if (ee_backing == EE_BK_QSPI){
     // The file's upper half: menu owns +0x0000/+0x1000, tempcomp owns +0x2000/+0x3000. One resolve
@@ -5454,23 +5462,43 @@ static void ee2_init_base(void){
   }
   ee2_avail = 0;                                     // no usable SETTINGS.BIN -> RAM-only, like the menu store
 }
-static void tc_pack(uint8_t*r, uint32_t gen){
-  memset(r,0,EE_REC_SZ);
-  uint32_t mg=EE2_MAGIC; memcpy(r+0,&mg,4); memcpy(r+4,&gen,4);
-  uint16_t sc=EE2_SCHEMA; memcpy(r+8,&sc,2);
-  float tpp = (float)tc_tpp(); if (tpp<=0.0f) tpp = 80.0f;
-  r[10] = (uint8_t)((tc_hse_valid?1:0) | (tc_lse_valid?2:0));
-  int16_t t0=tc_t0; memcpy(r+12,&t0,2);
-  float hb = tc_hse_valid? tc_hse_m[1]/tpp : 0.0f, hc = tc_hse_valid? tc_hse_m[2]/tpp : 0.0f;
-  memcpy(r+14,&hb,4); memcpy(r+18,&hc,4);
-  float la=tc_lse_valid?tc_lse_m[0]:0.0f, lb=tc_lse_valid?tc_lse_m[1]:0.0f, lc=tc_lse_valid?tc_lse_m[2]:0.0f;
-  memcpy(r+22,&la,4); memcpy(r+26,&lb,4); memcpy(r+30,&lc,4);
-  int16_t lo = tc_hse_valid? tc_hse_tmin : tc_lse_tmin;                // union coverage (like tc_dump case 9)
-  int16_t hi = tc_hse_valid? tc_hse_tmax : tc_lse_tmax;
-  if (tc_lse_valid){ if (tc_lse_tmin<lo) lo=tc_lse_tmin; if (tc_lse_tmax>hi) hi=tc_lse_tmax; }
-  memcpy(r+34,&lo,2); memcpy(r+36,&hi,2);
-  memcpy(r+38,&tc_hse_resid,4); memcpy(r+42,&tc_lse_resid,4);
-  memcpy(r+46,&tc_n_hse,4); memcpy(r+50,&tc_n_lse,4);
+// What the store last held, beyond the tc2 fields: the record itself, so a commit that has no live
+// model to write can carry the stored one forward byte for byte, and the stored wander.
+static uint8_t tc2_raw[EE_REC_SZ];
+static struct { float var; uint16_t count; } fw2;      // count < FW_MIN: no wander stored
+
+// with_live: write the live model. Otherwise (a commit made only to save the wander, or a live model
+// not yet good enough to persist) the stored model is carried forward untouched, or left absent.
+static void tc_pack(uint8_t*r, uint32_t gen, _Bool with_live){
+  if (with_live && (tc_hse_valid || tc_lse_valid)) {
+    memset(r,0,EE_REC_SZ);
+    uint32_t mg=EE2_MAGIC; memcpy(r+0,&mg,4);
+    uint16_t sc=EE2_SCHEMA; memcpy(r+8,&sc,2);
+    float tpp = (float)tc_tpp(); if (tpp<=0.0f) tpp = 80.0f;
+    r[10] = (uint8_t)((tc_hse_valid?1:0) | (tc_lse_valid?2:0));
+    int16_t t0=tc_t0; memcpy(r+12,&t0,2);
+    float hb = tc_hse_valid? tc_hse_m[1]/tpp : 0.0f, hc = tc_hse_valid? tc_hse_m[2]/tpp : 0.0f;
+    memcpy(r+14,&hb,4); memcpy(r+18,&hc,4);
+    float la=tc_lse_valid?tc_lse_m[0]:0.0f, lb=tc_lse_valid?tc_lse_m[1]:0.0f, lc=tc_lse_valid?tc_lse_m[2]:0.0f;
+    memcpy(r+22,&la,4); memcpy(r+26,&lb,4); memcpy(r+30,&lc,4);
+    int16_t lo = tc_hse_valid? tc_hse_tmin : tc_lse_tmin;                // union coverage (like tc_dump case 9)
+    int16_t hi = tc_hse_valid? tc_hse_tmax : tc_lse_tmax;
+    if (tc_lse_valid){ if (tc_lse_tmin<lo) lo=tc_lse_tmin; if (tc_lse_tmax>hi) hi=tc_lse_tmax; }
+    memcpy(r+34,&lo,2); memcpy(r+36,&hi,2);
+    memcpy(r+38,&tc_hse_resid,4); memcpy(r+42,&tc_lse_resid,4);
+    memcpy(r+46,&tc_n_hse,4); memcpy(r+50,&tc_n_lse,4);
+  } else if (tc2.valid) {
+    memcpy(r, tc2_raw, EE_REC_SZ);                      // the stored model, exactly as it was
+  } else {
+    memset(r,0,EE_REC_SZ);                              // no model at all: flags 0
+    uint32_t mg=EE2_MAGIC; memcpy(r+0,&mg,4);
+    uint16_t sc=EE2_SCHEMA; memcpy(r+8,&sc,2);
+  }
+  memcpy(r+4,&gen,4);
+  float wv = 0.0f; uint16_t wc = 0;                     // the wander: the live level once learned, else what was stored
+  if (fw_count >= FW_MIN)      { wv = fw_var;  wc = fw_count; }
+  else if (fw2.count >= FW_MIN){ wv = fw2.var; wc = fw2.count; }
+  memset(r+54,0,8); memcpy(r+54,&wv,4); memcpy(r+58,&wc,2);
   uint16_t crc=ee_crc16(r,62); memcpy(r+62,&crc,2);
 }
 static void tc_unpack(const uint8_t*r){
@@ -5482,6 +5510,11 @@ static void tc_unpack(const uint8_t*r){
   memcpy(&tc2.hse_resid,r+38,4); memcpy(&tc2.lse_resid,r+42,4);
   memcpy(&tc2.n_hse,r+46,4); memcpy(&tc2.n_lse,r+50,4);
   tc2.valid=1;
+  memcpy(tc2_raw, r, EE_REC_SZ);
+  // The stored wander, if it is believable: finite, not negative, under (100 ticks/s)^2, and learned.
+  float wv; uint16_t wc; memcpy(&wv,r+54,4); memcpy(&wc,r+58,2);
+  if (wc >= FW_MIN && isfinite(wv) && wv >= 0.0f && wv <= 1.0e4f) { fw2.var = wv; fw2.count = wc; }
+  else                                                           { fw2.var = 0.0f; fw2.count = 0; }
 }
 // Scan/position for the tempcomp pair — twin of ee_scan (same NOR first-use + skip-to-blank rules).
 static void ee2_scan(_Bool unpack){
@@ -5520,12 +5553,14 @@ static void ee2_scan(_Bool unpack){
 void ee2_load(void){
   ee2_init_base();
   tc2.valid=0; ee2_active=ee2_page_a; ee2_next=0; ee2_gen=0;
+  fw2.var=0.0f; fw2.count=0;         // the shadow mirrors the store: nothing is held until a record says so
   if (!ee2_avail) return;
   ee2_scan(1);
 }
 // Never write a zero/invalid record; update the shadow to what we just wrote (rebaselines the detector).
-static _Bool ee2_commit(void){
-  if (!ee2_avail || !(tc_hse_valid || tc_lse_valid)) return 0;
+static _Bool ee2_commit(_Bool with_live){
+  if (!ee2_avail) return 0;
+  if (!(with_live && (tc_hse_valid || tc_lse_valid)) && fw_count < FW_MIN) return 0;   // nothing worth a record
   if (!settings_mapping_ok()) return 0;
   uint8_t rec[EE_REC_SZ];
   fatfs_busy = 1;
@@ -5537,7 +5572,7 @@ static _Bool ee2_commit(void){
     ee_erase(other); ee2_active=other; ee2_next=0;
   }
   uint32_t addr = ee2_active + (uint32_t)ee2_next*EE_REC_SZ;
-  tc_pack(rec, ee2_gen+1);
+  tc_pack(rec, ee2_gen+1, with_live);
   for (uint32_t o=0;o<EE_REC_SZ;o+=8){ uint64_t dw; memcpy(&dw, rec+o, 8); ee_prog_dw(addr+o, dw); }
   ee2_gen++; ee2_next++;
   fatfs_busy = 0;
@@ -5636,12 +5671,36 @@ static inline _Bool pps_emit_pending(void){ return pps_ts_enabled && pps_record_
 
 // Main-loop: persist the model when dirty AND well-supported, throttled to >=30 min on a MONOTONIC
 // clock (uwTick, never GPS wall time), on the menu commit's PPS-safe / UART-idle / L0 gate.
+// The learned wander rides in the same record. It is worth a write when the level the bound USES has
+// moved: never stored before, or changed by a quarter either way. Both sides are taken after the
+// floor, so a quiet clock, whose learned level sits under the floor, is written once and then left.
+static _Bool fw_dirty = 0;
+static void fw_persist_check(void){
+  if (!fw_new_pair) return;
+  fw_new_pair = 0;
+  if (!tc_persist || !ee2_avail || fw_count < FW_MIN) return;
+  if (fw2.count < FW_MIN) { fw_dirty = 1; return; }
+  float live = fade_wander_var();
+  float kept = fw2.var > FADE_A_FLOOR ? fw2.var : FADE_A_FLOOR;
+  if (live > 1.25f * kept || live < 0.8f * kept) fw_dirty = 1;
+}
+// Boot: a stored wander becomes the live one, so the bound does not spend 2.3 h on its default (which
+// may be too TIGHT for a clock that had learned it wanders more). Once per boot, never over live data.
+static _Bool fw_restored = 0;
+void fw_restore_from_flash(void){
+  if (fw_restored) return;
+  fw_restored = 1;
+  if (!tc_persist || !ee2_avail || fw_count || fw2.count < FW_MIN) return;
+  fw_var = fw2.var; fw_count = fw2.count;
+}
 static void tc_persist_step(void){
-  if (tc_model_dirty && tc_persist && ee2_avail && tc_model_supported() &&
+  fw_persist_check();
+  _Bool model = tc_model_dirty && tc_model_supported();     // only a well-supported model reaches flash
+  if ((model || fw_dirty) && tc_persist && ee2_avail &&
       menu_layer==L0_CLOCK && !waitingForLatch &&
       huart2.gState==HAL_UART_STATE_READY && !pps_emit_pending() && !tc_dump_pending &&
       (uint32_t)(uwTick - tc_last_commit_ms) >= 1800000u){     // >= 30 min, wrap-safe
-    if (ee2_commit()){ tc_model_dirty = 0; tc_last_commit_ms = uwTick; }
+    if (ee2_commit(model)){ if (model) tc_model_dirty = 0; fw_dirty = 0; tc_last_commit_ms = uwTick; }
   }
 }
 // "tc_forget = on" over serial: erase the tempcomp store (drop the PERSISTED copy only; the live
@@ -5651,6 +5710,7 @@ static void tc_forget_step(void){
   if (ee2_avail && !settings_mapping_ok()) return;   // QSPI: never erase against a stale mapping; retry next pass
   tc_forget_pending = 0;
   tc2.valid = 0; tc_model_dirty = 0;
+  fw2.var = 0.0f; fw2.count = 0; fw_dirty = 0;       // the stored wander goes with it
   if (!ee2_avail) return;
   fatfs_busy = 1;
   ee_erase(ee2_page_a); ee_erase(ee2_page_b);
