@@ -3,7 +3,7 @@
 // it defines code and state, relies on everything main.c declares above it, and must not be included
 // anywhere else. main_parts/README.md says why this is one translation unit.
 
-// ==================== config.txt written by the clock (opt-in: config_write = on) ================
+// ==================== config.txt written by the clock (default on; config_write = off) =============
 // A setting changed with the buttons lives in the store, where config.txt cannot show it. With a
 // computer attached, pccd writes the choice into the file ($PMCFG). This is for a clock that is not:
 // it writes the lines itself, and config.txt then takes each setting back by the ordinary rule

@@ -14,12 +14,12 @@ mitxela's firmware for the [Precision Clock Mk IV](https://mitxela.com/projects/
 
 ## How this firmware differs from stock
 
-What improves the clock is on by default: holdover, brightness equalisation, the timing sentence and the watchdog. What changes what it shows is opt-in: the new display modes and the chimes. Set any key to `off` in `config.txt` to return that part to stock.
+What improves the clock is on by default: holdover, brightness equalisation, the timing sentence, the watchdog, and menu choices written into `config.txt`. What changes what it shows is opt-in: the new display modes and the chimes. Set any key to `off` in `config.txt` to return that part to stock.
 
 | | Stock (0.0.4 / 0.0.1) | This firmware |
 |---|---|---|
 | Display modes | Calendar, timezone, countdown, text, satellite and diagnostic modes | The same, plus sun, moon, twilight, grid locator, position, sidereal time, solar time, a second timezone, star transits and oscillator stability |
-| Changing a setting | Edit `config.txt` on a computer | Also a two-button menu on the clock, saved across power-off |
+| Changing a setting | Edit `config.txt` on a computer | Also a two-button menu on the clock, saved across power-off and written into `config.txt` |
 | GPS lost | Sub-second digits are dashed after fixed times | Each digit fades as the measured uncertainty reaches it, and the clock holds the frequency it measured while locked |
 | Brightness | One drive level for every segment | Per-segment and colon equalisation, so a `1` is not brighter than an `8` |
 | USB serial | GPS sentences | The same, plus a timing sentence on each GPS pulse, and opt-in diagnostics |
@@ -84,7 +84,7 @@ When `config.txt` and the menu disagree, the rule works one setting at a time:
 
 So a brightness set at the clock survives an edit to the timezone line, and a line you change in the file always takes effect, whether the clock was running at the time or unplugged straight after.
 
-The clock also sends its menu choices over USB as `config.txt` lines (`$PMCFG`). With PCC's `pccd` running, they are written into `config.txt`, so the file shows what the clock is doing. With `config_write = on`, a clock on a charger writes them into the file itself.
+Menu choices end up in `config.txt`, so the file shows what the clock is doing. A clock on a charger writes them itself (`config_write`, on by default); with a computer attached, the clock sends them over USB (`$PMCFG`) and PCC's `pccd` writes them. Once they are in the file, a factory reset keeps them: delete the lines to undo them.
 
 </details>
 

@@ -7,9 +7,9 @@ should be read as describing any other 0.0.5 build.
 
 Some additions are on by default, because they only make the clock more accurate or more robust:
 `significance_fade`, `freq_hold`, `tc_learn`, `tc_apply`, `tc_persist`, `seg_balance`,
-`colon_balance`, `pps` and `watchdog`. Set any of them to `off` in `config.txt` for the stock
-behaviour. Everything else is opt-in: the new display modes, `cuckoo`, `tc_rtc`,
-`brightness_report`, `config_write` and the diagnostics. With those defaults switched off and a stock
+`colon_balance`, `pps`, `watchdog` and `config_write`. Set any of them to `off` in `config.txt` for
+the stock behaviour. Everything else is opt-in: the new display modes, `cuckoo`, `tc_rtc`,
+`brightness_report` and the diagnostics. With those defaults switched off and a stock
 date board, behaviour is that of the stock firmware, apart from the fixes listed in the
 [readme](../readme.md).
 
@@ -378,7 +378,7 @@ config_write = on
 
 Lets the clock write its own menu choices into `config.txt`, so the file shows what the clock is
 doing without a computer running `pccd` (which otherwise does this: see `menu_export` under USB
-serial output). Default off.
+serial output). Default on.
 
 It writes only if no computer has connected since power-on, which in practice means on a charger. A
 computer that has the drive mounted keeps its own copy of the file and would not see a change made
@@ -843,7 +843,9 @@ Two rows are read-only live read-outs (they offer no EDIT):
 SYS > RESET erases every setting you've changed with the menu **and everything the clock has
 learned** — the stored and live temperature-compensation model included — then immediately re-reads
 `config.txt`, returning the clock to exactly what the file says (a `tc_*` seed block in the file
-re-seeds compensation on the spot). It is the same thing as the `factory_reset` serial command. EDIT
+re-seeds compensation on the spot). Menu choices the clock has already written into `config.txt`
+(`config_write`) are part of the file by then, so a reset keeps them: delete those lines to undo
+them. It is the same thing as the `factory_reset` serial command. EDIT
 opens a `DELETE ALL` confirm screen: APPLY fires it (the row flashes `DONE`), CANCEL backs out.
 This is deliberately a different thing from the REBOOT chord, which restarts the clock but keeps
 your settings.

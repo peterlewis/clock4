@@ -437,7 +437,7 @@ static const struct { const char *key, *def; } cfg_defaults[] = {
   {"colon_full_at","2048"}, {"colon_floor","20"}, {"tc_t0","40"}, {"tc_engage_s","2"},
   {"tc_max_ppm","100"}, {"tc_hse_b","nan"}, {"tc_hse_c","nan"}, {"tc_lse_a","nan"}, {"tc_lse_b","nan"},
   {"tc_lse_c","nan"}, {"tc_seed","off"}, {"tc_seed_lo","0"}, {"tc_seed_hi","0"}, {"star_max_mag","6"},
-  {"loop_diag","off"}, {"brightness_report","off"}, {"watchdog","on"}, {"config_write","off"}, {"BS1","0,0"},
+  {"loop_diag","off"}, {"brightness_report","off"}, {"watchdog","on"}, {"config_write","on"}, {"BS1","0,0"},
   {"BS2","131,365"}, {"BS3","1076,1422"}, {"BS4","2774,2665"}, {"BS5","3849,4095"},
 #ifdef NONCOMPLIANT_DATE_MODES
   {"MODE_DDMMYYYY","off"},
