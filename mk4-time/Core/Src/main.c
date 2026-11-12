@@ -2678,6 +2678,80 @@ void postConfigCleanup(void){
   }
 }
 
+// ==================== config.txt is the source of truth, on every load ============================
+// readConfigFile runs at boot and again whenever the host changes config.txt on the CLOCK drive. It
+// used to reset seven keys and then parse the file, so any OTHER key kept its last value when its line
+// was deleted or commented out: remove "cuckoo = trust", save, eject - and the cuckoo kept performing
+// until the power was cycled. With a config.txt that lists only what differs from the defaults,
+// taking a line out is the natural way to turn something off.
+//
+// The rule now: a key the file SET on the previous load and does NOT set on this one goes back to its
+// power-on default. Nothing else is touched, so a value set since by the menu or over USB serial for
+// a key the file never mentions survives a reload, exactly as before (PCC Web relies on that for
+// brightness_report). A key the host sets over serial stops being the file's to take back.
+//
+// cfg_defaults is the power-on state written as config lines, so a revert goes through the same
+// parser as everything else - no second copy of each key's meaning. Rows are the keys the file can
+// own. NOT here, on purpose:
+//   - the seven keys readConfigFile resets itself on every load (brightness, colon_mode,
+//     colon_alt_mode, the three Tolerance_time_* keys, and the zone_override flag);
+//   - serial-only commands (tc_dump, wdt_dump, factory_reset, ...), which a file cannot issue;
+//   - MATRIX_FREQUENCY: its power-on state is two different rates on two boards (this one's timer
+//     default and the date board's own), which one "frequency" cannot express. Removing that line
+//     takes effect at the next power-on. Every supplied config.txt sets it.
+// zone_override has a row with no default string: dropping it means "find the zone from the position
+// again", which is an action, not a value.
+static const struct { const char *key, *def; } cfg_defaults[] = {
+  {"text",""}, {"zone_override",NULL}, {"zone2",""}, {"countdown_to","1970-01-01T00:00:01Z"},
+  {"MODE_ISO8601_STD","off"}, {"MODE_ISO_ORDINAL","off"}, {"MODE_ISO_WEEK","off"}, {"MODE_UNIX","off"},
+  {"MODE_JULIAN_DATE","off"}, {"MODE_MODIFIED_JD","off"}, {"MODE_SHOW_OFFSET","off"},
+  {"MODE_SHOW_TZ_NAME","off"}, {"MODE_WEEKDAY","off"}, {"MODE_WEEKDA_DD","off"},
+  {"MODE_WDY_MM_DD","off"}, {"MODE_STANDBY","off"}, {"MODE_COUNTDOWN","off"}, {"MODE_SATVIEW","off"},
+  {"MODE_DEBUG_BRIGHTNESS","off"}, {"MODE_DEBUG_RTC","off"}, {"MODE_TEXT","off"}, {"MODE_VBAT","off"},
+  {"MODE_DISPLAYTEST","off"}, {"MODE_TTFF","off"}, {"MODE_FIRMWARE_CRC","off"}, {"MODE_SUN","off"},
+  {"MODE_SUN_AZEL","off"}, {"MODE_MOON","off"}, {"MODE_GRID","off"}, {"MODE_LATLON","off"},
+  {"MODE_TEMPCOMP","off"}, {"MODE_LST","off"}, {"MODE_SOLAR","off"}, {"MODE_ADEV","off"},
+  {"MODE_STAR","off"}, {"MODE_ZONE2","off"}, {"MODE_DARK","off"}, {"page_ms","0"},
+  {"fake_longitude","0"}, {"fake_latitude","0"}, {"nmea","on"}, {"pps","off"}, {"cuckoo","off"},
+  {"tc_learn","off"}, {"tc_apply","off"}, {"tc_rtc","off"}, {"tc_persist","off"}, {"freq_hold","off"},
+  {"significance_fade","off"}, {"seg_balance","off"}, {"colon_balance","off"},
+  {"colon_full_at","2048"}, {"colon_floor","20"}, {"tc_t0","40"}, {"tc_engage_s","2"},
+  {"tc_max_ppm","100"}, {"tc_hse_b","nan"}, {"tc_hse_c","nan"}, {"tc_lse_a","nan"}, {"tc_lse_b","nan"},
+  {"tc_lse_c","nan"}, {"tc_seed","off"}, {"tc_seed_lo","0"}, {"tc_seed_hi","0"}, {"star_max_mag","6"},
+  {"loop_diag","off"}, {"brightness_report","off"}, {"watchdog","off"}, {"BS1","0,0"},
+  {"BS2","131,365"}, {"BS3","1076,1422"}, {"BS4","2774,2665"}, {"BS5","3849,4095"},
+#ifdef NONCOMPLIANT_DATE_MODES
+  {"MODE_DDMMYYYY","off"},
+#endif
+};
+#define CFG_ROWS   (sizeof cfg_defaults / sizeof cfg_defaults[0])
+#define CFG_WORDS  ((CFG_ROWS + 31u) / 32u)
+static uint32_t cfg_from_file[CFG_WORDS];     // bit per row: the file set this key on the load now in force
+
+static int cfg_row(const char *key){
+  for (unsigned i = 0; i < CFG_ROWS; i++) if (strcasecmp(key, cfg_defaults[i].key) == 0) return (int)i;
+  return -1;
+}
+// After a load: put back to default every key the previous file set and this one (`now`) does not,
+// then make `now` the record. An absent file is `now` all zero: everything the file owned goes back.
+static void cfg_revert_missing(const uint32_t *now){
+  for (unsigned i = 0; i < CFG_ROWS; i++) {
+    uint32_t bit = 1u << (i & 31u);
+    if (!(cfg_from_file[i >> 5] & bit) || (now[i >> 5] & bit)) continue;
+    if (!cfg_defaults[i].def) {               // zone_override dropped: look the zone up from the position again
+      zone_lat = 999.0; zone_lon = 999.0;     // (defeats the distance gate, which would otherwise wait for a 0.5 km move)
+      new_position = 1;
+      continue;
+    }
+    char v[32];
+    strncpy(v, cfg_defaults[i].def, sizeof v - 1); v[sizeof v - 1] = 0;   // the parser edits its value in place (BSn)
+    parseConfigString((char*)cfg_defaults[i].key, v, 1);   // origin "not the file": must not count as file-defined
+  }
+  __disable_irq();                            // the USB ISR clears bits (serial takes a key over)
+  for (unsigned w = 0; w < CFG_WORDS; w++) cfg_from_file[w] = now[w];
+  __enable_irq();
+}
+
 void rxConfigString(char c){
   static char key[32], value[32];
   static uint8_t k=0, v=0, state=0;
@@ -2692,6 +2766,8 @@ void rxConfigString(char c){
     }
     if (k && (v || state>=2)) {
       parseConfigString(key, value, 1);   // serial origin: tc_dump/tc_reset may fire
+      int row = cfg_row(key);             // set over serial: no longer the file's to revert on a reload
+      if (row >= 0) cfg_from_file[row >> 5] &= ~(1u << (row & 31));
       // rxConfigString runs in the USB OTG ISR; postConfigCleanup() calls nextMode()
       // and sendDate(), which are non-reentrant against the SysTick repaint. Defer it
       // to the main loop so it runs in thread context, like the file-config path does.
@@ -2751,10 +2827,13 @@ void readConfigFile(void){
   colonModeAlt = COLON_MODE_ALT_SAWTOOTH;
   colonAltExplicit = 0;
   cfg_simple_defined = 0; cfg_modes_defined = 0; cfg_tc_defined = 0;   // rebuilt below as config.txt keys are parsed
+  uint32_t cfg_now[CFG_WORDS];           // the keys THIS file sets (cfg_defaults rows)
+  for (unsigned w = 0; w < CFG_WORDS; w++) cfg_now[w] = 0;
 
   FIL file;
 
    if (f_open(&file, CONFIG_FILENAME, FA_READ) != FR_OK) {
+     cfg_revert_missing(cfg_now);   // no config.txt: everything a previous file set goes back to default
      menu_apply_overrides();   // no config.txt: stored menu overrides are the only settings
      postConfigCleanup();
      return;
@@ -2791,10 +2870,14 @@ void readConfigFile(void){
        value[col]=0;
        col=0;
 
+       int row = cfg_row(key);          // a blank "zone_override =" means "automatic": it does not set the key
+       if (row >= 0 && (cfg_defaults[row].def || value[0])) cfg_now[row >> 5] |= 1u << (row & 31);
        parseConfigString(key, value, 0);   // file origin: serial-only triggers inert
 
      }
    }
+
+   cfg_revert_missing(cfg_now);   // keys the previous file set and this one dropped: back to their defaults
 
    menu_apply_overrides();   // merge stored menu overrides (config.txt precedence) before the boot mode
 

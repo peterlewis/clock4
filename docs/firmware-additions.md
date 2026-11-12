@@ -168,6 +168,12 @@ All of these go in `config.txt` like any other parameter, and can also be typed 
 port. Several can additionally be changed from the on-device menu — those are marked, and the
 precedence between the two is explained in the menu section.
 
+The clock reads `config.txt` at power-on and again whenever the file changes on the drive. Each time,
+the file is the whole truth: a line you delete or comment out returns that setting to its default,
+just as if the clock had been powered on with the new file. A setting the file does not mention keeps
+whatever the menu or a serial command last gave it. The one exception is `MATRIX_FREQUENCY`, whose
+removal takes effect at the next power-on.
+
 ### page_ms
 
 ```
