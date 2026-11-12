@@ -48,4 +48,5 @@ void tc_housekeeping(void){
 
   tc_dump_step();
   menu_dump_step();
+  menu_export_step();  // the menu's choices as config.txt lines, after a save or on request
 }

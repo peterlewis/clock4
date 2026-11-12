@@ -328,6 +328,8 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     if (from_serial && truthy(value)) wdt_dump_pending = 1;   // serial-only: report the watchdog's state
   } else if (strcasecmp(key, "menu_dump") == 0) {
     if (from_serial && truthy(value)) menu_dump_pending = 1;  // serial-only: report whether the store is flash-backed or RAM-only
+  } else if (strcasecmp(key, "menu_export") == 0) {
+    if (from_serial && truthy(value)) menu_export_pending = 1;   // serial-only: send the menu's choices as config.txt lines ($PMCFG)
   } else if (strcasecmp(key, "factory_reset") == 0) {
     if (from_serial && truthy(value)) factory_reset_pending = 1; // serial-only: wipe stored menu overrides
   } else if (strcasecmp(key, "tc_reset") == 0) {

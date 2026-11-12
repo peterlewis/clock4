@@ -70,6 +70,8 @@ Menu changes are saved in a file on the clock's drive, `SETTINGS.BIN`, and survi
 
 So a brightness set at the clock survives an edit to the timezone line, and a line you change in the file always takes effect. This works the same whether the clock was running when you edited the file or was unplugged straight afterwards.
 
+The clock also sends its menu choices over USB as `config.txt` lines. With PCC's `pccd` running, they are written into `config.txt`, so the file shows what the clock is doing.
+
 ### USB serial output
 
 Each of these is off until asked for.
@@ -80,6 +82,7 @@ Each of these is off until asked for.
 | `$PMBRIT` | The automatic dimmer's operating point |
 | `$PMADEV`, `$PMHDEV` | The measured stability curve |
 | `$PMSTAR` | The upcoming star transits |
+| `$PMCFG` | The menu's saved choices, as `config.txt` lines |
 
 There are also one-line reports for the temperature model (`tc_dump`), the settings store (`menu_dump`) and the watchdog (`wdt_dump`).
 
@@ -140,11 +143,12 @@ This is draft firmware. I run it on my own clock. Every change is tested in an e
 - **It reads the telemetry.** PCC charts `$PMTXTS` phase and drift, the stability curve and the star transits, and fits the temperature model.
 - **It edits `config.txt`.** The editor runs each line through the firmware's own parser, so what it accepts is what the clock accepts.
 - **It keeps a record.** The background program, `pccd`, records everything the clock reports. Those recordings are what the holdover figures above were measured from.
+- **It keeps `config.txt` true.** When you change a setting with the clock's buttons, `pccd` writes that line into `config.txt` on the clock's drive.
 - **It makes the clock a time source.** `pccd` can feed the clock's GPS pulse to chrony, so the computer keeps time from it.
 
 ## How it is tested
 
-- **Emulator suites** in the PCC repository (`web/emu/phase1`): 34 suites that drive the real firmware code, compiled to WebAssembly.
+- **Emulator suites** in the PCC repository (`web/emu/phase1`): 35 suites that drive the real firmware code, compiled to WebAssembly.
 - **Conformance:** 4,511 display checks against independently computed calendar and astronomy results, and 912 timezone checks against the host's timezone database.
 - **A native build** of the same source, whose output is compared byte for byte with the WebAssembly build's.
 - **A replay** of a capture from a real clock.

@@ -42,6 +42,7 @@ static _Bool    ee_ext_stored = 0;     // the newest menu record has its file re
 static _Bool    menu_dirty = 0;        // a menu edit is awaiting flash commit
 volatile _Bool factory_reset_pending = 0;     // "factory_reset = on" over serial -> factory-reset the menu store
 volatile _Bool menu_dump_pending = 0;      // "menu_dump = on" over serial -> emit the store-persistence diagnostic
+volatile _Bool menu_export_pending = 0;    // a saved menu change, or "menu_export = on" over serial -> send the choices as config lines
 
 // ---- Auto-persist the learned model to flash retained memory (opt-in: tc_persist = on) ----------
 // The record stores exactly what tc_dump prints and tc_seed re-loads (ppm-domain coefficients), so
@@ -453,6 +454,7 @@ static _Bool ee_commit(void){
     ee_next++; ee_ext_stored = 1;
   }
   fatfs_busy = 0;
+  menu_export_pending = 1;       // tell a listening host what the store now holds (menu_export_step)
   return 1;
 }
 
@@ -842,6 +844,105 @@ static void menu_record_key(uint8_t key_id, int32_t v){
     case KID_TEMPCOMP:   ovr.tc=(uint8_t)(v?1:0); break;
     case KID_BALANCE:    ovr.bal=(uint8_t)(v?1:0); break;
     case KID_CUCKOO:     ovr.cuckoo=(uint8_t)v; break;
+  }
+}
+
+// ---- The menu's choices as config.txt lines, over serial ---------------------------------------
+// After every saved change, and on "menu_export = on", the clock sends what the store holds in the
+// words config.txt uses, one setting a line, so a host can write those lines into config.txt without
+// knowing anything about the store:
+//   $PMCFG,<gen>,<n>,<key>,<value>*CC      n counts from 1
+//   $PMCFG,<gen>,0,END,<count>*CC          closes the set; <count> lines came before it
+// An empty <value> means "config.txt should not have this line" (brightness on AUTO has no value to
+// write). When the host does write them, each line is new or changed, so config.txt takes the
+// setting back and the stored choice is deleted (menu_reconcile): the file becomes the one record.
+// A setting made of several keys sends each of them. BALANCE sends the live strengths, because its
+// "on" keeps a hand-set strength that config.txt gave.
+// Same CDC contract as the dumps: one line a pass, a busy endpoint is retried, no host means no send.
+static const char *const colon_key[] = { "slowfade", "heartbeat", "sawtooth", "alt_sawtooth", "toggle", "solid" };
+static const char *const mode_key[NUM_DISPLAY_MODES] = {
+  [MODE_ISO8601_STD]="MODE_ISO8601_STD", [MODE_ISO_ORDINAL]="MODE_ISO_ORDINAL", [MODE_ISO_WEEK]="MODE_ISO_WEEK",
+  [MODE_UNIX]="MODE_UNIX", [MODE_JULIAN_DATE]="MODE_JULIAN_DATE", [MODE_MODIFIED_JD]="MODE_MODIFIED_JD",
+  [MODE_SHOW_OFFSET]="MODE_SHOW_OFFSET", [MODE_SHOW_TZ_NAME]="MODE_SHOW_TZ_NAME", [MODE_WEEKDAY]="MODE_WEEKDAY",
+  [MODE_WEEKDA_DD]="MODE_WEEKDA_DD", [MODE_WDY_MM_DD]="MODE_WDY_MM_DD", [MODE_STANDBY]="MODE_STANDBY",
+  [MODE_COUNTDOWN]="MODE_COUNTDOWN", [MODE_SATVIEW]="MODE_SATVIEW", [MODE_DEBUG_BRIGHTNESS]="MODE_DEBUG_BRIGHTNESS",
+  [MODE_DEBUG_RTC]="MODE_DEBUG_RTC", [MODE_TEXT]="MODE_TEXT", [MODE_FIRMWARE_CRC_T]="MODE_FIRMWARE_CRC",
+  [MODE_VBAT]="MODE_VBAT", [MODE_DISPLAYTEST]="MODE_DISPLAYTEST", [MODE_TTFF]="MODE_TTFF",
+#ifdef NONCOMPLIANT_DATE_MODES
+  [MODE_DDMMYYYY]="MODE_DDMMYYYY",
+#endif
+  [MODE_SUN]="MODE_SUN", [MODE_SUN_AZEL]="MODE_SUN_AZEL", [MODE_MOON]="MODE_MOON", [MODE_GRID]="MODE_GRID",
+  [MODE_LATLON]="MODE_LATLON", [MODE_DARK]="MODE_DARK", [MODE_TEMPCOMP]="MODE_TEMPCOMP", [MODE_LST]="MODE_LST",
+  [MODE_SOLAR]="MODE_SOLAR", [MODE_ADEV]="MODE_ADEV", [MODE_STAR]="MODE_STAR", [MODE_ZONE2]="MODE_ZONE2",
+};   // MODE_FIRMWARE_CRC_D has no key of its own: the one config.txt key sets both slots
+#define MX_SIMPLE 17u                    // the lines before the modes
+// Line `slot` of the export: 0 = the store does not hold it. val is at least 12 bytes.
+static const char *menu_export_item(uint16_t slot, char *val){
+  static const struct { uint8_t kid; const char *key; } sk[MX_SIMPLE] = {
+    {KID_BRIGHTNESS,"brightness"}, {KID_COLON,"colon_mode"}, {KID_COLON_ALT,"colon_alt_mode"}, {KID_PAGE_MS,"page_ms"},
+    {KID_SIG_FADE,"significance_fade"}, {KID_PPS,"pps"}, {KID_NMEA,"nmea"}, {KID_MATRIX_FREQ,"MATRIX_FREQUENCY"},
+    {KID_TEMPCOMP,"tc_learn"}, {KID_TEMPCOMP,"tc_apply"}, {KID_TEMPCOMP,"tc_persist"},
+    {KID_BALANCE,"seg_balance"}, {KID_BALANCE,"colon_balance"}, {KID_CUCKOO,"cuckoo"},
+    {KID_BRIT,"brightness_report"}, {KID_FREQ_HOLD,"freq_hold"}, {KID_WATCHDOG,"watchdog"},
+  };
+  long num = -1; const char *word = NULL;
+  if (slot >= MX_SIMPLE) {
+    uint16_t m = (uint16_t)(slot - MX_SIMPLE);
+    if (m >= NUM_DISPLAY_MODES || !mode_key[m] || !(ovr.modes_mask & (1ull<<m))) return NULL;
+    strcpy(val, ((ovr.modes_val>>m)&1ull) ? "enabled" : "disabled");
+    return mode_key[m];
+  }
+  if (!(ovr.simple_mask & (1u<<sk[slot].kid))) return NULL;
+  switch (slot) {
+    case 0:  if (ovr.brightness >= 0) num = 4095 - ovr.brightness; else word = ""; break;   // the key is read inverted; AUTO is "no line"
+    case 1:  word = colon_key[ovr.colon     < 6 ? ovr.colon     : 0]; break;
+    case 2:  word = colon_key[ovr.alt_colon < 6 ? ovr.alt_colon : 0]; break;
+    case 3:  num = ovr.page_ms; break;
+    case 4:  word = ovr.sig_fade ? "on" : "off"; break;
+    case 5:  word = ovr.pps ? "on" : "off"; break;
+    case 6:  word = ovr.nmea == NMEA_NONE ? "off" : (ovr.nmea == NMEA_RMC ? "rmc" : "all"); break;
+    case 7:  num = (long)ovr.matrix_freq; break;
+    case 8: case 9: case 10: word = ovr.tc ? "on" : "off"; break;
+    case 11: if (seg_balance   > 1) num = seg_balance;   else word = seg_balance   ? "on" : "off"; break;
+    case 12: if (colon_balance > 1) num = colon_balance; else word = colon_balance ? "on" : "off"; break;
+    case 13: word = ovr.cuckoo == CK_TRUST ? "trust" : "off"; break;
+    case 14: word = ovr.brit ? "on" : "off"; break;
+    case 15: word = ovr.fh   ? "on" : "off"; break;
+    default: word = ovr.wdt  ? "on" : "off"; break;
+  }
+  if (word) strcpy(val, word); else snprintf(val, 12, "%ld", num);
+  return sk[slot].key;
+}
+static void menu_export_step(void){
+  static uint16_t slot = 0, sent = 0;
+  static uint32_t gen = 0;
+  static int      dn = -1;                // a formatted line is waiting to go
+  static uint16_t busy_ct = 0;
+  static char     dline[96];
+  if (!menu_export_pending) return;
+  if (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED) { menu_export_pending = 0; dn = -1; slot = 0; sent = 0; return; }
+  if (dn < 0) {
+    if (slot == 0 && sent == 0) gen = ee_gen;             // one set describes one state of the store
+    char body[80], val[12];
+    const char *key = NULL;
+    while (slot < MX_SIMPLE + NUM_DISPLAY_MODES && !(key = menu_export_item(slot, val))) slot++;
+    int n;
+    if (key) n = snprintf(body, sizeof body, "PMCFG,%lu,%u,%s,%s", (unsigned long)gen, (unsigned)(sent + 1u), key, val);
+    else     n = snprintf(body, sizeof body, "PMCFG,%lu,0,END,%u", (unsigned long)gen, (unsigned)sent);
+    if (n <= 0 || n >= (int)sizeof body) { menu_export_pending = 0; slot = 0; sent = 0; return; }
+    uint8_t cks = 0; for (int i = 0; i < n; i++) cks ^= (uint8_t)body[i];
+    dn = snprintf(dline, sizeof dline, "$%s*%02X\r\n", body, (unsigned)cks);
+    busy_ct = 0;
+    if (key) { slot++; sent++; } else slot = 0xFFFF;      // 0xFFFF: the END line is the one waiting
+  }
+  __disable_irq();
+  uint8_t r = CDC_Copy_Transmit((uint8_t*)dline, (uint16_t)dn);
+  __enable_irq();
+  if (r == USBD_BUSY) { if (++busy_ct > 5000) { menu_export_pending = 0; dn = -1; slot = 0; sent = 0; } return; }
+  dn = -1;
+  if (slot == 0xFFFF) {                   // the set is complete...
+    slot = 0; sent = 0;
+    if (ee_gen == gen) menu_export_pending = 0;           // ...unless the store was saved again while it went out: send the new one
   }
 }
 

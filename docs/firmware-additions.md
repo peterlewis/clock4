@@ -612,6 +612,28 @@ it has reset the clock since power was applied (`resets`), how many of those wer
 ```
 
 ```
+menu_export = on
+```
+Sends the menu's stored choices in the words `config.txt` uses, one setting a line, then a closing
+line:
+
+```
+$PMCFG,<gen>,<n>,<key>,<value>*CC
+$PMCFG,<gen>,0,END,<count>*CC
+```
+
+`gen` is the store's generation, the same on every line of a set; `n` counts from 1; `count` is the
+number of lines before the closing one. An empty `value` means `config.txt` should have no line for
+that key (brightness on `AUTO` has no value to write). A setting made of several keys sends each:
+TEMPCOMP sends `tc_learn`, `tc_apply` and `tc_persist`. The clock also sends a set by itself after
+every saved menu change.
+
+The purpose is to let a host put the lines into `config.txt`, so the file shows what the clock is
+doing. When it does, each line is new or changed, so by the rule under [Where settings
+live](#where-settings-live) the file takes the setting back and the stored choice is deleted: the
+file becomes the one record. `pccd`, the PCC daemon, does this without being asked.
+
+```
 factory_reset = on
 ```
 Factory-resets the on-device menu: erases every setting changed with the two-button menu and
@@ -804,6 +826,11 @@ computer, edited and unplugged makes the same comparison at its next power-on. A
 several keys counts as one: `tc_learn`, `tc_apply` and `tc_persist` are the menu's TEMPCOMP, and
 `seg_balance` and `colon_balance` its BALANCE; change any of them and the file takes the whole
 setting back, with the keys it does not mention returning to their defaults.
+
+With `pccd` running on a computer the clock is plugged into, a menu choice does not stay hidden in
+the store: the clock sends it as a `config.txt` line (`$PMCFG`, under USB serial output), `pccd`
+writes it into the file, and the file is then the one record. With no computer, the store keeps the
+choice and the file catches up at the next connection.
 
 A store written by an earlier build has no memory of the file. Until its first save under this build
 it uses the earlier rule: the menu's choices stand only while `config.txt` still has the modification
