@@ -191,12 +191,35 @@ significance_fade = on
 ```
 
 Replaces the fixed `Tolerance_time_*` ladder with measured uncertainty. When enabled, the clock
-continuously computes a 3-sigma bound on its holdover time error — from the age and quality of the
-last calibration, the measured residual of the learned temperature model, and aging — and each
-sub-second digit fades out smoothly as the uncertainty passes through its place value, rather than
-being dashed at a fixed time. A digit that is still significant keeps ticking at partial brightness
-on its way out. At power-on the sub-second digits start dark and only light once the clock can prove
-they're significant. Default off. Also settable from the menu (DISP > SIG FADE).
+continuously computes a bound on its holdover time error, and each sub-second digit fades out
+smoothly as the bound passes through its place value, rather than being dashed at a fixed time. A
+digit that is still significant keeps ticking at partial brightness on its way out. At power-on the
+sub-second digits start dark and only light once the clock can prove they're significant. Default
+off. Also settable from the menu (DISP > SIG FADE).
+
+The bound has two parts, both measured by the clock itself while it is locked:
+
+- **The oscillator's offset.** If nothing is steering it out, the display drifts at that offset, so
+  it is charged in full. With `freq_hold = on` it is steered out and not charged.
+- **The oscillator's wander.** Once the offset is removed, what remains grows as the holdover time
+  to the power 1.5, the mark of a frequency that random-walks. The clock learns the size of its own
+  wander from how much its frequency changes between consecutive 17-minute averages, remembered
+  over about a day and a half. Until it has 2.3 hours of lock it assumes twice a typical level.
+
+The numbers behind it come from 24 days of once-a-second records from one production clock. The
+earlier bound was a guess and was 6 to 350 times larger than that clock's real error, so the
+millisecond digit went dark about 6 minutes into a holdover. On the same clock the digits now last:
+
+| | unsteered | with `freq_hold = on` |
+|---|---|---|
+| millisecond digit starts to fade | 30 min | 1.2 h |
+| millisecond digit dark | 47 min | 1.7 h |
+| hundredths digit dark | 5.4 h | 8.2 h |
+
+Replaying 102,000 holdovers from those records, the real error exceeded the bound in 0.001% of
+them. Past a few hours the bound is deliberately loose, by 3 to 6 times at 12 to 24 hours. A clock
+with a noisier oscillator widens its own bound through the wander it learns. `tc_dump` prints the
+wander level in use and the bound at one hour.
 
 ### seg_balance
 

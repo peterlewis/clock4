@@ -3651,6 +3651,49 @@ static uint32_t fh_prev_dwt = 0;
 static _Bool    fh_have_prev = 0;
 static uint8_t  fh_warm = 0;
 
+// ---- The oscillator's WANDER, learned (feeds the significance-fade bound; see computeHoldoverFade) --
+// How far does the frequency move once nobody is watching it? Consecutive 1024 s mean frequencies
+// answer that directly: half the squared change between two of them is the Allan variance at 1024 s,
+// and a random-walking frequency has variance a^2 * tau, so one number - the level a - predicts the
+// time error of any holdover as a * tau^1.5. The clock averages it with a long memory (128 windows,
+// about 36 hours), because the wander comes in bursts: a quiet hour says little about the next one.
+// 64 of the 16 s blocks make a window; any break in the blocks breaks the window too.
+#define FW_BLOCKS   64u               // 16 s blocks per 1024 s window
+#define FW_WINDOW_S 1024.0f
+#define FW_MEMORY   128u              // windows the average remembers
+#define FW_MIN      8u                // windows needed before the learned level is used (2.3 h of lock)
+static int32_t  fw_sum = 0;           // the window in progress (sum of block sums = ticks over the window)
+static uint8_t  fw_n = 0;
+static float    fw_prev_y = 0;        // the previous window's mean, ticks per second
+static _Bool    fw_have_prev = 0;
+static float    fw_var = 0;           // learned Allan variance at 1024 s, (ticks/s)^2
+static uint16_t fw_count = 0;         // window pairs behind it
+
+static void fw_break(void){ fw_sum = 0; fw_n = 0; fw_have_prev = 0; }
+static void fw_block(int32_t block_sum){
+  fw_sum += block_sum;
+  if (++fw_n < FW_BLOCKS) return;
+  float y = (float)fw_sum / FW_WINDOW_S;
+  if (fw_have_prev) {
+    float dy = y - fw_prev_y;
+    if (fw_count < 0xFFFFu) fw_count++;
+    fw_var += (0.5f * dy * dy - fw_var) / (float)(fw_count < FW_MEMORY ? fw_count : FW_MEMORY);
+  }
+  fw_prev_y = y; fw_have_prev = 1;
+  fw_sum = 0; fw_n = 0;
+}
+// The constants of the significance-fade bound (derived and explained at computeHoldoverFade).
+#define FADE_K           6.5f
+#define FADE_C0_US       1.0f                 // PPS edge jitter and scheduling at the moment of loss
+#define FADE_SE          0.25f                // ticks/s: how well an 80 s estimate knows the frequency
+#define FADE_A_FLOOR     0.1475f              // (ticks/s)^2 at 1024 s  ==  a = 1.5e-10 per root-second at 80 MHz
+#define FADE_A_DEFAULT   0.59f                // twice that level, until the clock has learned its own
+#define FADE_B_UNKNOWN   10.0f                // ppm: an oscillator never yet measured against GPS
+static float fade_wander_var(void){
+  if (fw_count < FW_MIN) return FADE_A_DEFAULT;
+  return fw_var > FADE_A_FLOOR ? fw_var : FADE_A_FLOOR;
+}
+
 static void fh_learn(void){
   static uint32_t last_seq = 0;
 
@@ -3666,6 +3709,7 @@ static void fh_learn(void){
 
   if ((flags & 0x3) != 0x3 || !contiguous) {  // no valid fix at this edge, or edges were missed
     fh_have_prev = 0; fh_warm = 0; fh_sum = 0; fh_n = 0;
+    fw_break();
     return;                                   // completed blocks are kept: an old measurement beats none
   }
   if (!fh_have_prev) { fh_prev_dwt = dwt; fh_have_prev = 1; return; }
@@ -3674,10 +3718,11 @@ static void fh_learn(void){
   if (fh_warm < 10) { fh_warm++; return; }    // settle after (re)acquisition
 
   int32_t tpp = tc_tpp();
-  if (d > 100 * tpp || d < -100 * tpp) { fh_sum = 0; fh_n = 0; return; }   // >100 ppm: a glitch, not the oscillator
+  if (d > 100 * tpp || d < -100 * tpp) { fh_sum = 0; fh_n = 0; fw_break(); return; }   // >100 ppm: a glitch, not the oscillator
   fh_sum += d;
   if (++fh_n >= FH_BLOCK_S) {
     fh_ring[fh_head] = fh_sum;
+    fw_block(fh_sum);                         // the wander learner counts the same block
     fh_head = (uint8_t)((fh_head + 1u) % FH_BLOCKS);
     if (fh_count < FH_BLOCKS) fh_count++;
     fh_sum = 0; fh_n = 0;
@@ -3696,6 +3741,10 @@ static _Bool fh_estimate(int32_t *e_fp){
   *e_fp = (n & 1u) ? v[n/2] : (v[n/2 - 1] + v[n/2]) / 2;
   return 1;
 }
+
+// What the governor is steering right now, for the significance-fade bound: the measured offset
+// (freq_hold) and/or the modelled temperature change (tc_apply). Main-loop only.
+static _Bool tc_hold_active = 0, tc_temp_active = 0;
 
 // Once-per-second control: evaluate the models at the current die temperature, refresh the
 // display cache, engage/disengage SysTick steering, and (optionally) trim RTC->CALR.
@@ -3795,12 +3844,14 @@ static void tc_governor(void){
       tc_steer_on = 1;
       __enable_irq();
       was_on = 1;
+      tc_hold_active = hold_ok; tc_temp_active = have_t;
     } else if (was_on) {                      // nothing left to apply mid-holdover
       tc_steer_on = 0;
       SysTick->LOAD = tc_nom_load;
       tc_acc = 0;
       applied_fp = 0; dither = 0; hold_ok = 0;
       was_on = 0;
+      tc_hold_active = 0; tc_temp_active = 0;
     }
   } else if (was_on) {
     tc_steer_on = 0;                          // flag first: the ISR stops writing LOAD...
@@ -3808,6 +3859,7 @@ static void tc_governor(void){
     tc_acc = 0;
     applied_fp = 0; dither = 0; hold_ok = 0;
     was_on = 0;
+    tc_hold_active = 0; tc_temp_active = 0;
   }
 
   // --- LSE -> RTC->CALR trim: power-loss insurance only (display time is HSE-driven) ---
@@ -3915,6 +3967,15 @@ static void tc_dump_step(void){
                      e_fp < 0 ? '-' : '+', q / 10000L, q % 10000L, (unsigned)(fh_count * FH_BLOCK_S));
       }
     }
+    if (idx == 11) {                          // the significance-fade bound: what it rests on, and where it stands at an hour
+      float a_var = fade_wander_var();
+      float tpp_f = (float)tc_tpp(); if (tpp_f <= 0.0f) tpp_f = 80.0f;
+      // wander level a in units of 1e-12 per root-second, and the hour's wander term in us; integers only
+      long a12 = (long)(sqrtf(a_var / FW_WINDOW_S) / (tpp_f * 1e6f) * 1e12f + 0.5f);
+      long u1h = (long)(FADE_K * sqrtf(FADE_SE * FADE_SE + a_var / FW_WINDOW_S * 3600.0f) / tpp_f * 3600.0f + 0.5f);
+      n = snprintf(dline, sizeof dline, "# fade: wander %ld e-12/rt-s (%s, %u windows), +-%ld us at 1 h plus any offset left in\r\n",
+                   a12, fw_count < FW_MIN ? "default" : fw_var > FADE_A_FLOOR ? "learned" : "floor", (unsigned)fw_count, u1h);
+    }
     if (n <= 0 || n >= (int)sizeof dline) { tc_dump_pending = 0; idx = 0; dn = -1; return; }
     dn = n;
     busy_ct = 0;
@@ -3928,7 +3989,7 @@ static void tc_dump_step(void){
     return;
   }
   dn = -1;
-  if (++idx > 10) { idx = 0; tc_dump_pending = 0; }
+  if (++idx > 11) { idx = 0; tc_dump_pending = 0; }
 }
 
 // "adev_dump = on" over serial: emit the whole live Allan-deviation curve as ONE checksummed
@@ -4194,40 +4255,65 @@ static void menu_dump_step(void);
 
 // Main-loop entry point, called every pass. With every tc key at its default this reduces to
 // four flag checks — no measurable cost, no behaviour change.
-// Holdover fade: from the residual 1σ time uncertainty during GPS-loss holdover, set each trailing
-// sub-second digit's intensity by its remaining SIGNIFICANCE. U(τ) = k_σ·σ·τ (µs); σ = RSS of three
-// independent ppm terms — how well the last cal pinned frequency, the MEASURED temp-model residual,
-// and aging. A digit fades over its significance band and goes dark once U exceeds its place value.
+//
+// SIGNIFICANCE FADE: the bound U(t) on the display's time error t seconds into a holdover. A
+// sub-second digit fades as U approaches half its place value and is dark once U passes it.
+//
+// The first bound was a guess: 0.02 ppm * sqrt(age of the last calibration), three-sigma. Against 24
+// days of 1 Hz records from a production Mk IV (pccd's flight recorder; 46,000 replayed GPS losses)
+// it was 6 to 350 times larger than the real error. The ms digit went dark about 6 minutes into a
+// holdover, when it was in fact right for about 50 minutes, and for 2.5 hours with freq_hold.
+//
+// What the data shows, and what this bound is now built from:
+//  - THE OFFSET. Unsteered, the error is almost exactly (the oscillator's offset) * t: 99.7% of
+//    losses stayed under 0.17 ppm * t. The clock measures that offset (fh_estimate), so it is a
+//    known term, not a margin: charged in full when it is left in, and not at all when freq_hold is
+//    steering it out.
+//  - THE WANDER. With the offset removed, what remains grows as t^1.5, a random-walking frequency:
+//    err = a * t^1.5, with a = 1.5e-10 per root-second on that clock from minutes out to hours.
+//    Each clock learns its own a (fw_var above). The learned value is never trusted below
+//    FADE_A_FLOOR, that clock's long-run level: with no floor a quiet day talked the bound down and
+//    the next thermal event broke it in 0.7% of cases. Before 2.3 h of lock, twice that level.
+//  - THE FACTOR. FADE_K = 6.5, not 3: the wander is bursty, not Gaussian. With these constants the
+//    real error exceeded the bound in 0.001% of 102,000 replayed cases, steered and unsteered,
+//    with and without tc_apply, from 5 minutes to 24 hours.
+//  - Beyond a few hours the real wander levels off (it follows the day) while t^1.5 keeps growing,
+//    so the bound is 3 to 6 times loose at 12 to 24 h. That errs toward dark, the honest side.
+// The temperature model's own residual still counts, as before, but only while tc_apply is actually
+// steering from it. One clock supplied the numbers; a noisier one widens its bound itself through
+// the learned wander, and only a quieter one is held to the floor.
+// (FADE_K and the other constants sit with the wander learner, above the governor: tc_dump prints them.)
 static void computeHoldoverFade(void){
   uint32_t age = (uint32_t)currentTime - last_pps_time;              // holdover seconds
+  float tau = (float)age;
+  float tpp = (float)tc_tpp(); if (tpp <= 0.0f) tpp = 80.0f;         // ticks/s per ppm
 
-  // σ_cal — a random-walk bound that grows with the age of the last successful RTC calibration (the
-  // last moment the clock is known to have been disciplined). ONE continuous term, so U(τ) can only
-  // grow through a holdover. It must NOT include debug_rtc_val: that is the raw LSE offset (~19 ppm
-  // on a typical crystal), a known bias of the 32 kHz oscillator, while the displayed time runs on
-  // the HSE-driven SysTick. An earlier branch used it as σ while the calibration was under
-  // CAL_PERIOD old: with an LSE model learned, the ms digit went dark ~9 s into a holdover, then
-  // RELIT when that branch expired (within 64 s), then faded again minutes later.
-  float cal_age = (float)((uint32_t)currentTime - (uint32_t)rtc_last_calibration);
-  float sigma_cal = 0.02f * sqrtf(cal_age);
-
-  // σ_temp — the MEASURED tempco-model residual (ppm), plus a penalty beyond the learned range.
-  float sigma_temp;
-  if (tc_hse_valid) {
-    float tpp = (float)tc_tpp();
-    sigma_temp = (tpp > 0.0f) ? tc_hse_resid / tpp : 10.0f;         // HSE residual (ticks/s) → ppm
-    int t = die_temp_c;
-    int over = t < tc_hse_tmin ? tc_hse_tmin - t : t > tc_hse_tmax ? t - tc_hse_tmax : 0;
-    if (over > 0) sigma_temp += 0.3f * (float)over;                 // unvalidated beyond coverage
+  // The oscillator's offset that is NOT being steered out, in ticks per second.
+  int32_t e_fp = 0;
+  _Bool measured = fh_estimate(&e_fp);
+  float y = measured ? fabsf((float)e_fp / (float)FH_FP) : FADE_B_UNKNOWN * tpp;
+  float left_in, start_us;
+  if (tc_hold_active) {                      // freq_hold has it: only the seconds before steering engaged count
+    left_in  = 0.0f;
+    start_us = y / tpp * (float)(age < tc_engage_s ? age : tc_engage_s);
   } else {
-    sigma_temp = 10.0f;                                            // no model yet — bare-crystal
+    left_in  = y;
+    start_us = 0.0f;
   }
 
-  // σ_age — long-term oscillator aging (negligible over minutes/hours, kept for completeness).
-  float sigma_age = 0.1f * (float)age / 86400.0f;
+  // The wander: K * sqrt(estimate error^2 + a^2 * t), in ticks per second averaged over the holdover.
+  float wander = FADE_K * sqrtf(FADE_SE * FADE_SE + fade_wander_var() / FW_WINDOW_S * tau);
 
-  float sigma = sqrtf(sigma_cal*sigma_cal + sigma_temp*sigma_temp + sigma_age*sigma_age);
-  float U_us  = 3.0f * sigma * (float)age;                          // k_σ = 3 ("certainly right")
+  // The temperature model's own error, while it is steering (and a penalty beyond what it learned).
+  float model = 0.0f;
+  if (tc_temp_active) {
+    model = 3.0f * tc_hse_resid;                                    // HSE residual, ticks/s
+    int t = die_temp_c;
+    int over = t < tc_hse_tmin ? tc_hse_tmin - t : t > tc_hse_tmax ? t - tc_hse_tmax : 0;
+    if (over > 0) model += 3.0f * 0.3f * (float)over * tpp;         // unvalidated beyond coverage
+  }
+
+  float U_us = FADE_C0_US + start_us + (left_in + wander + model) / tpp * tau;   // ppm * s = us
   holdover_u_us = U_us;                                             // publish for read-back / display
 
   // Half place values (µs): 0.1 s, 0.01 s, 0.001 s. Fade band β. b_k = (h−U)/(β·h), clamped 0..1.
@@ -4271,7 +4357,7 @@ void tc_housekeeping(void){
   // tc_steer_on in the gate: the governor owns DISENGAGE, so it must stay reachable even if
   // the user turns every tc key off while steering is engaged mid-holdover — otherwise the
   // tick ISR would keep applying a stale frozen correction forever.
-  if (freq_hold) fh_learn();                // the oscillator's offset against GPS, one sample per locked second
+  if (freq_hold || significance_fade) fh_learn();   // the oscillator against GPS, one sample per locked second (the fade's bound needs it too)
 
   if (tc_learn || tc_apply || tc_rtc || freq_hold || tc_steer_on || displayMode == MODE_TEMPCOMP) tc_governor();
 
