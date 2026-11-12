@@ -114,7 +114,7 @@ volatile float star_max_mag = 6.0f;   // config "star_max_mag": only load stars 
 // the first star past the cut. Hardened like loadRules (PR#7): validate magic + record length, clamp
 // the count BEFORE writing, byte-check every read, sanity-check RA/Dec, scrub name bytes. No file (or
 // an invalid one) leaves the catalogue EMPTY — MODE_STAR requires STARS.BIN on the CLOCK drive.
-static void loadStars(void){
+static SMALL_CODE void loadStars(void){
   star_count = 0; star_apparent_at = 0;
   FIL file;
   _Bool file_ok = 0;

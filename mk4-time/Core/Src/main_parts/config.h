@@ -52,7 +52,7 @@ static uint8_t parseColonName(const char *value){
   return COLON_MODE_SLOWFADE;
 }
 
-void parseConfigString(char *key, char *value, _Bool from_serial) {
+SMALL_CODE void parseConfigString(char *key, char *value, _Bool from_serial) {
 
   if (strcasecmp(key, "text") == 0) {
 
@@ -356,7 +356,7 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
 
 }
 
-void postConfigCleanup(void){
+SMALL_CODE void postConfigCleanup(void){
   // Keep the sidereal colon distinct unless the user EXPLICITLY matched the two.
   if (!colonAltExplicit && colonModeAlt == colonModeCivil) {
     colonModeAlt = (colonModeCivil != COLON_MODE_ALT_SAWTOOTH) ? COLON_MODE_ALT_SAWTOOTH
@@ -462,7 +462,7 @@ static SMALL_CODE void cfg_release(const char *key){
 }
 // After a load: put back to default every key the previous file set and this one (`now`) does not,
 // then make `now` the record. An absent file is `now` all zero: everything the file owned goes back.
-static void cfg_revert_missing(const uint32_t *now){
+static SMALL_CODE void cfg_revert_missing(const uint32_t *now){
   for (unsigned i = 0; i < CFG_ROWS; i++) {
     uint32_t bit = 1u << (i & 31u);
     if (!(cfg_from_file[i >> 5] & bit) || (now[i >> 5] & bit)) continue;
@@ -529,7 +529,7 @@ void rxConfigString(char c){
   }
 }
 
-void readConfigFile(void){
+SMALL_CODE void readConfigFile(void){
 
 #ifdef CHECK_CONFIG_MTIME
   FILINFO fno;

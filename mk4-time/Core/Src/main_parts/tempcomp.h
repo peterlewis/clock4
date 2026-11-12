@@ -277,7 +277,7 @@ static void tc_fit(void){
 // honest before real samples arrive. Clearing the frozen slots is what turns a freeze into an
 // evolving prior. Runs once per boot; on a later live config reload it only re-clears the reparsed
 // coefficients so the freeze path can't silently re-activate over the evolving model.
-static void tc_seed_apply(void){
+static SMALL_CODE void tc_seed_apply(void){
   if (!tc_seed) return;
   if (tc_seed_done) {                         // live reload: keep evolving — don't re-freeze or re-seed
     tc_cfg_hse[0]=tc_cfg_hse[1]=tc_cfg_hse[2]=NAN;

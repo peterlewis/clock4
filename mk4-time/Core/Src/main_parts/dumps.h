@@ -16,7 +16,7 @@ volatile _Bool star_dump_pending = 0;      // "star_dump = on" over serial -> em
 // HSE coefficients are printed in ppm/°C (per-degree slope b and curvature c, converted from
 // the tick-domain model); the HSE 'a' term has an arbitrary instrument origin and is neither
 // printed nor needed — steering uses temperature DIFFERENCES only (see tc_hse_delta).
-static void tc_dump_step(void){
+static SMALL_CODE void tc_dump_step(void){
   static uint8_t  idx = 0;
   static int      dn = -1;                    // formatted length; -1 = line not built yet
   static uint16_t busy_ct = 0;
@@ -118,7 +118,7 @@ static void tc_dump_step(void){
 // at tau = 2^k s (fractional frequency, %.2e). valid = contiguous phase samples behind the estimate
 // (confidence). Fresh cache computed here (thread context) so the dump works in any display mode.
 // Serviced from the main loop; retries only the CDC submit on USBD_BUSY, like tc_dump_step/emitPPS.
-static void adev_dump_step(void){
+static SMALL_CODE void adev_dump_step(void){
   static int      dn = -1;                    // formatted length; -1 = not built yet
   static uint16_t busy_ct = 0;
   static char     dline[160];                 // epoch+tau0 header + 11 octaves outgrow NMEA_BUF_SIZE
@@ -159,7 +159,7 @@ static void adev_dump_step(void){
 
 // "hdev_dump = on": one $PMHDEV sentence — the Hadamard twin of $PMADEV (same shape: epoch, tau0,
 // valid, noct, sigmas), computed on demand from the shared phase ring. Same CDC/BUSY-retry contract.
-static void hdev_dump_step(void){
+static SMALL_CODE void hdev_dump_step(void){
   static int      dn = -1;
   static uint16_t busy_ct = 0;
   static char     dline[160];
@@ -198,7 +198,7 @@ static void hdev_dump_step(void){
 // "star_dump = on" over serial: the current soonest-transit list as ONE checksummed sentence —
 // $PMSTAR,<n>,<name>,<sec_to_transit>,<transit_alt_deg>,..*CC. Fresh list computed here so it works
 // in any display mode. Same CDC/BUSY-retry contract as adev_dump_step/emitPPSTimestamp.
-static void star_dump_step(void){
+static SMALL_CODE void star_dump_step(void){
   static int      dn = -1;
   static uint16_t busy_ct = 0;
   static char     dline[192];   // 8 entries x ",NAME,SSSSS,AA,D" + header outgrow NMEA_BUF_SIZE

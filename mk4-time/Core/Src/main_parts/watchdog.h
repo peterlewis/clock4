@@ -111,7 +111,7 @@ static void wdt_poll(void){
   wdt_hw_kick();
 }
 // "wdt_dump = on" over serial: one line. Same CDC/BUSY-retry contract as the other dump steps.
-static void wdt_dump_step(void){
+static SMALL_CODE void wdt_dump_step(void){
   static int      dn = -1;
   static uint16_t busy_ct = 0;
   static char     dline[192];

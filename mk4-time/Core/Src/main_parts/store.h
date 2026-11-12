@@ -272,7 +272,7 @@ static void ee_unpack(const uint8_t*r){
 // (sclust-2)*csize + database), times the fixed 4096-byte sector (_MIN_SS==_MAX_SS==4096, and the MSC
 // maps blk*0x1000 -> QSPI 1:1), so store and host agree on physical bytes exactly.
 #ifdef __EMSCRIPTEN__
-static _Bool settings_resolve(void){
+static SMALL_CODE _Bool settings_resolve(void){
   ee_sfile_state = ee_sfile_attached ? (ee_sfile_frag ? 2 : 1) : 0;
   if (ee_sfile_state == 1 && emu_disk_attached) {     // the file is only there if the directory still lists it
     _Bool listed = 0;
@@ -285,7 +285,7 @@ static _Bool settings_resolve(void){
   return 1;
 }
 #else
-static _Bool settings_resolve(void){
+static SMALL_CODE _Bool settings_resolve(void){
   FIL f; DWORD clmt[8];
   ee_sfile_state = 0;
   if (f_open(&f, "/SETTINGS.BIN", FA_READ) != FR_OK) return 0;        // absent -> RAM-only
@@ -307,7 +307,7 @@ static _Bool settings_resolve(void){
   return ok;
 }
 #endif
-static void ee_init_base(void){
+static SMALL_CODE void ee_init_base(void){
   ee_backing = EE_BK_NONE;
   ee_rd_fault = 0;                                   // a new boot retries the medium
 #ifdef __EMSCRIPTEN__
@@ -320,7 +320,7 @@ static void ee_init_base(void){
   ee_avail = (ee_backing != EE_BK_NONE);
   settings_map_seen = settings_map_gen;              // boot mapping is fresh by definition
 }
-static _Bool ee_page_blank(uint32_t base){
+static SMALL_CODE _Bool ee_page_blank(uint32_t base){
   for (uint32_t o = 0; o < EE_QSPI_PGSZ; o += 4) if (ee_rd32(base + o) != 0xFFFFFFFFu) return 0;
   return 1;
 }
@@ -347,7 +347,7 @@ static _Bool ee_same(uint32_t a, const uint8_t *b){            // does the secto
   for (uint32_t o=0;o<EE_QSPI_PGSZ;o+=sizeof t){ ee_rd(a+o, t, sizeof t); if (memcmp(t, b+o, sizeof t)) return 0; }
   return !ee_rd_fault;
 }
-static _Bool settings_mapping_ok(void);
+static SMALL_CODE _Bool settings_mapping_ok(void);
 // Begin rewriting the sector at `target` with the 4096 bytes at img, which must stay put until done.
 static SMALL_CODE _Bool ee_j_begin(uint32_t target, const uint8_t *img){
   if (jx.st || !ee_avail || !settings_mapping_ok()) return 0;
@@ -425,7 +425,7 @@ static SMALL_CODE _Bool ee_j_recover_raw(void){
 // Scan both pages for the highest-generation CRC-valid record; position the append cursor. Shared by
 // boot load (unpack=1) and the post-host-write remap rescan (unpack=0 — RAM state may be newer than
 // anything stored, so a rescan must never clobber ovr).
-static void ee_scan(_Bool unpack){
+static SMALL_CODE void ee_scan(_Bool unpack){
   uint8_t rec[EE_REC_SZ], best[EE_REC_SZ];           // best = the CRC-verified bytes of the winner (never re-read)
   int found=0; uint32_t best_gen=0, best_page=ee_page_a; uint16_t best_slot=0;
   ee_active=ee_page_a; ee_next=0;
@@ -478,7 +478,7 @@ static void ee_scan(_Bool unpack){
   ee_fault_check();
 }
 // Boot: derive the base, scan both pages, unpack the highest-generation CRC-valid record into ovr.
-void ee_load(void){
+SMALL_CODE void ee_load(void){
   ee_init_base();
   ovr.valid=0; ee_active=ee_page_a; ee_next=0; ee_gen=0;
   cfg_prev_known = 0; ee_ext_stored = 0;   // a boot: what the file last said comes from the store, if it is there
@@ -497,7 +497,7 @@ void ee_load(void){
 // also reports the die's flash size (RG 1024 KB, RC 256 KB): the store no longer depends on it, but
 // it's the one way to learn which STM32L476 a clock was built with without reading the chip marking.
 // Same CDC/BUSY-retry contract as star_dump_step.
-static void menu_dump_step(void){
+static SMALL_CODE void menu_dump_step(void){
   static int      dn = -1;
   static uint16_t busy_ct = 0;
   static char     dline[192];   // the RAM-ONLY verdicts run to ~165 chars: at NMEA_BUF_SIZE (128) the line
@@ -533,7 +533,7 @@ static void menu_dump_step(void){
   dn = -1; menu_dump_pending = 0;
 }
 // Forward decl (defined with ee2 below — it re-bases BOTH stores after a host write moves the file).
-static void ee2_scan(_Bool unpack);
+static SMALL_CODE void ee2_scan(_Bool unpack);
 // QSPI-backing commit precondition. (1) Defer while host MSC I/O is in flight or just settled — the
 // bus is busy and the FAT may be mid-mutation. (2) If the host has written ANYTHING since the mapping
 // was last validated (settings_map_gen advanced), re-resolve /SETTINGS.BIN before trusting the cached
@@ -541,7 +541,7 @@ static void ee2_scan(_Bool unpack);
 // vanished (drop to RAM-only). This is what makes a stale-mapping write — the one failure the design
 // review found that could hit fwt.bin or the FAT itself — impossible: no commit ever runs against a
 // base the host could have invalidated.
-static _Bool settings_mapping_ok(void){
+static SMALL_CODE _Bool settings_mapping_ok(void){
   if (ee_backing != EE_BK_QSPI) return 1;
   if (qspi_write_time || qspi_usb_read_time) return 0;   // host mid-I/O: defer, retry next pass
   uint32_t snap = settings_map_gen;
@@ -569,7 +569,7 @@ static _Bool settings_mapping_ok(void){
 // the log is gone — re-initialise the pair (we own every byte of the file) and append from slot 0.
 // Never reached with a stale mapping (settings_mapping_ok runs first), so the erase stays inside the
 // file. `magic` distinguishes the menu pair from the tempcomp pair.
-static _Bool ee_sentinel(uint32_t magic, uint32_t page_a, uint32_t page_b,
+static SMALL_CODE _Bool ee_sentinel(uint32_t magic, uint32_t page_a, uint32_t page_b,
                          uint32_t *active, uint16_t *next){
   if (ee_backing != EE_BK_QSPI) return 1;
   uint32_t s0 = ee_rd32(*active);
@@ -582,7 +582,7 @@ static _Bool ee_sentinel(uint32_t magic, uint32_t page_a, uint32_t page_b,
 }
 // Write ovr as the next record. Erase + switch page when the active one is full (CRC lands last, so a
 // power loss mid-write just fails CRC and ee_load falls back to the prior generation). Caller gates.
-static _Bool ee_commit(void){
+static SMALL_CODE _Bool ee_commit(void){
   if (!ee_avail || !ovr.valid) return 0;
   if (jx.st) return 0;                                   // a sector rewrite is open: its image is in the idle page
   if (!settings_mapping_ok()) return 0;
@@ -624,7 +624,7 @@ static _Bool ee_commit(void){
 // 60..61 rsvd | 62 crc16.
 // (54..61 were zeroed padding in every earlier record, so an old record reads as "no wander stored"
 //  and EE2_SCHEMA stays 1. The wander is the fade bound's learned level: fw_var / fw_count.)
-static void ee2_init_base(void){
+static SMALL_CODE void ee2_init_base(void){
   if (ee_backing == EE_BK_QSPI){
     // The file's upper half: menu owns +0x0000/+0x1000, tempcomp owns +0x2000/+0x3000. One resolve
     // (done by ee_init_base, which ee_load ran first) covers both stores.
@@ -690,7 +690,7 @@ static void tc_unpack(const uint8_t*r){
   else                                                           { fw2.var = 0.0f; fw2.count = 0; }
 }
 // Scan/position for the tempcomp pair — twin of ee_scan (same NOR first-use + skip-to-blank rules).
-static void ee2_scan(_Bool unpack){
+static SMALL_CODE void ee2_scan(_Bool unpack){
   uint8_t rec[EE_REC_SZ], best[EE_REC_SZ];
   int found=0; uint32_t best_gen=0, best_page=ee2_page_a; uint16_t best_slot=0;
   ee2_active=ee2_page_a; ee2_next=0;
@@ -723,7 +723,7 @@ static void ee2_scan(_Bool unpack){
   while (ee2_next < EE_SLOTS && ee_rd32(ee2_active + (uint32_t)ee2_next*EE_REC_SZ) != 0xFFFFFFFFu) ee2_next++;
   ee_fault_check();
 }
-void ee2_load(void){
+SMALL_CODE void ee2_load(void){
   ee2_init_base();
   tc2.valid=0; ee2_active=ee2_page_a; ee2_next=0; ee2_gen=0;
   fw2.var=0.0f; fw2.count=0;         // the shadow mirrors the store: nothing is held until a record says so
@@ -731,7 +731,7 @@ void ee2_load(void){
   ee2_scan(1);
 }
 // Never write a zero/invalid record; update the shadow to what we just wrote (rebaselines the detector).
-static _Bool ee2_commit(_Bool with_live){
+static SMALL_CODE _Bool ee2_commit(_Bool with_live){
   if (!ee2_avail) return 0;
   if (!(with_live && (tc_hse_valid || tc_lse_valid)) && fw_count < FW_MIN) return 0;   // nothing worth a record
   if (!settings_mapping_ok()) return 0;
@@ -769,7 +769,7 @@ static _Bool tc2_sane(void){
   return tc2.hse_valid || tc2.lse_valid;
 }
 // Boot: seed the learned model from flash THROUGH the existing tc_seed path (config.txt still wins).
-void tc_seed_from_flash(void){
+SMALL_CODE void tc_seed_from_flash(void){
   if (!tc_persist) return;                                   // opt-in (default off)
   if (tc_seed_done) return;                                  // first boot pass only (live-reload = no-op)
   if (!ee2_avail || !tc2.valid) return;
@@ -792,7 +792,7 @@ void tc_seed_from_flash(void){
 // quadratic can never lock the model for the life of a thermally-narrow deployment. Also restore the
 // real sample counts + residual for display + holdover-fade honesty, and stamp the commit clock so the
 // clock does not immediately rewrite the record it just loaded.
-void tc_persist_after_seed(void){
+SMALL_CODE void tc_persist_after_seed(void){
   if (!tc_persist_seeded) return;
   tc_persist_seeded = 0;      // readConfigFile ends with this tail on every reload, not just at boot
   if (tc_hse_prior > 2) tc_hse_prior = 2;
@@ -853,13 +853,13 @@ static void fw_persist_check(void){
 // Boot: a stored wander becomes the live one, so the bound does not spend 2.3 h on its default (which
 // may be too TIGHT for a clock that had learned it wanders more). Once per boot, never over live data.
 static _Bool fw_restored = 0;
-void fw_restore_from_flash(void){
+SMALL_CODE void fw_restore_from_flash(void){
   if (fw_restored) return;
   fw_restored = 1;
   if (!tc_persist || !ee2_avail || fw_count || fw2.count < FW_MIN) return;
   fw_var = fw2.var; fw_count = fw2.count;
 }
-static void tc_persist_step(void){
+static SMALL_CODE void tc_persist_step(void){
   fw_persist_check();
   _Bool model = tc_model_dirty && tc_model_supported();     // only a well-supported model reaches flash
   if ((model || fw_dirty) && tc_persist && ee2_avail &&
@@ -871,7 +871,7 @@ static void tc_persist_step(void){
 }
 // "tc_forget = on" over serial: erase the tempcomp store (drop the PERSISTED copy only; the live
 // learned model is untouched — a full cold start is tc_reset + tc_forget). Serviced from the main loop.
-static void tc_forget_step(void){
+static SMALL_CODE void tc_forget_step(void){
   if (!tc_forget_pending) return;
   if (ee2_avail && !settings_mapping_ok()) return;   // QSPI: never erase against a stale mapping; retry next pass
   tc_forget_pending = 0;
@@ -1107,7 +1107,7 @@ static SMALL_CODE void menu_export_step(void){
 // forget the RAM override store, then re-read config.txt so the clock returns to a config.txt-only
 // state immediately (no reboot). Serial-only + origin-guarded, like tc_reset. Serviced from the main
 // loop (flash erase stalls the CPU, and the config re-read touches the FAT + non-reentrant sendDate).
-static void factory_reset_step(void){
+static SMALL_CODE void factory_reset_step(void){
   if (!factory_reset_pending) return;
   if (ee_avail && !settings_mapping_ok()) return;   // QSPI: never erase against a stale mapping; retry
   factory_reset_pending = 0;

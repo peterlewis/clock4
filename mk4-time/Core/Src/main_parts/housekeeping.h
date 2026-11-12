@@ -5,7 +5,7 @@
 
 // Main-loop entry point, called every pass. With every tc key at its default this reduces to
 // four flag checks — no measurable cost, no behaviour change.
-void tc_housekeeping(void){
+SMALL_CODE void tc_housekeeping(void){
   if (!tc_nom_load) tc_nom_load = SysTick->LOAD;       // capture the nominal period once
 
   // Serial warm-start (armed by the "tc_seed = on" line) + the evolving seed's freeze guard: with

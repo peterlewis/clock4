@@ -45,7 +45,7 @@ uint8_t findField( FIL* fp, char* str, uint8_t count, uint8_t padding ) {
   }
   return 0;
 }
-uint8_t loadRules( char* cat, char* zo, struct tzrule* dest, uint32_t maxrules ) {
+SMALL_CODE uint8_t loadRules( char* cat, char* zo, struct tzrule* dest, uint32_t maxrules ) {
   FIL file;
 
   if (f_open(&file, RULES_FILENAME, FA_READ) != FR_OK) {
@@ -117,7 +117,7 @@ uint8_t loadRules( char* cat, char* zo, struct tzrule* dest, uint32_t maxrules )
 }
 
 // loadRulesSingle modifies the input string, can't be used with const str
-uint8_t loadRulesSingle(char * str){
+SMALL_CODE uint8_t loadRulesSingle(char * str){
   char * zo = str;
   while (*zo && *zo != '/') zo++;
   if (*zo!='/') return RULES_STR_ERR;
@@ -145,7 +145,7 @@ uint8_t loadZone2Single(char * str){
   return err;
 }
 
-void checkDelayedLoadRules(){
+SMALL_CODE void checkDelayedLoadRules(){
   if (delayedLoadRules) {
     config.zone_override = 1;
     if (loadRulesSingle(preloadRulesString) !=RULES_OK) {

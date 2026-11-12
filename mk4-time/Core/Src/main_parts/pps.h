@@ -287,7 +287,7 @@ static uint8_t emitBrightnessReport(void){
 
 // Main loop: one report a second while brightness_report is on. BUSY holds the window open so the
 // next pass retries; a report that went, or had no host to take it, closes it until the next second.
-void brightness_report_poll(void){
+SMALL_CODE void brightness_report_poll(void){
   if (!brightness_report || (uint32_t)(uwTick - brit_win) < 1000u) return;
   if (emitBrightnessReport() != USBD_BUSY) brit_win = uwTick;
 }

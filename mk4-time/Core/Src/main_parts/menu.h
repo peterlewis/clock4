@@ -45,7 +45,7 @@ static void menu_show(const char *s){
   if (decisec!=9) sendDate(1); else menu_repaint=1;   // keep menu paints out of the SysTick window
 }
 static void menu_flash(const char *s){ menu_show(s); }   // transient; cleared by the next render
-static void menu_to_L0(void){
+static SMALL_CODE void menu_to_L0(void){
   menu_layer=L0_CLOCK; menu_chord=0; menu_stage=0; menu_run_dir=0; menu_run_len=0; menu_text[0]=0;
   if (colon_preview != 0xFF){ colon_preview = 0xFF; applyColonForMode(); }  // §3.5: never leave a preview stuck if we idle/EXIT mid-edit
   if (ck_menu_prev){ ck_menu_prev = 0; cuckoo_abort(); }                    // likewise the cuckoo editor's performing piece
@@ -180,7 +180,7 @@ static const MItem menu_items[] = {
 static const char *const sect_name[NSEC] = { "CAL", "ASTRO", "DISP", "DIAG", "SYS" };
 #define MENU_N ((uint8_t)(sizeof(menu_items)/sizeof(menu_items[0])))
 
-static void menu_fmt_val(const MItem*m, int32_t v, char*out){   // out must hold >=10
+static SMALL_CODE void menu_fmt_val(const MItem*m, int32_t v, char*out){   // out must hold >=10
   if (m->key_id==KID_BRIGHTNESS && v<0) { strcpy(out,"AUTO"); return; }
   if (m->type==MIT_ENUM && m->enums && v>=0 && v<=m->hi) { uint8_t n=0; const char*e=m->enums[v]; while(n<9&&e[n]){out[n]=e[n];n++;} out[n]=0; return; }
   if (m->type==MIT_TOGGLE) { strcpy(out, v?"ON":"OFF"); return; }
@@ -199,7 +199,7 @@ static uint8_t menu_step_in_section(uint8_t from, int dir){
   }
   return from;                                          // lone item in section -> stay put
 }
-static void menu_render_item(void){
+static SMALL_CODE void menu_render_item(void){
   if (menu_layer==L1_SECTION){ menu_show(sect_name[menu_section]); return; }  // section ring == breadcrumb
   const MItem *m=&menu_items[menu_idx];
   char buf[20];
@@ -253,7 +253,7 @@ static void menu_render_item(void){
 }
 
 // ---- L2 value editor (live-preview on the real digits) ----
-static void menu_enter_edit(void){
+static SMALL_CODE void menu_enter_edit(void){
   const MItem *m=&menu_items[menu_idx];
   if (m->type==MIT_INFO){ menu_render_item(); return; }   // nothing to edit — repaint the live readout
   menu_orig = m->get(m); menu_val = menu_orig; menu_run_dir=0; menu_run_len=0;
@@ -288,7 +288,7 @@ static int32_t menu_accel_inc(const MItem*m,int dir){
   }
   return inc*dir;
 }
-static void menu_edit_step(int dir){
+static SMALL_CODE void menu_edit_step(int dir){
   const MItem *m=&menu_items[menu_idx];
   int32_t want;
   if (m->type==MIT_ACTION) return;                                   // confirm screen ("SURE?") — nothing to scrub
@@ -312,7 +312,7 @@ static void menu_colon_preview_end(void){
 static void menu_cuckoo_preview_end(void){
   if (ck_menu_prev){ ck_menu_prev = 0; cuckoo_abort(); }
 }
-static void menu_cancel_edit(void){
+static SMALL_CODE void menu_cancel_edit(void){
   const MItem *m=&menu_items[menu_idx];
   m->set(m, menu_orig);                                            // restore pre-edit value
   if (m->key_id==KID_COLON_ALT) colonAltExplicit = menu_acolx_orig; // the restore-write just re-set the explicit flag — an abandoned edit must not defeat the auto-distinguish on the next config load
@@ -321,7 +321,7 @@ static void menu_cancel_edit(void){
   menu_cuckoo_preview_end();                                       // the abandoned editor's piece stops on the plain face
   menu_layer=L2_ITEM; menu_render_item();
 }
-static void menu_commit_edit(void){
+static SMALL_CODE void menu_commit_edit(void){
   const MItem *m=&menu_items[menu_idx];
   if (m->type==MIT_ACTION) { m->set(m, 1); }   // fire the one-shot action (e.g. factory reset) — nothing to persist
   else if (menu_val != menu_orig) {
@@ -426,7 +426,7 @@ static void menu_dispatch(uint8_t e){
 // Main-loop tick: flush a deferred repaint, enforce 15 s idle, then drain the event ring. The
 // decisec!=9 gate keeps EVERY menu-originated sendDate (incl. the L0 nextMode path) out of the 1 ms
 // window where the SysTick ISR runs its own non-reentrant sendDate(0).
-void menu_poll(void){
+SMALL_CODE void menu_poll(void){
   if (menu_repaint && decisec!=9){ menu_repaint=0; sendDate(1); }
   if (menu_layer!=L0_CLOCK && (uint32_t)(uwTick-menu_last_ms) >= MENU_IDLE_MS) {
     if (menu_layer==L3_EDIT) menu_cancel_edit();   // idle-out mid-edit == abandon: revert the live scrub + flush the final MATRIX rate to the date board, exactly like CANCEL (menu_to_L0 alone did neither)

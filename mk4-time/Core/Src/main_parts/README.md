@@ -41,6 +41,19 @@ can reach the firmware's internal state.
 - A new subsystem gets a new file here and one `#include` line in `main.c`, placed after everything
   it uses.
 
+## Speed and size
+
+The project is compiled `-O3`, which the interrupt handlers and the display path want. Most of the
+code is neither: it runs once at start-up, or when a file changes, or when a button is pressed. Built
+`-O3` it was about 12 KB bigger than it needs to be, in an app region of 192 KB.
+
+So a function that runs rarely, and never on a timing path, is marked `SMALL_CODE` (defined in
+`main.c`: the compiler's `cold` attribute, and never inlined). The compiler then builds it for size.
+Mark new code of that kind. Do not mark anything an interrupt handler runs (the SysTick, PPS, PendSV,
+UART, DMA and DAC handlers), `sendDate`, the brightness and colon polling, the cuckoo, or the
+astronomy. The USB interrupt is the exception: it has a lower priority than those handlers, and the
+config parser it runs for a serial line is marked.
+
 ## Checking a rearrangement
 
 Moving code must not change it. Keep the old `main.o`, rebuild, and compare:

@@ -46,6 +46,20 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
+// This project is compiled -O3, for the interrupt handlers and the display path. Code that runs rarely
+// and never on a timing path is marked cold instead: the compiler then builds it for size, and keeps it
+// out of line. That is start-up initialisation, the config parser and loader, the settings stores, the
+// menu's screens, the serial reports, the config.txt writer and the once-a-second temperature
+// housekeeping. At -O3 they came to about 12 KB more than they need. Not marked, on purpose: the
+// SysTick, PPS, PendSV, UART, DMA and DAC handlers and everything they run, sendDate, the brightness
+// and colon polling, the cuckoo, the astronomy. Two marked things do run in an interrupt, the USB one,
+// which has a lower priority than those handlers and cannot delay them: the parser, when a config line
+// arrives over serial, and SystemClock_Config, when the bus resumes from suspend.
+#if defined(__GNUC__)
+#define SMALL_CODE __attribute__((cold, noinline))
+#else
+#define SMALL_CODE
+#endif
 
 /* USER CODE END PM */
 
@@ -100,6 +114,24 @@ static void MX_LPTIM1_Init(void);
 static void MX_TIM5_Init(void);
 static void MX_ADC3_Init(void);
 /* USER CODE BEGIN PFP */
+// Start-up initialisation, run once. Declared again here to mark it: the definitions are generated.
+SMALL_CODE void SystemClock_Config(void);
+static SMALL_CODE void MX_GPIO_Init(void);
+static SMALL_CODE void MX_DMA_Init(void);
+static SMALL_CODE void MX_QUADSPI_Init(void);
+static SMALL_CODE void MX_TIM1_Init(void);
+static SMALL_CODE void MX_USART2_UART_Init(void);
+static SMALL_CODE void MX_USART1_UART_Init(void);
+static SMALL_CODE void MX_TIM2_Init(void);
+static SMALL_CODE void MX_ADC1_Init(void);
+static SMALL_CODE void MX_DAC1_Init(void);
+static SMALL_CODE void MX_TIM6_Init(void);
+static SMALL_CODE void MX_RTC_Init(void);
+static SMALL_CODE void MX_TIM7_Init(void);
+static SMALL_CODE void MX_CRC_Init(void);
+static SMALL_CODE void MX_LPTIM1_Init(void);
+static SMALL_CODE void MX_TIM5_Init(void);
+static SMALL_CODE void MX_ADC3_Init(void);
 void tmToBcd(struct tm *in, bcdStamp_t *out );
 uint8_t loadRulesSingle(char * str);
 void nextMode(_Bool);
@@ -166,14 +198,6 @@ uint8_t requestMode = 255;
 
 volatile uint8_t config_write = 0;   // "config_write = on": the parser sets it, config_write.h (below it) acts on it
 
-// This file is compiled -O3, for the interrupt handlers. Code that runs rarely and never on a timing
-// path (the settings store's merge, the menu export, the config.txt writer) is built for size instead,
-// and kept out of line: at -O3 it came to several kilobytes more than it needs.
-#if defined(__GNUC__) && !defined(__clang__)
-#define SMALL_CODE __attribute__((optimize("Os"), noinline))
-#else
-#define SMALL_CODE
-#endif
 
 // ---- The menu's public face --------------------------------------------------------------------
 // Two things other sections read: the layer the menu is on (the store commits to flash only at
