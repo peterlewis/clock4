@@ -104,6 +104,7 @@ void tmToBcd(struct tm *in, bcdStamp_t *out );
 uint8_t loadRulesSingle(char * str);
 void nextMode(_Bool);
 static void menu_flash(const char *s);     // menu.h; the store calls it (a note on the date row after a factory reset)
+static void cfg_release(const char *key);   // config.h; the store calls it (a bundled setting the file takes back from the menu)
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/

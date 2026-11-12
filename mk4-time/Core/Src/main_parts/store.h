@@ -24,6 +24,21 @@ static struct {
 } ovr;
 static uint16_t cfg_simple_defined;    // bit per KID set by config.txt this load
 static uint64_t cfg_modes_defined;     // bit per MODE_* ordinal set by config.txt this load
+static uint32_t cfg_sig[16];           // per KID: a hash of the file's line(s) for that setting, this load
+static uint32_t cfg_line_hash;         // the hash of the line now being parsed (readConfigFile sets it)
+// config.txt owns this setting on this load. A setting can take several lines (tc_learn, tc_apply and
+// tc_persist are all TEMPCOMP), so the hashes are chained: any of them changing changes the result.
+#define cfg_owns(kid) do { cfg_simple_defined |= (uint16_t)(1u<<(kid)); \
+                           cfg_sig[kid] = (cfg_sig[kid] * 16777619u) ^ cfg_line_hash; } while(0)
+// What config.txt said when the stored choices were last merged with it, so the next load can tell
+// which lines have changed. Kept in RAM and, beside every menu record, in the store (ee_pack_x): a
+// clock is often plugged into a computer, edited, and unplugged before it has looked at the file
+// again, and the comparison then has to be made at the next power-on.
+static uint16_t cfg_prev_simple;
+static uint64_t cfg_prev_modes, cfg_prev_modes_val;
+static uint16_t cfg_prev_sig[16];      // the line hashes, folded to 16 bits
+static _Bool    cfg_prev_known = 0;    // 0 until a load, or the store, has supplied the above
+static _Bool    ee_ext_stored = 0;     // the newest menu record has its file record beside it
 static _Bool    menu_dirty = 0;        // a menu edit is awaiting flash commit
 volatile _Bool factory_reset_pending = 0;     // "factory_reset = on" over serial -> factory-reset the menu store
 volatile _Bool menu_dump_pending = 0;      // "menu_dump = on" over serial -> emit the store-persistence diagnostic
@@ -54,7 +69,8 @@ static uint8_t cfg_tc_defined = 0;
 // ================= Menu persistence: firmware-owned emulated-EEPROM =============================
 // Two 4 KB pages, append-only ping-pong. Each 64-byte record: {magic, generation, schema, config.txt
 // mtime stamp, the packed override set, CRC16 in the LAST doubleword}. Boot picks the highest-
-// generation CRC-valid record. The pages live in /SETTINGS.BIN on the QSPI FAT volume on EVERY clock,
+// generation CRC-valid record. Each is followed by a file record (ee_pack_x): what config.txt said
+// when these choices were last merged with it. The pages live in /SETTINGS.BIN on the QSPI FAT volume on EVERY clock,
 // whatever the STM32L476 variant: the bootloader treats every die as 256 KB (boot + app end at
 // 0x08040000 even on a 1 MB RG) and every board carries the same QSPI chip, so one medium means one
 // path to test. The RG-only internal-flash home (the top of bank 2) is retired: records an earlier
@@ -169,6 +185,28 @@ static void ee_pack(uint8_t*r, uint32_t gen){
   r[48]=ovr.brit; r[49]=ovr.fh; r[50]=ovr.wdt;
   uint16_t crc=ee_crc16(r,62); memcpy(r+62,&crc,2);
 }
+// The file record: what config.txt said at the last merge. It is written in the slot after the menu
+// record of the same generation and is only believed there; a menu record without one (an older
+// build's, or a write cut short between the two) falls back on the stamp. Its magic and schema differ
+// from the menu record's, so a build that does not know it skips the slot.
+// Layout: 0 magic u32 | 4 gen u32 | 8 schema u16 | 10 settings the file mentions u16 |
+// 12 modes it mentions u64 | 20 what it says for them u64 | 28 line hash per setting, 16 x u16 |
+// 60..61 rsvd | 62 crc16.
+#define EE_XMAGIC  0x4D4B3458u        // "MK4X"
+#define EE_XSCHEMA 0x5801u
+static void ee_pack_x(uint8_t*r, uint32_t gen){
+  memset(r,0,EE_REC_SZ);
+  uint32_t mg=EE_XMAGIC; memcpy(r+0,&mg,4); memcpy(r+4,&gen,4);
+  uint16_t sc=EE_XSCHEMA; memcpy(r+8,&sc,2);
+  memcpy(r+10,&cfg_prev_simple,2); memcpy(r+12,&cfg_prev_modes,8); memcpy(r+20,&cfg_prev_modes_val,8);
+  memcpy(r+28,cfg_prev_sig,32);
+  uint16_t crc=ee_crc16(r,62); memcpy(r+62,&crc,2);
+}
+static void ee_unpack_x(const uint8_t*r){
+  memcpy(&cfg_prev_simple,r+10,2); memcpy(&cfg_prev_modes,r+12,8); memcpy(&cfg_prev_modes_val,r+20,8);
+  memcpy(cfg_prev_sig,r+28,32);
+  cfg_prev_known=1;
+}
 static void ee_unpack(const uint8_t*r){
   memcpy(&ovr.stamp_fdate,r+10,2); memcpy(&ovr.stamp_ftime,r+12,2);
   memcpy(&ovr.simple_mask,r+14,2);
@@ -255,7 +293,19 @@ static void ee_scan(_Bool unpack){
     }
   }
   if (found){
-    if (unpack) ee_unpack(best);                            // a record that passed its CRC is safe to apply, fault or not
+    if (unpack) {
+      ee_unpack(best);                                      // a record that passed its CRC is safe to apply, fault or not
+      ee_ext_stored = 0;
+      if (best_slot + 1u < EE_SLOTS) {                      // its file record, if it has one: the next slot, same generation
+        uint32_t xa = best_page + (uint32_t)(best_slot+1)*EE_REC_SZ;
+        if (ee_rd32(xa) == EE_XMAGIC) {
+          ee_rd(xa, rec, EE_REC_SZ);
+          uint16_t sc, crc; uint32_t gen;
+          memcpy(&sc,rec+8,2); memcpy(&crc,rec+62,2); memcpy(&gen,rec+4,4);
+          if (sc==EE_XSCHEMA && ee_crc16(rec,62)==crc && gen==best_gen) { ee_unpack_x(rec); ee_ext_stored = 1; }
+        }
+      }
+    }
     ee_active=best_page; ee_next=(uint16_t)(best_slot+1);   // append after the winner
     if (best_gen > ee_gen) ee_gen = best_gen;               // gen stays monotonic across remaps
   }
@@ -281,6 +331,7 @@ static void ee_scan(_Bool unpack){
 void ee_load(void){
   ee_init_base();
   ovr.valid=0; ee_active=ee_page_a; ee_next=0; ee_gen=0;
+  cfg_prev_known = 0; ee_ext_stored = 0;   // a boot: what the file last said comes from the store, if it is there
   if (!ee_avail) return;
   ee_scan(1);
 }
@@ -383,7 +434,7 @@ static _Bool ee_commit(void){
   // Never program a non-blank slot (NOR AND-merges): skip past strays.
   while (ee_next < EE_SLOTS && ee_rd32(ee_active + (uint32_t)ee_next*EE_REC_SZ) != 0xFFFFFFFFu) ee_next++;
   if (ee_fault_check()){ fatfs_busy = 0; return 0; }   // "every slot is used" from failed reads must not erase the other page
-  if (ee_next >= EE_SLOTS){
+  if (ee_next + 2u > EE_SLOTS){                         // room for the pair: the two records never straddle pages
     uint32_t other = (ee_active==ee_page_a)? ee_page_b : ee_page_a;
     ee_erase(other); ee_active=other; ee_next=0;
   }
@@ -391,6 +442,16 @@ static _Bool ee_commit(void){
   ee_pack(rec, ee_gen+1);
   for (uint32_t o=0;o<EE_REC_SZ;o+=8){ uint64_t dw; memcpy(&dw, rec+o, 8); ee_prog_dw(addr+o, dw); }
   ee_gen++; ee_next++;
+  // The menu record above is the commit point. The file record follows it: cut short here, the menu
+  // record stands alone and the next boot falls back on the stamp. A page always starts with a menu
+  // record, which is what ee_sentinel looks for.
+  ee_ext_stored = 0;
+  if (cfg_prev_known){
+    addr += EE_REC_SZ;
+    ee_pack_x(rec, ee_gen);
+    for (uint32_t o=0;o<EE_REC_SZ;o+=8){ uint64_t dw; memcpy(&dw, rec+o, 8); ee_prog_dw(addr+o, dw); }
+    ee_next++; ee_ext_stored = 1;
+  }
   fatfs_busy = 0;
   return 1;
 }
@@ -664,35 +725,96 @@ static void tc_forget_step(void){
   ee2_active = ee2_page_a; ee2_next = 0; ee2_gen = 0;
 }
 
-// Boot merge: apply an override to a key iff config.txt didn't define it OR the stored mtime matches
-// the current config.txt mtime. A zero mtime never matches (an RTC-less host writes 0/0), so a real
-// config.txt edit on such a host always wins over a stored override.
-void menu_apply_overrides(void){
-  if (!ovr.valid) return;
+// Merge the stored menu choices into the settings config.txt has just produced. Per setting:
+//   - config.txt does not mention it: the menu's choice applies.
+//   - config.txt mentions it, and its line is the same as at the last merge: the menu's choice still
+//     applies. Saving the file for some other reason does not undo it.
+//   - config.txt mentions it, and its line is new or has changed since the last merge: the file wins,
+//     and the menu's choice is deleted from the store. It does not come back if the line is removed
+//     later.
+// A line that is removed never beats the menu: the file has stopped having an opinion.
+//
+// "The last merge" is cfg_prev_*: in RAM while the clock runs, and read back from the store at boot,
+// so it does not matter whether the clock was running, or had caught up, when the file was changed.
+// A store with no file record (an older build's, or a write cut short) falls back on the stamp, the
+// modification time of the config.txt it was merged with: if the file still carries it, nothing has
+// changed and every choice stands; if not, which lines changed is unknown and the file wins every
+// setting it mentions, which is the rule this one replaced.
+//
+// have_file = 0: there is no config.txt to read. The stored choices apply and the memory of the last
+// real file is kept, so a file that reappears (an editor that saves by delete and rename) is compared
+// with the file before it, not with nothing.
+static void menu_reconcile(_Bool have_file){
   _Bool stamp_ok = (ovr.stamp_fdate || ovr.stamp_ftime) &&
                    ovr.stamp_fdate==config.fdate && ovr.stamp_ftime==config.ftime;
-  #define OVR_S(kid, apply) if ((ovr.simple_mask&(1u<<(kid))) && (!(cfg_simple_defined&(1u<<(kid)))||stamp_ok)) { apply; }
-  OVR_S(KID_BRIGHTNESS, config.brightness_override=(float)ovr.brightness)
-  OVR_S(KID_COLON,      colonModeCivil=ovr.colon)
-  OVR_S(KID_COLON_ALT,  { colonModeAlt=ovr.alt_colon; colonAltExplicit=1; })
-  OVR_S(KID_PAGE_MS,    config.page_ms=ovr.page_ms)
-  OVR_S(KID_SIG_FADE,   significance_fade=ovr.sig_fade)
-  OVR_S(KID_PPS,        pps_ts_enabled=ovr.pps)
-  OVR_S(KID_BRIT,       brightness_report=ovr.brit?1:0)
-  OVR_S(KID_FREQ_HOLD,  freq_hold=ovr.fh?1:0)
-  OVR_S(KID_WATCHDOG,   watchdog=ovr.wdt?1:0)   // on arms it on the next main-loop pass; off waits for the next reset
-  OVR_S(KID_NMEA,       nmea_cdc_level=ovr.nmea)
-  OVR_S(KID_MATRIX_FREQ,setDisplayFreq(ovr.matrix_freq))   // clamping setter (never ARR-direct) -> a bad stored value can't brick
-  OVR_S(KID_TEMPCOMP,   tc_learn=tc_apply=tc_persist=ovr.tc?1:0)
-  OVR_S(KID_BALANCE,    { if(ovr.bal){ if(!seg_balance)seg_balance=1; if(!colon_balance)colon_balance=1; } else seg_balance=colon_balance=0; colonForce=1; })  // config parse ran first: a stored "on" must not clobber a manual strength
-  OVR_S(KID_CUCKOO,     { uint8_t pv=cuckoo; cuckoo=(ovr.cuckoo<CK_PIECES)?ovr.cuckoo:CK_OFF; if(cuckoo!=pv) cuckoo_abort(); })  // range-clamped: a corrupt store must not select a ghost piece
-  #undef OVR_S
-  for (uint8_t m=0;m<NUM_DISPLAY_MODES;m++)
-    if ((ovr.modes_mask&(1ull<<m)) && (!(cfg_modes_defined&(1ull<<m))||stamp_ok))
-      config.modes_enabled[m] = (ovr.modes_val>>m)&1ull;   // postConfigCleanup's >=1 guard backstops this
+  uint64_t now_modes_val = 0;          // what the file says for each mode it mentions: the parser has just
+  for (uint8_t m=0;m<NUM_DISPLAY_MODES;m++)   // run, and nothing stored has been applied yet
+    if ((cfg_modes_defined&(1ull<<m)) && config.modes_enabled[m]) now_modes_val |= (1ull<<m);
+  uint16_t now_sig[16];
+  for (uint8_t k=0;k<16;k++) now_sig[k] = (uint16_t)(cfg_sig[k] ^ (cfg_sig[k]>>16));
+
+  if (!cfg_prev_known && have_file) {                  // no memory of a merge: the stamp decides
+    if (ovr.valid && stamp_ok) {                       // the file the store was last merged with: nothing has changed
+      cfg_prev_simple = cfg_simple_defined; cfg_prev_modes = cfg_modes_defined; cfg_prev_modes_val = now_modes_val;
+      memcpy(cfg_prev_sig, now_sig, sizeof cfg_prev_sig);
+    } else {                                           // unknown history: every line counts as new
+      cfg_prev_simple = 0; cfg_prev_modes = 0; cfg_prev_modes_val = 0;
+      memset(cfg_prev_sig, 0, sizeof cfg_prev_sig);
+    }
+    cfg_prev_known = 1;
+  }
+  if (ovr.valid) {
+    if (have_file) {
+      uint16_t changed_s = (uint16_t)~cfg_prev_simple;         // lines that were not there before...
+      for (uint8_t k=0;k<16;k++) if (now_sig[k] != cfg_prev_sig[k]) changed_s |= (uint16_t)(1u<<k);   // ...or read differently
+      uint16_t beat_s = ovr.simple_mask & cfg_simple_defined & changed_s;
+      uint64_t beat_m = ovr.modes_mask & cfg_modes_defined & (~cfg_prev_modes | (now_modes_val ^ cfg_prev_modes_val));
+      // TEMPCOMP and BALANCE each cover several config.txt keys. The file may have taken over only one
+      // of them; the others still hold what the menu's choice set, and nothing owns that any more.
+      // They go back to their defaults, which is where a power cycle would put them.
+      if (beat_s & (1u<<KID_TEMPCOMP)) { cfg_release("tc_learn"); cfg_release("tc_apply"); cfg_release("tc_persist"); }
+      if (beat_s & (1u<<KID_BALANCE))  { cfg_release("seg_balance"); cfg_release("colon_balance"); }
+      ovr.simple_mask &= (uint16_t)~beat_s;
+      ovr.modes_mask &= ~beat_m; ovr.modes_val &= ~beat_m;
+      // What must reach the store: a deleted choice; and, while any choice is stored, the file this
+      // merge was made against (its statements, and its stamp for the fallback).
+      _Bool moved = cfg_prev_simple != cfg_simple_defined || cfg_prev_modes != cfg_modes_defined ||
+                    cfg_prev_modes_val != now_modes_val || memcmp(cfg_prev_sig, now_sig, sizeof now_sig) != 0;
+      _Bool holds = ovr.simple_mask || ovr.modes_mask;
+      _Bool mtime = config.fdate || config.ftime;
+      if (beat_s || beat_m || (holds && (moved || (mtime && !stamp_ok) || (ee_avail && !ee_ext_stored)))) {
+        if (mtime) { ovr.stamp_fdate = config.fdate; ovr.stamp_ftime = config.ftime; }
+        menu_dirty = 1;
+      }
+    }
+    #define OVR_S(kid, apply) if (ovr.simple_mask&(1u<<(kid))) { apply; }
+    OVR_S(KID_BRIGHTNESS, config.brightness_override=(float)ovr.brightness)
+    OVR_S(KID_COLON,      colonModeCivil=ovr.colon)
+    OVR_S(KID_COLON_ALT,  { colonModeAlt=ovr.alt_colon; colonAltExplicit=1; })
+    OVR_S(KID_PAGE_MS,    config.page_ms=ovr.page_ms)
+    OVR_S(KID_SIG_FADE,   significance_fade=ovr.sig_fade)
+    OVR_S(KID_PPS,        pps_ts_enabled=ovr.pps)
+    OVR_S(KID_BRIT,       brightness_report=ovr.brit?1:0)
+    OVR_S(KID_FREQ_HOLD,  freq_hold=ovr.fh?1:0)
+    OVR_S(KID_WATCHDOG,   watchdog=ovr.wdt?1:0)   // on arms it on the next main-loop pass; off waits for the next reset
+    OVR_S(KID_NMEA,       nmea_cdc_level=ovr.nmea)
+    OVR_S(KID_MATRIX_FREQ,setDisplayFreq(ovr.matrix_freq))   // clamping setter (never ARR-direct) -> a bad stored value can't brick
+    OVR_S(KID_TEMPCOMP,   tc_learn=tc_apply=tc_persist=ovr.tc?1:0)
+    OVR_S(KID_BALANCE,    { if(ovr.bal){ if(!seg_balance)seg_balance=1; if(!colon_balance)colon_balance=1; } else seg_balance=colon_balance=0; colonForce=1; })  // config parse ran first: a stored "on" must not clobber a manual strength
+    OVR_S(KID_CUCKOO,     { uint8_t pv=cuckoo; cuckoo=(ovr.cuckoo<CK_PIECES)?ovr.cuckoo:CK_OFF; if(cuckoo!=pv) cuckoo_abort(); })  // range-clamped: a corrupt store must not select a ghost piece
+    #undef OVR_S
+    for (uint8_t m=0;m<NUM_DISPLAY_MODES;m++)
+      if (ovr.modes_mask&(1ull<<m))
+        config.modes_enabled[m] = (ovr.modes_val>>m)&1ull;   // postConfigCleanup's >=1 guard backstops this
+  }
+  if (have_file) {                                     // this file is "the last merge" for the next load
+    cfg_prev_simple = cfg_simple_defined; cfg_prev_modes = cfg_modes_defined; cfg_prev_modes_val = now_modes_val;
+    memcpy(cfg_prev_sig, now_sig, sizeof cfg_prev_sig);
+  }
 }
-// Record a menu edit into the override store (value already applied live). Stamped with the current
-// config.txt mtime so a later host re-save (mtime advances) reasserts that key.
+void menu_apply_overrides(void){ menu_reconcile(1); }
+// Record a menu edit into the override store (value already applied live). The stamp is the
+// config.txt this store is merged with (see menu_reconcile): the file now loaded.
 static void menu_record_key(uint8_t key_id, int32_t v){
   ovr.stamp_fdate=config.fdate; ovr.stamp_ftime=config.ftime; ovr.valid=1; menu_dirty=1;
   if (key_id>=KID_MODE_BASE){

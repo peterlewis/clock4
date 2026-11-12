@@ -61,7 +61,7 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
   } else if (strcasecmp(key, "MATRIX_FREQUENCY") == 0) {
 
     setDisplayFreq(atoi(value));
-    if (!from_serial) cfg_simple_defined |= (1u<<KID_MATRIX_FREQ);   // config.txt keeps priority over the menu
+    if (!from_serial) cfg_owns(KID_MATRIX_FREQ);   // config.txt keeps priority over the menu
 
   } else if (strcasecmp(key, "zone_override") == 0) {
 
@@ -88,7 +88,7 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
   } else if (strcasecmp(key, "brightness") == 0) {
 
     config.brightness_override = parseBrightness(value, 1);
-    if (!from_serial) cfg_simple_defined |= (1u<<KID_BRIGHTNESS);
+    if (!from_serial) cfg_owns(KID_BRIGHTNESS);
 
   } else if (strcasecmp(key, "countdown_to") == 0) {
 
@@ -163,7 +163,7 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
   } else if (strcasecmp(key, "page_ms") == 0) {
     int v = atoi(value);
     config.page_ms = v < 0 ? 0 : (v > 65535 ? 65535 : v);   // fits uint16; 0 -> default
-    if (!from_serial) cfg_simple_defined |= (1u<<KID_PAGE_MS);
+    if (!from_serial) cfg_owns(KID_PAGE_MS);
   } else if (strcasecmp(key, "Tolerance_time_1ms") == 0) {
     config.tolerance_1ms = atoi(value);
   } else if (strcasecmp(key, "Tolerance_time_10ms") == 0) {
@@ -177,13 +177,13 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
   } else if (strcasecmp(key, "colon_mode") == 0) {
 
     colonModeCivil = parseColonName(value);
-    if (!from_serial) cfg_simple_defined |= (1u<<KID_COLON);
+    if (!from_serial) cfg_owns(KID_COLON);
 
   } else if (strcasecmp(key, "colon_alt_mode") == 0) {
 
     colonModeAlt = parseColonName(value);   // shared by the alternate-timebase modes (ACOLON in the menu)
     colonAltExplicit = 1;
-    if (!from_serial) cfg_simple_defined |= (1u<<KID_COLON_ALT);
+    if (!from_serial) cfg_owns(KID_COLON_ALT);
 
   } else if (strcasecmp(key, "nmea") == 0) {
 
@@ -192,12 +192,12 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     } else if (strcasecmp(value, "rmc") == 0) {
       nmea_cdc_level = NMEA_RMC;
     } else nmea_cdc_level = NMEA_ALL;
-    if (!from_serial) cfg_simple_defined |= (1u<<KID_NMEA);
+    if (!from_serial) cfg_owns(KID_NMEA);
 
   } else if (strcasecmp(key, "pps") == 0) {
 
     pps_ts_enabled = truthy(value);   // emit a $PMTXTS timing sentence on each PPS edge
-    if (!from_serial) cfg_simple_defined |= (1u<<KID_PPS);
+    if (!from_serial) cfg_owns(KID_PPS);
 
   } else if (strcasecmp(key, "cuckoo") == 0) {
 
@@ -208,7 +208,7 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     if      (strcasecmp(value, "trust") == 0)        cuckoo = CK_TRUST;
     else                                             cuckoo = CK_OFF;   // off, and every parked piece name, and typos
     if (cuckoo != prev) cuckoo_abort();   // a change mid-piece ends it cleanly on the plain face
-    if (!from_serial) cfg_simple_defined |= (1u<<KID_CUCKOO);
+    if (!from_serial) cfg_owns(KID_CUCKOO);
 
   } else if (strcasecmp(key, "cuckoo_preview") == 0) {
 
@@ -237,27 +237,27 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     set_mode_enabled(MODE_DARK, value);
   } else if (strcasecmp(key, "tc_learn") == 0) {
     tc_learn = truthy(value);         // accumulate (die temp, ppm) samples while GPS-locked
-    if (!from_serial) cfg_simple_defined |= (1u<<KID_TEMPCOMP);   // menu TEMPCOMP toggle bundles learn+apply
+    if (!from_serial) cfg_owns(KID_TEMPCOMP);   // menu TEMPCOMP toggle bundles learn+apply
   } else if (strcasecmp(key, "tc_apply") == 0) {
     tc_apply = truthy(value);         // steer the SysTick timebase during GPS-loss holdover
-    if (!from_serial) cfg_simple_defined |= (1u<<KID_TEMPCOMP);
+    if (!from_serial) cfg_owns(KID_TEMPCOMP);
   } else if (strcasecmp(key, "significance_fade") == 0) {
     significance_fade = truthy(value);      // fade sub-second digits by significance in holdover, not dash
-    if (!from_serial) cfg_simple_defined |= (1u<<KID_SIG_FADE);
+    if (!from_serial) cfg_owns(KID_SIG_FADE);
   } else if (strcasecmp(key, "seg_balance") == 0) {
     // Equalise per-segment brightness by duty (see segbal_poll). "on" (or 1) = AUTO, the
     // calibrated strength-vs-rail curve — the intended setting. A numeric 2..300 applies a
     // fixed manual strength (<=100 linear blend, >100 power-law) for tuning experiments.
     int v = truthy(value) ? 1 : atoi(value);
     seg_balance = (uint16_t)(v < 0 ? 0 : (v > 300 ? 300 : v));
-    if (!from_serial) cfg_simple_defined |= (1u<<KID_BALANCE);   // menu BALANCE toggle bundles seg+colon
+    if (!from_serial) cfg_owns(KID_BALANCE);   // menu BALANCE toggle bundles seg+colon
   } else if (strcasecmp(key, "colon_balance") == 0) {
     // Dim the colons with the rail (see colon_balance_poll). "on"/1 = AUTO curve; a numeric 2..256
     // pins a fixed scale (of 256) for eyeball calibration. The main-loop poll re-applies it.
     int v = truthy(value) ? 1 : (falsey(value) ? 0 : atoi(value));
     colon_balance = (uint16_t)(v < 0 ? 0 : (v > 256 ? 256 : v));
     colonForce = 1;                   // land an explicit sweep step even if within the hysteresis band
-    if (!from_serial) cfg_simple_defined |= (1u<<KID_BALANCE);
+    if (!from_serial) cfg_owns(KID_BALANCE);
   } else if (strcasecmp(key, "colon_full_at") == 0) {
     // Per-hardware anchor: the dac (0..4095) at/below which AUTO colons run at full scale. Overrides
     // the baked default. Kept below full-scale so 4095-colon_full_at stays a positive span.
@@ -269,7 +269,7 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     colonForce = 1;
   } else if (strcasecmp(key, "freq_hold") == 0) {
     freq_hold = truthy(value);        // in holdover, run at the frequency measured while locked
-    if (!from_serial) cfg_simple_defined |= (1u<<KID_FREQ_HOLD);
+    if (!from_serial) cfg_owns(KID_FREQ_HOLD);
   } else if (strcasecmp(key, "tc_rtc") == 0) {
     tc_rtc = truthy(value);           // additionally trim RTC->CALR while GPS is absent
   } else if (strcasecmp(key, "tc_t0") == 0) {
@@ -298,7 +298,7 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     if (!from_serial) cfg_tc_defined |= CFG_TC_HI;
   } else if (strcasecmp(key, "tc_persist") == 0) {
     tc_persist = truthy(value);       // opt-in: auto-save the learned model to its retained flash store
-    if (!from_serial) cfg_simple_defined |= (1u<<KID_TEMPCOMP);   // menu TEMPCOMP bundles this too — a file that defines it wins
+    if (!from_serial) cfg_owns(KID_TEMPCOMP);   // menu TEMPCOMP bundles this too — a file that defines it wins
   } else if (strcasecmp(key, "tc_forget") == 0) {
     if (from_serial && truthy(value)) tc_forget_pending = 1;   // serial-only: erase the retained model (keeps live learning)
   } else if (strcasecmp(key, "tc_dump") == 0) {
@@ -318,12 +318,12 @@ void parseConfigString(char *key, char *value, _Bool from_serial) {
     loop_diag = truthy(value) ? 1 : 0;   // 1 Hz $PMLOOP main-loop latency diagnostic
   } else if (strcasecmp(key, "brightness_report") == 0) {
     brightness_report = truthy(value) ? 1 : 0;   // 1 Hz $PMBRIT auto-dimmer operating point
-    if (!from_serial) cfg_simple_defined |= (1u<<KID_BRIT);
+    if (!from_serial) cfg_owns(KID_BRIT);
   } else if (strcasecmp(key, "watchdog") == 0) {
     // Opt-in. Arms on the next main-loop pass. It cannot be stopped once armed (the hardware has no
     // off switch), so "off" takes effect at the next reset.
     watchdog = truthy(value) ? 1 : 0;
-    if (!from_serial) cfg_simple_defined |= (1u<<KID_WATCHDOG);
+    if (!from_serial) cfg_owns(KID_WATCHDOG);
   } else if (strcasecmp(key, "wdt_dump") == 0) {
     if (from_serial && truthy(value)) wdt_dump_pending = 1;   // serial-only: report the watchdog's state
   } else if (strcasecmp(key, "menu_dump") == 0) {
@@ -447,6 +447,15 @@ static int cfg_row(const char *key){
   for (unsigned i = 0; i < CFG_ROWS; i++) if (strcasecmp(key, cfg_defaults[i].key) == 0) return (int)i;
   return -1;
 }
+// A key nothing owns any more goes back to its default, unless the file now loaded sets it.
+// (menu_reconcile, in the store, calls this when config.txt takes a bundled setting back from the menu.)
+static void cfg_release(const char *key){
+  int row = cfg_row(key);
+  if (row < 0 || !cfg_defaults[row].def || (cfg_from_file[row >> 5] & (1u << (row & 31)))) return;
+  char v[32];
+  strncpy(v, cfg_defaults[row].def, sizeof v - 1); v[sizeof v - 1] = 0;
+  parseConfigString((char*)key, v, 1);        // origin "not the file", as in cfg_revert_missing
+}
 // After a load: put back to default every key the previous file set and this one (`now`) does not,
 // then make `now` the record. An absent file is `now` all zero: everything the file owned goes back.
 static void cfg_revert_missing(const uint32_t *now){
@@ -542,6 +551,7 @@ void readConfigFile(void){
   colonModeAlt = COLON_MODE_ALT_SAWTOOTH;
   colonAltExplicit = 0;
   cfg_simple_defined = 0; cfg_modes_defined = 0; cfg_tc_defined = 0;   // rebuilt below as config.txt keys are parsed
+  memset(cfg_sig, 0, sizeof cfg_sig);
   uint32_t cfg_now[CFG_WORDS];           // the keys THIS file sets (cfg_defaults rows)
   for (unsigned w = 0; w < CFG_WORDS; w++) cfg_now[w] = 0;
 
@@ -549,7 +559,7 @@ void readConfigFile(void){
 
    if (f_open(&file, CONFIG_FILENAME, FA_READ) != FR_OK) {
      cfg_revert_missing(cfg_now);   // no config.txt: everything a previous file set goes back to default
-     menu_apply_overrides();   // no config.txt: stored menu overrides are the only settings
+     menu_reconcile(0);        // no config.txt: stored menu overrides are the only settings
      postConfigCleanup();
      return;
    }
@@ -587,6 +597,10 @@ void readConfigFile(void){
 
        int row = cfg_row(key);          // a blank "zone_override =" means "automatic": it does not set the key
        if (row >= 0 && (cfg_defaults[row].def || value[0])) cfg_now[row >> 5] |= 1u << (row & 31);
+       cfg_line_hash = 2166136261u;        // FNV-1a of "key=value": how a later load knows this line changed
+       for (const char *p = key;   *p; p++) cfg_line_hash = (cfg_line_hash ^ (uint8_t)((*p>='A' && *p<='Z') ? *p+32 : *p)) * 16777619u;   // keys match without regard to case
+       cfg_line_hash = (cfg_line_hash ^ (uint8_t)'=') * 16777619u;
+       for (const char *p = value; *p; p++) cfg_line_hash = (cfg_line_hash ^ (uint8_t)*p) * 16777619u;
        parseConfigString(key, value, 0);   // file origin: serial-only triggers inert
 
      }
@@ -594,7 +608,7 @@ void readConfigFile(void){
 
    cfg_revert_missing(cfg_now);   // keys the previous file set and this one dropped: back to their defaults
 
-   menu_apply_overrides();   // merge stored menu overrides (config.txt precedence) before the boot mode
+   menu_apply_overrides();   // merge stored menu overrides (a changed line beats the menu; see menu_reconcile)
 
    // if enabled, always boot into ttff
    if (config.modes_enabled[MODE_TTFF]) requestMode=MODE_TTFF;

@@ -788,12 +788,28 @@ unusable, settings still work but are RAM-only, lost at power-off. `menu_dump = 
 reports which of these your clock is doing.
 
 Only the settings you actually changed are recorded, so `config.txt` remains the source of truth for
-everything else. When both have an opinion about the same key, the rule is: a key defined in
-`config.txt` wins, *unless* the menu change was made against this exact version of the file — each
-menu edit is stamped with the config file's modification time, and a stored override only beats the
-file while the stamps still match. In practice: edit something on the device and it sticks; re-save
-`config.txt` from your computer and the file reasserts whatever it defines. (If your host writes zero
-FAT timestamps, the file always wins after a re-save.)
+everything else. When both have an opinion about the same setting, the rule works one setting at a
+time:
+
+- `config.txt` does not mention it: the menu's choice applies.
+- `config.txt` mentions it, and that line is the same as when the clock last read the file: the
+  menu's choice still applies. Editing some other line does not undo it.
+- That line is new, or has changed: the file wins, and the menu's choice is deleted. It does not
+  come back if you remove the line later.
+
+Removing a line never beats the menu: the file has stopped having an opinion, so the menu's choice
+(or, with none, the default) applies.
+
+The clock does not have to be running, or to have caught up, when you change the file. The store
+keeps what `config.txt` said the last time the two were merged, so a clock that is plugged into a
+computer, edited and unplugged makes the same comparison at its next power-on. A setting made of
+several keys counts as one: `tc_learn`, `tc_apply` and `tc_persist` are the menu's TEMPCOMP, and
+`seg_balance` and `colon_balance` its BALANCE; change any of them and the file takes the whole
+setting back, with the keys it does not mention returning to their defaults.
+
+A store written by an earlier build has no memory of the file. Until its first save under this build
+it uses the earlier rule: the menu's choices stand only while `config.txt` still has the modification
+time it had when they were made, and otherwise the file wins every setting it mentions.
 
 ## Flash memory files
 
