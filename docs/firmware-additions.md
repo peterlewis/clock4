@@ -642,6 +642,15 @@ $PMTXTS,<seq>,<epoch>,<subms>,<systick>,<load>,<calerr>,<sincecal>,<temp>,<flags
 The modelled sub-second position at the edge — the phase error against GPS — is
 `subms + (load − systick)/(load + 1)` milliseconds.
 
+A locked clock reports `subms` 999 with `systick` a few hundred: a few microseconds short of the
+second, which is the time the PPS handler takes to restart the millisecond counter. `subms` and
+`systick` are read as one value, so a counter that has just wrapped is never paired with a count that
+has not yet moved on. Builds before this one mostly reported `subms` 0 with the same small `systick`:
+a leftover tick from the old second was counted as the first millisecond of the new one, so the
+count, the ms digit and the roll-over of the seconds ran one millisecond ahead of GPS in most locked
+seconds (98.8% of them on one clock over 30 hours). A host that folds the phase by whole
+milliseconds reads both forms the same way.
+
 The last three fields are the SOF-correlation tail, present once USB has enumerated: `dwt_pps` is a
 free-running 80 MHz cycle count latched at the PPS edge, `sof_frame` the 11-bit USB frame number of
 the most recent start-of-frame, and `dwt_sof` the cycle count at that SOF. A host that can read each

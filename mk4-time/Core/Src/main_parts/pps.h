@@ -44,10 +44,19 @@ static inline _Bool pps_emit_pending(void){ return pps_ts_enabled && pps_record_
 // Snapshot the timing state at the instant of the PPS edge. MUST run before SysTick->VAL is
 // reloaded and before millisec/centisec/decisec are zeroed, so it captures the phase error
 // between the firmware's modelled second and the true GPS edge.
+//
+// The count and the counter are read as one value. SysTick and this handler have the same priority,
+// so SysTick can wrap after the edge and stay pending while this runs: the counter has then started
+// the next millisecond and the count has not. Reading the counter first and the pending flag second
+// tells the two apart: pending with a counter that has just reloaded means the count is one behind.
+#define systick_is_pending()  ((SCB->ICSR & SCB_ICSR_PENDSTSET_Msk) != 0)
 #define capturePPS() do { \
     pps_cap.dwt_pps  = DWT->CYCCNT; \
-    pps_cap.systick  = SysTick->VAL; \
-    pps_cap.subms    = (uint16_t)decisec*100 + (uint16_t)centisec*10 + millisec; \
+    uint32_t cap_v_  = SysTick->VAL; \
+    uint16_t cap_s_  = (uint16_t)((uint16_t)decisec*100 + (uint16_t)centisec*10 + millisec); \
+    if (systick_is_pending() && cap_v_ > (SysTick->LOAD >> 1)) cap_s_ = (cap_s_ >= 999) ? 0 : (uint16_t)(cap_s_ + 1); \
+    pps_cap.systick  = cap_v_; \
+    pps_cap.subms    = cap_s_; \
     pps_cap.epoch    = (uint32_t)currentTime; \
     pps_cap.calerr   = debug_rtc_val; \
     pps_cap.sincecal = (uint32_t)currentTime - (uint32_t)rtc_last_calibration; \
@@ -58,11 +67,36 @@ static inline _Bool pps_emit_pending(void){ return pps_ts_enabled && pps_record_
     adev_push_dwt(pps_cap.dwt_pps, pps_cap.epoch); /* free-running Allan-deviation sample */ \
   } while(0)
 
+// The second starts at the edge: restart the millisecond counter, and drop a tick left over from the
+// second that has just ended.
+//
+// The counter was restarted a few microseconds after the previous edge, so its 1000th wrap falls a
+// few microseconds after this one: inside this handler, which runs at SysTick's own priority. The
+// wrap stays pending and, left alone, runs the moment this handler returns, as the first millisecond
+// of the new second. The count then reads one millisecond ahead for the whole second: the ms digit
+// one high, and the seconds rolling over a millisecond early. Recordings of a locked clock show it in
+// 98.8% of seconds; in the rest the restart below wins the race against the wrap by a few ticks.
+// Writing VAL does not clear a pending SysTick, so it is cleared here. Any tick pending at this
+// point belongs to the old second, whatever the oscillator is doing.
+//
+// uwTick still gets its 1000 counts a second: when the count shows the old second's last tick never
+// ran (it was dropped here, or the restart came first), it is counted here instead.
+#ifdef __EMSCRIPTEN__
+#define systick_drop_pending()  (SCB->ICSR &= ~SCB_ICSR_PENDSTSET_Msk)    // the emulator's ICSR is plain memory
+#else
+#define systick_drop_pending()  (SCB->ICSR = SCB_ICSR_PENDSTCLR_Msk)      // write-one-to-clear; zero bits do nothing
+#endif
+#define restartSecond() do { \
+    SysTick->VAL = SysTick->LOAD; \
+    systick_drop_pending(); \
+    if (decisec >= 5) HAL_IncTick(); \
+  } while(0)
+
 // PPS rising edge
 void PPS(void)
 {
   capturePPS();
-  SysTick->VAL = SysTick->LOAD;
+  restartSecond();
 
   buffer_c[3].low=cLut[0];
   buffer_c[2].low=cLut[0];
@@ -73,8 +107,6 @@ void PPS(void)
   decisec=0;
 
   __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_7);
-
-  // clear systick flag if set?
 
   // During first power up PPS can be emitted before the GPS leapsecond offset is known
   // In this case, it is safest to pretend PPS hasn't happened
@@ -91,7 +123,7 @@ void PPS(void)
 void PPS_NoUpdate(void)
 {
   capturePPS();
-  SysTick->VAL = SysTick->LOAD;
+  restartSecond();
   triggerPendSV();
 
   millisec=0;
@@ -111,7 +143,7 @@ void PPS_NoUpdate(void)
 void PPS_Countdown(void)
 {
   capturePPS();
-  SysTick->VAL = SysTick->LOAD;
+  restartSecond();
 
   buffer_c[3].low=cLut[9];
   buffer_c[2].low=cLut[9];
