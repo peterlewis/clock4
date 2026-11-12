@@ -5408,7 +5408,7 @@ static const MItem menu_items[] = {
   // "am I disciplined right now?" and "did my star catalogue actually load?" — the second would have
   // surfaced a failed card a session earlier than the serial diagnostics did.
   { 0, MIT_INFO, "PPS",   0,0,0, NULL, NULL, NULL, SEC_DIAG  },   // "PPS LOCK" / "HOLD <s>" / "PPS ----"
-  { 0, MIT_INFO, "STARS", 1,0,0, NULL, NULL, NULL, SEC_ASTRO },   // "STARS <n>" (card) / "STARS b<n>" (baked fallback)
+  { 0, MIT_INFO, "STARS", 1,0,0, NULL, NULL, NULL, SEC_ASTRO },   // "STARS <n>": stars loaded from /STARS.BIN (0 = no file, or an invalid one)
 };
 static const char *const sect_name[NSEC] = { "CAL", "ASTRO", "DISP", "DIAG", "SYS" };
 #define MENU_N ((uint8_t)(sizeof(menu_items)/sizeof(menu_items[0])))
@@ -5892,7 +5892,7 @@ int main(void)
   ee2_load();         // scan the retained tempco model (separate 2-page store); readConfigFile picks it up as a seed
   readConfigFile();
   checkDelayedLoadRules();
-  loadStars();          // scan /STARS.BIN into the transit catalogue (star_max_mag is known now); falls back to the baked bright set
+  loadStars();          // scan /STARS.BIN into the transit catalogue (star_max_mag is known now); no file -> empty catalogue, "STAr ----"
 
   measure_vbat();
 
