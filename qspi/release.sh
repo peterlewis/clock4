@@ -6,3 +6,6 @@
 # either config is fine for mk4-date
 ./fw-crc.sh ../mk4-date/Release/mk4-date.bin output/fwd.bin || \
 ./fw-crc.sh ../mk4-date/Debug/mk4-date.bin output/fwd.bin
+
+# The sample config.txt goes out beside the images. config.txt here is the one to edit.
+cp config.txt output/config.txt

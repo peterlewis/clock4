@@ -69,7 +69,11 @@ the script's header documents the binary format. `STAR_MAG_CUT` in the environme
 magnitude cut at build time, and `star_max_mag` in config.txt trims the catalogue on the clock.
 
 ## config
-An example `config.txt` is provided. 
+`config.txt` here is the sample: every key the firmware knows, each with a line. `release.sh` copies
+it to `output/config.txt`, beside the images. It is also the template Precision Clock Companion uses,
+and a test in that repository (`config_template_check.mjs`) fails if the two texts differ, if the
+parser knows a key the sample has no line for, or if the sample states a default that is not the
+firmware's.
 
 ## firmware images
 There are two separate firmware image files. They are copied to the internal flash memory of each microcontroller so can be safely deleted after the update (or left there, it doesn't matter).

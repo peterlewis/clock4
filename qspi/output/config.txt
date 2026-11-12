@@ -1,0 +1,231 @@
+# =============================================================================
+# Precision Clock Mk IV: config.txt
+#
+# Edit this file on the CLOCK drive. The clock reads it at power-on and again
+# when you save it. A line that starts with # is switched off: the clock then
+# uses its built-in value for that key. Delete a line, or put # in front of it,
+# and that setting goes back to its built-in value.
+#
+# Every key the firmware knows is in this file. Precision Clock Companion (PCC)
+# uses the same file as its template.
+# =============================================================================
+
+
+## display
+
+# Matrix refresh rate in Hz, 1000 to 100000. The clock uses the nearest rate it
+# can divide from its processor clock.
+MATRIX_FREQUENCY = 20000
+
+
+## timezone
+
+# Leave ZONE_OVERRIDE switched off to find the zone from the GPS position. To
+# fix it, give an IANA name: Europe/London, Etc/UTC, or Etc/GMT+5 for a fixed
+# offset. The value below is an example.
+#ZONE_OVERRIDE = Europe/London
+
+# The second timezone, shown by MODE_ZONE2. Same format. An example.
+#zone2 = America/New_York
+
+
+## display modes
+# Enable each mode you want. The two buttons step through the enabled modes.
+
+# Date row: ISO 8601 date (YYYY-MM-DD), day of the year, week number
+MODE_ISO8601_STD = enabled
+MODE_ISO_ORDINAL = disabled
+MODE_ISO_WEEK    = disabled
+# Unix time (always UTC), Julian Date, Modified Julian Date
+MODE_UNIX        = disabled
+MODE_JULIAN_DATE = disabled
+MODE_MODIFIED_JD = disabled
+
+# Weekday name, alone and with the date
+MODE_WEEKDAY   = disabled
+MODE_WDY_MM_DD = disabled
+MODE_WEEKDA_DD = disabled
+
+# UTC offset (+01:00) and timezone name
+MODE_SHOW_OFFSET  = disabled
+MODE_SHOW_TZ_NAME = disabled
+
+# Other clocks on the time row. The date row keeps the local date.
+# Local sidereal time, apparent solar (sundial) time, the second timezone.
+MODE_LST   = disabled
+MODE_SOLAR = disabled
+MODE_ZONE2 = disabled
+
+# The text and the countdown set further down
+MODE_TEXT      = disabled
+MODE_COUNTDOWN = disabled
+
+# All LEDs off. GPS stays on.
+MODE_STANDBY = disabled
+
+
+## astronomy modes
+# These need a position: a GPS fix, or the fixed position below.
+
+# Sunrise, sunset and solar noon. The sun's azimuth and elevation now.
+MODE_SUN      = disabled
+MODE_SUN_AZEL = disabled
+# Moon phase and illuminated percentage (needs no position)
+MODE_MOON     = disabled
+# Maidenhead grid locator. Latitude and longitude.
+MODE_GRID     = disabled
+MODE_LATLON   = disabled
+# Countdown to astronomical darkness (sun 18 degrees down), and the twilight times
+MODE_DARK     = disabled
+# Countdown to the next bright stars crossing your meridian. Needs STARS.BIN on the drive.
+MODE_STAR     = disabled
+
+# Use only stars brighter than this magnitude. A smaller number gives fewer,
+# better-known stars: 1.5 is about two dozen.
+#star_max_mag = 6
+
+# How long each page of a paged mode stays up, in milliseconds. 250 or more.
+page_ms = 5500
+
+# A fixed position, in decimal degrees, north and east positive. With these set
+# the clock ignores the GPS position. An example.
+#fake_latitude  = 51.4779
+#fake_longitude = -0.0015
+
+
+## diagnostic modes
+
+# Satellites in view
+MODE_SATVIEW  = disabled
+# Allan deviation of the clock's own oscillator, measured against GPS
+MODE_ADEV     = disabled
+# What the temperature compensation has learned
+MODE_TEMPCOMP = disabled
+# Coin-cell voltage
+MODE_VBAT     = disabled
+# Checksum of the installed firmware
+MODE_FIRMWARE_CRC = disabled
+# Time to first fix after power-on. Light every segment. Raw brightness. RTC calibration.
+MODE_TTFF             = disabled
+MODE_DISPLAYTEST      = disabled
+MODE_DEBUG_BRIGHTNESS = disabled
+MODE_DEBUG_RTC        = disabled
+
+
+## colons
+
+# slowfade, heartbeat, sawtooth, alt_sawtooth, toggle or solid
+colon_mode = heartbeat
+# The colon for MODE_LST, MODE_SOLAR and MODE_ZONE2. Switched off, the clock
+# picks one that differs from colon_mode, so those modes never look like local time.
+#colon_alt_mode = alt_sawtooth
+
+# A small flourish on each quarter-hour and a longer one on the hour: off or trust
+cuckoo = off
+
+
+## text and countdown
+
+# The text MODE_TEXT shows. An example.
+#text = HELLO
+# The moment MODE_COUNTDOWN counts down to, in UTC. An example.
+#countdown_to = 2027-01-01T00:00:00Z
+
+
+## when GPS is lost
+
+# The clock hides its last digits as its time gets less certain. These are the
+# seconds without GPS after which the 1 ms, 10 ms and 100 ms digits go.
+Tolerance_time_1ms   = 1000
+Tolerance_time_10ms  = 10000
+Tolerance_time_100ms = 100000
+# on: use the clock's own measurement of its error and not the three times above.
+# Each digit fades as the error reaches it.
+significance_fade = off
+
+# on: without GPS, hold the oscillator frequency measured while GPS was present.
+# The clock needs 48 seconds of GPS first.
+freq_hold = off
+
+# Temperature compensation. With GPS, tc_learn measures how the oscillators
+# drift with temperature. Without GPS, tc_apply corrects the display for it and
+# tc_rtc corrects the battery-backed clock. tc_persist keeps what was learned
+# across power-off.
+tc_learn   = off
+tc_apply   = off
+tc_rtc     = off
+tc_persist = off
+# Reference temperature in degrees C. Seconds without GPS before the correction
+# starts (2 or more). The largest correction, in parts per million.
+#tc_t0       = 40
+#tc_engage_s = 2
+#tc_max_ppm  = 100
+# A model to start from. Send "tc_dump = on" over USB serial and paste the lines
+# it prints here. The numbers below are placeholders.
+#tc_hse_b = 0
+#tc_hse_c = 0
+#tc_lse_a = 0
+#tc_lse_b = 0
+#tc_lse_c = 0
+#tc_seed_lo = 0
+#tc_seed_hi = 0
+#tc_seed = on
+
+
+## brightness
+
+# The curve from the light sensor to the display brightness: five points, each
+# "sensor,brightness", 0 to 4095. This one suits the VTT9812FH sensor with R11 = 470K.
+BS1 = 0,0
+BS2 = 131,365
+BS3 = 1076,1422
+BS4 = 2774,2665
+BS5 = 3849,4095
+# A fixed brightness, 0.0 to 1.0 or 0 to 4095. Switched off, the light sensor sets it. An example.
+#brightness = 0.5
+
+# on: make every digit equally bright. Without it a 1 is brighter than an 8.
+# A number from 2 to 300 sets a fixed strength.
+seg_balance = off
+# on: dim the colons with the digits. A number from 2 to 256 sets a fixed level.
+colon_balance = off
+# The two ends of the automatic colon curve: the brightness at or below which the
+# colons are full, and their level (of 256) at the dimmest setting.
+#colon_full_at = 2048
+#colon_floor   = 20
+
+
+## USB serial output
+
+# GPS sentences: on, rmc (position and time only) or off
+nmea = on
+# on: one $PMTXTS timing sentence for each GPS pulse
+pps = off
+# on: report the automatic dimmer once a second as $PMBRIT. PCC asks for this
+# when it connects. Leave it switched off here, or a reload of this file stops it.
+#brightness_report = on
+# on: report the main loop's longest pause once a second as $PMLOOP
+#loop_diag = on
+
+
+## reliability
+
+# on: restart the clock if its firmware stops for 8 seconds. Once on, "off"
+# takes effect at the next restart.
+watchdog = off
+
+
+## this file and the menu
+
+# A setting you change with the clock's buttons stays until you change that
+# setting's line in this file. Changing a different line does not undo it.
+#
+# on: the clock writes its menu changes into this file, so the file shows what
+# the clock is doing. It only does this when no computer has been connected
+# since power-on. It then adds a line that starts "# synced". With PCC's pccd
+# running on a connected computer, pccd writes the changes whatever this says.
+config_write = off
+
+# To erase every menu change and everything the clock has learned, choose
+# SYS > RESET in the menu, or send "factory_reset = on" over USB serial. The
+# clock then does exactly what this file says.

@@ -114,6 +114,8 @@ There is also an opt-in watchdog (`watchdog = on`) that restarts a clock whose m
 | `SETTINGS.BIN` | Menu settings and the learned temperature model |
 | `STARS.BIN` | The bright-star catalogue for `MODE_STAR` |
 
+The release folder also has a sample `config.txt`. It is the same text PCC uses as its template.
+
 ### What is not changed
 
 The hardware, the bootloader, the update method, and every stock mode and `config.txt` key. The bootloader checks an image before it erases anything, so the stock firmware can be put back the same way this one was installed.
@@ -128,6 +130,8 @@ Ready-built images are in [qspi/output](qspi/output).
 4. Copy `fwt.bin` (time board) and `fwd.bin` (date board).
 5. Eject the drive. The clock updates itself and restarts.
 
+Your existing `config.txt` keeps working as it is. `config.txt` in the same folder is a sample with a line for every key this firmware knows, the new ones included, each switched off or at its built-in value. Copy lines from it into yours, or start from it. Do not copy it over your own file unless you mean to lose your settings.
+
 To return to stock, copy mitxela's `fwt.bin` and `fwd.bin` the same way. [qspi/qspi.md](qspi/qspi.md) has the details, including how to format the drive from scratch.
 
 ## Status
@@ -141,14 +145,14 @@ This is draft firmware. I run it on my own clock. Every change is tested in an e
 - **Try the firmware without flashing it.** PCC compiles this source to WebAssembly and runs it as the clock on screen. Every mode, the menu and the `config.txt` parser are the real code. Open [pcc.ptrl.ws](https://pcc.ptrl.ws/) to use it.
 - **It is how the firmware is tested.** The emulator test suites live in the PCC repository. A change here comes with a test there.
 - **It reads the telemetry.** PCC charts `$PMTXTS` phase and drift, the stability curve and the star transits, and fits the temperature model.
-- **It edits `config.txt`.** The editor runs each line through the firmware's own parser, so what it accepts is what the clock accepts.
+- **It edits `config.txt`.** The editor runs each line through the firmware's own parser, so what it accepts is what the clock accepts. Its template is this repository's sample `config.txt`, and it can lay an existing file's settings onto that template.
 - **It keeps a record.** The background program, `pccd`, records everything the clock reports. Those recordings are what the holdover figures above were measured from.
 - **It keeps `config.txt` true.** When you change a setting with the clock's buttons, `pccd` writes that line into `config.txt` on the clock's drive.
 - **It makes the clock a time source.** `pccd` can feed the clock's GPS pulse to chrony, so the computer keeps time from it.
 
 ## How it is tested
 
-- **Emulator suites** in the PCC repository (`web/emu/phase1`): 36 suites that drive the real firmware code, compiled to WebAssembly.
+- **Emulator suites** in the PCC repository (`web/emu/phase1`): 37 suites that drive the real firmware code, compiled to WebAssembly.
 - **Conformance:** 4,511 display checks against independently computed calendar and astronomy results, and 912 timezone checks against the host's timezone database.
 - **A native build** of the same source, whose output is compared byte for byte with the WebAssembly build's.
 - **A replay** of a capture from a real clock.
