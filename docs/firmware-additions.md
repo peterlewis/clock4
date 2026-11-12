@@ -520,7 +520,8 @@ $PMSTAR,<n>,<name>,<sec>,<alt>,<dir>,...*CC
 menu_dump = on
 ```
 Prints one line reporting whether the on-device menu settings persist in `SETTINGS.BIN` or are
-RAM-only, and if RAM-only, why (no `SETTINGS.BIN`, or the file is fragmented or too small). Useful
+RAM-only, and if RAM-only, why (no `SETTINGS.BIN`, the file is fragmented or too small, or the
+flash chip failed a read, in which case the file is left untouched until the next power-on). Useful
 for checking whether your settings will survive a power cycle. The line also gives the
 microcontroller's flash size, `flash=256KB` for an STM32L476RC or `flash=1024KB` for an STM32L476RG,
 which is the easiest way to find out which one your clock was built with.
