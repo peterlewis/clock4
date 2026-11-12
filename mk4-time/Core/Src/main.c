@@ -4844,7 +4844,9 @@ void ee_load(void){
 static void menu_dump_step(void){
   static int      dn = -1;
   static uint16_t busy_ct = 0;
-  static char     dline[NMEA_BUF_SIZE];
+  static char     dline[192];   // the RAM-ONLY verdicts run to ~165 chars: at NMEA_BUF_SIZE (128) the line
+                                // overflowed and the dump was dropped in exactly the cases it exists to explain.
+                                // 192 = the CDC transmit buffer.
   if (!menu_dump_pending) return;
   if (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED) { menu_dump_pending = 0; dn = -1; return; }
 
