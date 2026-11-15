@@ -120,8 +120,11 @@ Found in the code or the emulator, and fixed before they were seen on a clock:
 - An unguarded pointer in the USB serial path when no computer is attached.
 - Out-of-range writes in the text mode, and in the date board's display and text handling.
 - Work inside the USB interrupt that could collide with the main loop: applying a serial setting, checking for an update on eject, and allocating memory.
+- A timezone lookup cut short by a write from the computer could return a zone from the part of the map it had read, and left memory allocated each time. A lookup that is cut short now returns nothing.
 
 Changed for everyone:
+
+- The timezone lookup gives way to a computer using the drive. It does not start while the computer is reading or writing, nor for two seconds after, and one in progress is given up. Stock waits inside the lookup for the computer's reads to finish, which with `watchdog = on` can restart the clock. A read that lands in a lookup already running still fails, so `zone_gate = on` is the setting to use with a computer attached.
 
 - A line removed from `config.txt` returns that setting to its default when the file is saved, not at the next power-on.
 - The buttons are read by the main loop, so that the menu can use them. A press can register about 0.3 s late while the timezone lookup runs; stock acts on it at once.

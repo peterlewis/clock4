@@ -88,15 +88,23 @@ void ZDAbort(){
   zd_abort=1;
 }
 
+// A computer using the drive comes first: the lookup is given up, never made to wait. Stock gave up
+// for a write but waited here for reads to stop, and that wait holds the main loop for as long as the
+// computer keeps reading: 16 s for one pass over TZMAP.BIN, which is twice the watchdog's timeout.
+// Once given up, a lookup reads nothing more (zd_abort stays set until the next ZDOpenDatabase), and
+// ZDLookup and ZDHelperSimpleLookupString return no zone for it, so the caller tries again later.
+static _Bool mapReadGivenUp(void){
+  if (zd_abort || qspi_write_time || qspi_usb_read_time) zd_abort=1;
+  return zd_abort;
+}
+
 uint8_t readMapFile(uint32_t addr){
   unsigned int r;
 
   if (addr>=mapCacheStart && addr<mapCacheEnd)
     return mapCache[ addr-mapCacheStart ];
 
-  do {
-    if (qspi_write_time) {zd_abort=1;return 0;}
-  } while (qspi_usb_read_time);
+  if (mapReadGivenUp()) return 0;
 
   f_lseek( file, addr);
   if (file->err) {zd_abort=1;return 0;}
@@ -114,9 +122,7 @@ uint8_t readMapFileReverse(uint32_t addr){
   if (addr>=mapCacheStart && addr<mapCacheEnd)
     return mapCache[ addr-mapCacheStart ];
 
-  do {
-    if (qspi_write_time) {zd_abort=1;return 0;}
-  } while (qspi_usb_read_time);
+  if (mapReadGivenUp()) return 0;
 
   mapCacheStart = addr -MAP_CACHE_SIZE +1;
   mapCacheEnd = addr +1;
@@ -846,6 +852,7 @@ ZoneDetect *ZDOpenDatabase(FIL* fd)
         memset(library, 0, sizeof(*library));
 
         file=fd;
+        zd_abort = 0;   // a new lookup starts here; one given up earlier no longer counts
 /*
         library->fd = open(path, O_RDONLY | O_CLOEXEC);
         if(library->fd < 0) {
@@ -906,7 +913,7 @@ ZoneDetectResult *ZDLookup(const ZoneDetect *library, float lat, float lon, floa
     while(bboxIndex < library->metadataOffset) {
         int32_t minLat, minLon, maxLat, maxLon, metadataIndexDelta;
         uint64_t polygonIndexDelta;
-        if (zd_abort) return NULL;
+        if (zd_abort) { free(results); return NULL; }
         if(!ZDDecodeVariableLengthSigned(library, &bboxIndex, &minLat)) break;
         if(!ZDDecodeVariableLengthSigned(library, &bboxIndex, &minLon)) break;
         if(!ZDDecodeVariableLengthSigned(library, &bboxIndex, &maxLat)) break;
@@ -949,6 +956,10 @@ ZoneDetectResult *ZDLookup(const ZoneDetect *library, float lat, float lon, floa
 
         polygonId++;
     }
+
+    /* A lookup given up part-way read zeroes from then on, and can leave the loop by a break with
+       only some of the polygons seen. Those are not an answer. */
+    if (zd_abort) { free(results); return NULL; }
 
     /* Clean up results */
     for(size_t i = 0; i < numResults; i++) {
@@ -1165,5 +1176,6 @@ char* ZDHelperSimpleLookupString(const ZoneDetect* library, float lat, float lon
 
 done:
     ZDFreeResults(result);
+    if (zd_abort) { free(output); output = NULL; }   // given up while reading the names: no zone
     return output;
 }

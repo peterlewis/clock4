@@ -296,16 +296,32 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 #include "main_parts/housekeeping.h"        // the timing subsystems' once-per-pass work in the main loop
 
 // ---- The main loop's timezone lookup: when it runs -----------------------------------------------
-// On every new fix, as in stock. Two things can hold it back, and neither clears new_position, so it
+// On every new fix, as in stock. Three things can hold it back, and none clears new_position, so it
 // runs on a later pass:
+//  - a computer using the drive. The lookup reads the map through the same flash chip, and a read or
+//    write from the computer that arrives while the lookup has the chip fails. So no lookup starts
+//    until the computer has left the drive alone for ZONE_HOST_QUIET_MS, and one already running is
+//    given up at the computer's first read (readMapFile, zonedetect.c). Stock held off for a write
+//    only, and waited inside the lookup for reads to stop.
 //  - the cuckoo (cuckoo.h): the lookup stalls the main loop for ~300 ms, and the cuckoo is scheduled
 //    and stepped from that loop. Nothing is held with cuckoo = off, bar a menu preview while it plays.
 //  - zone_gate = on: skip the lookup unless the fix has moved far enough to plausibly change zone.
 //    0.005° ≈ 0.5 km — ~100× the metre-scale jitter of a stationary clock, yet far finer than any
 //    timezone boundary. (dlat²+dlon² threshold 2.5e-5 = 0.005²; the cos-lat foreshortening of
 //    longitude only makes the gate MORE conservative.)
+#define ZONE_HOST_QUIET_MS 2000u
+// The storage handlers set qspi_usb_read_time and qspi_write_time, and the 10 Hz interrupt clears
+// them 10 and 100 ms after the last transfer. This remembers when either was last seen set.
+static _Bool zone_host_busy(void){
+  static uint32_t seen;
+  static _Bool busy = 0;
+  if (qspi_write_time || qspi_usb_read_time) { seen = uwTick; busy = 1; }
+  else if (busy && (uint32_t)(uwTick - seen) >= ZONE_HOST_QUIET_MS) busy = 0;
+  return busy;
+}
 static _Bool zone_lookup_due(void){
-  return new_position && !qspi_write_time && !config.zone_override
+  _Bool host = zone_host_busy();   // ahead of the &&s: it must look on every pass, not only when a fix is waiting
+  return new_position && !host && !qspi_write_time && !config.zone_override
       && (data_valid || (config.fake_long && config.fake_lat))
       && latitude>=-90.0 && latitude<=90.0 && longitude>=-180.0 && longitude<=180.0
       && !cuckoo_holds_lookup()

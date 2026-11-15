@@ -30,6 +30,8 @@ Two more depend on how the clock is used:
   stock once-a-second timezone lookup still running, `seg_balance` may show a faint once-a-second
   flicker on the fast digits (see `zone_gate`). That combination has not been checked on a clock.
 - `pps = on` if a computer running PCC is attached, which reads the timing sentence.
+- `zone_gate = on` for any clock with a computer attached, whether or not it uses `seg_balance`.
+  A read from the computer that lands in a timezone lookup fails (see `zone_gate`).
 
 `ms_align` is on the list with a caveat: it has been checked in the emulator and against one clock's
 own timing reports, but not yet filmed on a clock. On a clock that does not need it, it does nothing.
@@ -446,8 +448,24 @@ occupies the main loop for about 300 ms. That is the default here too.
 With `zone_gate = on` the clock looks the zone up again only when its position has moved about
 0.5 km (0.005°) from the last fix whose zone loaded. That is around a hundred times the jitter of a
 stationary GPS fix, and far finer than any timezone boundary. A lookup that fails (the map file
-missing, a write from the computer in progress, the zone's rules not found) is tried again at the
-next fix, and so is the position after a `ZONE_OVERRIDE` is removed or fails to load.
+missing, a computer using the drive, the zone's rules not found) is tried again at the next fix, and
+so is the position after a `ZONE_OVERRIDE` is removed or fails to load.
+
+With either setting, a computer that is using the drive comes first. The lookup reads the map
+through the same flash chip the computer reads the drive through, and a read or write from the
+computer that arrives while the lookup has the chip fails. So no lookup starts while the computer is
+reading or writing, nor for two seconds after it stops, and one already running is given up at the
+computer's first read. The position is looked up once the drive is quiet. The stock clock holds off
+for a write only, and waits inside the lookup for reads to finish, which stops the main loop for as
+long as the computer goes on reading; the watchdog's limit is 8 s. One clock with `watchdog = on`
+and `zone_gate` off restarted while a computer was reading the drive. With this change the same
+reads, `TZMAP.BIN` three times at 16 s each, did not restart it. The lookup's side is checked by
+`mk4-time/test/zone_host_test.c`.
+
+A read that arrives while a lookup already has the chip still fails, as in stock, and a computer
+takes that badly. On the same clock, just after the drive mounted, one read hung for 30 s and one
+returned wrong data. So with a computer attached, `zone_gate = on` is the setting to use: a clock
+that is not moving then makes no lookups for a read to land in.
 
 What it buys is the main loop's time. Everything drawn from interrupts is unaffected either way: the
 time, the date and the sub-second digits. What runs in the main loop waits behind each lookup: the
