@@ -44,12 +44,12 @@ volatile _Bool factory_reset_pending = 0;     // "factory_reset = on" over seria
 volatile _Bool menu_dump_pending = 0;      // "menu_dump = on" over serial -> emit the store-persistence diagnostic
 volatile _Bool menu_export_pending = 0;    // a saved menu change, or "menu_export = on" over serial -> send the choices as config lines
 
-// ---- Auto-persist the learned model to flash retained memory (default on; tc_persist = off) ----------
+// ---- Auto-persist the learned model to flash retained memory (opt-in: tc_persist = on) ----------
 // The record stores exactly what tc_dump prints and tc_seed re-loads (ppm-domain coefficients), so
 // boot warm-starts through the UNCHANGED tc_seed_apply path — auto-persist = "auto tc_dump into
 // flash", auto-seed = "auto paste + tc_seed = on". tc2 is both the RAM shadow of the winning flash
 // record AND the "last persisted model" the change-detector compares against.
-volatile _Bool tc_persist = 1;              // on by default: needs a usable SETTINGS.BIN (ee2_avail), else RAM-only
+volatile _Bool tc_persist = 0;              // config master opt-in (default off = stock behaviour)
 volatile _Bool tc_forget_pending = 0;       // "tc_forget = on" over serial -> erase the tempcomp store
 static   _Bool tc_model_dirty = 0;          // live model has moved beyond threshold since last persist
 static uint32_t tc_last_commit_ms = 0;      // uwTick at last commit (MONOTONIC — never GPS wall time)
@@ -770,7 +770,7 @@ static _Bool tc2_sane(void){
 }
 // Boot: seed the learned model from flash THROUGH the existing tc_seed path (config.txt still wins).
 SMALL_CODE void tc_seed_from_flash(void){
-  if (!tc_persist) return;                                   // tc_persist = off in config.txt
+  if (!tc_persist) return;                                   // opt-in (default off)
   if (tc_seed_done) return;                                  // first boot pass only (live-reload = no-op)
   if (!ee2_avail || !tc2.valid) return;
   if (!tc2_sane()) { tc2.valid = 0; return; }                // reject implausible/corrupt model

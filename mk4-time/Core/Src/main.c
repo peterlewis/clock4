@@ -173,10 +173,12 @@ uint8_t decisec=0, centisec=0, millisec=0;
 
 float longitude=-9999, latitude=-9999;
 _Bool data_valid=0, had_pps=0, rtc_good=0, new_position=1;
-// Last fix the ZoneDetect timezone lookup actually ran for. The NMEA parser sets new_position on
-// EVERY 1 Hz fix, but that lookup reads TZMAP.BIN off the QSPI FATFS and costs ~300 ms — so on a
-// stationary clock it re-ran every second on metre-scale GPS jitter, a 300 ms main-loop stall per
-// second (starves the balance mirrors, widens the date-board byte-drop window). 999 = never yet.
+// The NMEA parser sets new_position on every 1 Hz fix, and the main loop then looks the timezone up
+// again from TZMAP.BIN: about 300 ms on the QSPI FATFS, every second. That is the stock design (the
+// clock re-checks where it is each second) and the default here. "zone_gate = on" looks the zone up
+// again only when the fix has moved about 0.5 km from the last one that loaded its rules.
+// zone_lat/zone_lon are that fix; 999 = none yet, or the last attempt failed, so the next fix retries.
+volatile uint8_t zone_gate = 0;
 double zone_lat=999.0, zone_lon=999.0;
 
 uint32_t last_pps_time = 0;
@@ -196,7 +198,7 @@ uint8_t displayMode = 0, countMode = 0;
 #define is_alt_mode(m) ((m) == MODE_LST || (m) == MODE_SOLAR || (m) == MODE_ZONE2)
 uint8_t requestMode = 255;
 
-volatile uint8_t config_write = 1;   // on by default; "config_write = off" in config.txt stops it. config_write.h (below it) acts on it
+volatile uint8_t config_write = 0;   // "config_write = on": the parser sets it, config_write.h (below it) acts on it
 
 
 // ---- The menu's public face --------------------------------------------------------------------
@@ -290,8 +292,31 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 #include "main_parts/store.h"               // SETTINGS.BIN: the menu settings store and the tempcomp store
 #include "main_parts/menu.h"                // the two-button menu
 #include "main_parts/config.h"              // config.txt and serial config lines: the parser, the defaults table, the file loader
-#include "main_parts/config_write.h"        // the clock writes its menu choices into config.txt itself (on by default)
+#include "main_parts/config_write.h"        // the clock writes its menu choices into config.txt itself (opt-in)
 #include "main_parts/housekeeping.h"        // the timing subsystems' once-per-pass work in the main loop
+
+// ---- The main loop's timezone lookup: when it runs -----------------------------------------------
+// On every new fix, as in stock. Two things can hold it back, and neither clears new_position, so it
+// runs on a later pass:
+//  - the cuckoo (cuckoo.h): the lookup stalls the main loop for ~300 ms, and the cuckoo is scheduled
+//    and stepped from that loop. Nothing is held with cuckoo = off, bar a menu preview while it plays.
+//  - zone_gate = on: skip the lookup unless the fix has moved far enough to plausibly change zone.
+//    0.005° ≈ 0.5 km — ~100× the metre-scale jitter of a stationary clock, yet far finer than any
+//    timezone boundary. (dlat²+dlon² threshold 2.5e-5 = 0.005²; the cos-lat foreshortening of
+//    longitude only makes the gate MORE conservative.)
+static _Bool zone_lookup_due(void){
+  return new_position && !qspi_write_time && !config.zone_override
+      && (data_valid || (config.fake_long && config.fake_lat))
+      && latitude>=-90.0 && latitude<=90.0 && longitude>=-180.0 && longitude<=180.0
+      && !cuckoo_holds_lookup()
+      && (!zone_gate || zone_lat>90.0 || (latitude-zone_lat)*(latitude-zone_lat) + (longitude-zone_lon)*(longitude-zone_lon) > 2.5e-5);
+}
+// The gate measures from the last fix whose rules loaded. A lookup that was cut short, found no map
+// file, or could not load its rules leaves no such fix, so the next one tries again.
+static void zone_lookup_done(double lat, double lon, _Bool loaded){
+  if (loaded) { zone_lat=lat; zone_lon=lon; }
+  else zone_lat=999.0;
+}
 
 void generateDACbuffer(uint16_t * buf) {
 
@@ -586,18 +611,12 @@ int main(void)
     brightness_report_poll();   // $PMBRIT once a second (brightness_report) — the dimmer's operating point
 
     LP_MARK(3);
-    // Distance gate: skip the ~300 ms FATFS/ZoneDetect lookup unless the fix has actually moved far
-    // enough to plausibly change zone. 0.005° ≈ 0.5 km — ~100× the metre-scale jitter of a stationary
-    // clock, yet far finer than any timezone boundary, so a moving clock still re-detects its zone
-    // within ~0.5 km of a crossing while a still one looks up exactly once. (dlat²+dlon² threshold
-    // 2.5e-5 = 0.005²; the cos-lat foreshortening of longitude only makes the gate MORE conservative.)
-    if (new_position && !qspi_write_time && !config.zone_override
-        && (data_valid || (config.fake_long && config.fake_lat))
-        && latitude>=-90.0 && latitude<=90.0 && longitude>=-180.0 && longitude<=180.0
-        && (zone_lat>90.0 || (latitude-zone_lat)*(latitude-zone_lat) + (longitude-zone_lon)*(longitude-zone_lon) > 2.5e-5)) {
+    // The timezone lookup, on every new fix as in stock unless zone_lookup_due (above) holds it.
+    if (zone_lookup_due()) {
 
       new_position=0;
-      zone_lat=latitude; zone_lon=longitude;
+      double fix_lat=latitude, fix_lon=longitude;   // the fix this lookup is for
+      _Bool zone_loaded=0;
       fatfs_busy=1;   // map lookup + loadRulesSingle touch FATFS; block the eject-time check
       FIL mapfile;
       if (f_open(&mapfile, MAP_FILENAME, FA_READ) == FR_OK) {
@@ -617,7 +636,7 @@ int main(void)
 #ifdef MEASURE_LOOKUP_TIME
             start=uwTick;
 #endif
-            loadRulesSingle(zone);
+            zone_loaded = (loadRulesSingle(zone) == RULES_OK);
 #ifdef MEASURE_LOOKUP_TIME
             sprintf(textDisplay,"d%ld L%ld",ztime, uwTick-start);
 #endif
@@ -629,6 +648,7 @@ int main(void)
       }
       // else no_map = 1
       fatfs_busy=0;
+      zone_lookup_done(fix_lat, fix_lon, zone_loaded);
     }
 
     LP_MARK(4);

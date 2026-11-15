@@ -3,15 +3,35 @@
 This documents the features this firmware adds to the stock Mk IV firmware. It describes the
 `rollup` branch, which is what the ready-to-flash images in `qspi/output` are built from. That build
 carries version `0.0.5+<build>` on the time board and `0.0.2+<build>` on the date board; nothing here
-should be read as describing any other 0.0.5 build.
+should be read as describing any other 0.0.5 build. Everything is opt-in: with none of the new
+config keys set, and a stock date board, behaviour is that of the stock firmware, apart from the
+fixes listed in the [readme](../readme.md).
 
-Some additions are on by default, because they only make the clock more accurate or more robust:
-`significance_fade`, `freq_hold`, `tc_learn`, `tc_apply`, `tc_persist`, `seg_balance`,
-`colon_balance`, `pps`, `watchdog` and `config_write`. Set any of them to `off` in `config.txt` for
-the stock behaviour. Everything else is opt-in: the new display modes, `cuckoo`, `tc_rtc`,
-`brightness_report` and the diagnostics. With those defaults switched off and a stock
-date board, behaviour is that of the stock firmware, apart from the fixes listed in the
-[readme](../readme.md).
+## Recommended settings
+
+Nothing here is switched on for you. These are the additions this fork's author runs with, as
+`config.txt` lines:
+
+```
+significance_fade = on
+freq_hold = on
+tc_learn = on
+tc_apply = on
+tc_persist = on
+colon_balance = on
+watchdog = on
+config_write = on
+```
+
+Two more depend on how the clock is used:
+
+- `seg_balance = on` together with `zone_gate = on`, for a clock that stays in one place. With the
+  stock once-a-second timezone lookup still running, `seg_balance` may show a faint once-a-second
+  flicker on the fast digits (see `zone_gate`). That combination has not been checked on a clock.
+- `pps = on` if a computer running PCC is attached, which reads the timing sentence.
+
+`ms_align` is not on the list: it has been checked in the emulator and against a clock's own timing
+reports, but not yet filmed on a clock.
 
 ## New modes
 
@@ -199,8 +219,7 @@ continuously computes a bound on its holdover time error, and each sub-second di
 smoothly as the bound passes through its place value, rather than being dashed at a fixed time. A
 digit that is still significant keeps ticking at partial brightness on its way out. At power-on the
 sub-second digits start dark and only light once the clock can prove they're significant. Default
-on; `significance_fade = off` restores the stock `Tolerance_time_*` ladder. Also settable from the menu
-(DISP > SIG FADE).
+off. Also settable from the menu (DISP > SIG FADE).
 
 The bound has two parts, both measured by the clock itself while it is locked:
 
@@ -245,7 +264,7 @@ proportionally less duty, on both boards, with no change to the scan timing.
 intended setting. A number from 2 to 300 pins a fixed manual strength instead, for experiments:
 values up to 100 are a linear blend (100 = exactly duty-proportional), and 101 to 300 overdrive it
 with a power law, useful at the dimmest settings where the LED response is exponential and a linear
-map under-corrects. Default on (the automatic curve); `seg_balance = off` is the stock scan. Requires a matrix frequency of at least ~4 kHz;
+map under-corrects. Default off (stock behaviour). Requires a matrix frequency of at least ~4 kHz;
 below that the balancing dither would visibly strobe and is disabled.
 
 Balancing the date row requires the updated date-board firmware (`fwd.bin`); with a stock date board
@@ -261,8 +280,8 @@ The colons are driven by their own PWM rail, not the segment scan, so out of the
 brightness while the digits dim around them. `colon_balance` ties the colon brightness to the display
 brightness: `on` (or `1`) applies a calibrated curve — full brightness over the bright half of the
 range, tapering linearly to a dim floor at the darkest — and a number from 2 to 256 pins a fixed
-scale (of 256) for calibration sweeps. Default on (the automatic curve); `colon_balance = off` keeps
-the colons at full animation brightness, as stock.
+scale (of 256) for calibration sweeps. Default off. Leave it off until the digit brightness is
+dialled in, then switch on.
 
 Two anchors of the automatic curve are overridable per-hardware, exactly like the `BS` brightness
 stops:
@@ -351,6 +370,12 @@ need the same dither canvas as `seg_balance`, so a matrix frequency below ~4 kHz
 than showing them badly; `seg_balance` itself need not be on, since the mirror runs at identity duty
 when it is off. With `cuckoo = off` the display path is byte-identical to stock.
 
+The flourishes are scheduled and stepped from the main loop, which the once-a-second timezone lookup
+occupies for about 300 ms (see `zone_gate`). So with `cuckoo` set, the lookup waits for it: through
+the last second before a quarter-hour, and while a flourish plays. That is a few seconds an hour; the
+fix that arrived meanwhile is looked up as soon as the flourish ends. With `cuckoo = off` the lookup
+is never held.
+
 ```
 cuckoo_preview = trust
 ```
@@ -378,7 +403,7 @@ config_write = on
 
 Lets the clock write its own menu choices into `config.txt`, so the file shows what the clock is
 doing without a computer running `pccd` (which otherwise does this: see `menu_export` under USB
-serial output). Default on.
+serial output). Default off.
 
 It writes only if no computer has connected since power-on, which in practice means on a charger. A
 computer that has the drive mounted keeps its own copy of the file and would not see a change made
@@ -407,6 +432,46 @@ completed at the next power-on. That includes the one sector of the directory it
 record the file's new size), which it can recover even though the directory is how files are found.
 It needs a usable `SETTINGS.BIN`, and a FAT12 or FAT16 volume, which the clock's drive is.
 
+### zone_gate
+
+```
+zone_gate = on
+```
+
+The stock clock looks its timezone up from the GPS position every second, so that a clock carried
+across a boundary changes zone at once. Each lookup reads the boundary map from the drive and
+occupies the main loop for about 300 ms. That is the default here too.
+
+With `zone_gate = on` the clock looks the zone up again only when its position has moved about
+0.5 km (0.005°) from the last fix whose zone loaded. That is around a hundred times the jitter of a
+stationary GPS fix, and far finer than any timezone boundary. A lookup that fails (the map file
+missing, a write from the computer in progress, the zone's rules not found) is tried again at the
+next fix, and so is the position after a `ZONE_OVERRIDE` is removed or fails to load.
+
+What it buys is the main loop's time. Everything drawn from interrupts is unaffected either way: the
+time, the date and the sub-second digits. What runs in the main loop waits behind each lookup: the
+menu and the buttons (up to 0.3 s late), page changes in the paged modes, and the brightness
+weighting `seg_balance` gives each digit, which for the length of a lookup stays as it was when the
+lookup began. On the fast digits that may show as a faint once-a-second flicker at low brightness;
+this has not been checked on a clock. Default off.
+
+### ms_align
+
+```
+ms_align = on
+```
+
+Starts each second's millisecond count at the GPS pulse. The PPS handler restarts the millisecond
+timer a few microseconds after each pulse, so the timer's 1000th tick falls a few microseconds after
+the next pulse, inside the handler, and is left pending. Without this key (the stock handler) that
+tick runs when the handler returns and is counted as the first millisecond of the new second: the
+count, the millisecond digit and the roll-over of the seconds then run one millisecond ahead of GPS.
+On one clock, 30 hours of `$PMTXTS` showed that in 98.8% of locked seconds. With `ms_align = on` the
+handler drops the leftover tick.
+
+This rests on the clock's own timing reports and on the emulator (`pps_edge_check` in PCC). It has
+not yet been confirmed by filming a clock, and it may differ between boards. Default off.
+
 ### watchdog
 
 ```
@@ -423,8 +488,7 @@ The watchdog is armed only once the clock is running, never during a firmware up
 always stops it, so the bootloader is unaffected. If it fires three times in a row it stands down
 for that boot rather than reboot forever, and re-arms after a minute of normal running. Once armed
 it cannot be switched off: `watchdog = off` takes effect at the next reset. `wdt_dump = on` over
-serial (below) says whether it has ever fired. Default on: `config.txt` is read before the main loop
-starts, so `watchdog = off` in the file means it is never armed that boot. Also settable from the menu (SYS >
+serial (below) says whether it has ever fired. Default off. Also settable from the menu (SYS >
 WATCHDOG), under the same rule: on arms it at once, off waits for the next reset.
 
 ### pps
@@ -438,9 +502,9 @@ sub-millisecond phase measurement made at the edge, for host-side jitter and dri
 the sentence also carries a USB SOF-correlation tail that lets a host place the edge on its own clock
 to around a microsecond despite USB delivery jitter; a host that only needs the phase can ignore the
 extra fields. The USB start-of-frame interrupt (a cheap 1 kHz latch) is always enabled; this key only
-decides whether it records. With no computer attached the sentence is dropped before it is formatted.
-Default on; `pps = off` stops the sentence. Also settable from the menu (SYS > PPS MSG). The sentence format is documented under USB serial
-output below.
+decides whether the sentence is sent. With no computer attached it is dropped before it is formatted.
+Default off. Also settable from the menu (SYS > PPS MSG). The sentence format is documented under USB
+serial output below.
 
 ### Temperature compensation
 
@@ -451,8 +515,7 @@ existing 63-second RTC calibration. The temperature compensation system learns a
 temperature model for both oscillators, then uses it during a GPS outage to steer the display
 timebase and to keep the battery RTC trimmed for the next power-up.
 
-`tc_learn`, `tc_apply` and `tc_persist` default on; `tc_rtc` defaults off. Set the first three to
-`off` for the stock behaviour.
+Everything defaults off; with none of the keys set the behaviour is stock.
 
 ```
 tc_learn = on
@@ -527,8 +590,7 @@ coverage, a believable fit — at most once every 30 minutes and only when it ha
 so the flash lasts decades. On boot the stored model loads as an evolving seed; `config.txt` still
 wins per-key, so pasted coefficients override it. The store lives inside `SETTINGS.BIN` (see Flash
 memory files below). The same record also keeps the wander level learned for `significance_fade`,
-whether or not a temperature model is stored. Default on. With no usable `SETTINGS.BIN` the model is
-kept in RAM only, as the menu store is.
+whether or not a temperature model is stored. Default off.
 
 ### freq_hold
 
@@ -549,7 +611,7 @@ add, and `tc_engage_s` and `tc_max_ppm` apply to the total. `tc_dump` prints the
 
 Measured on one production clock over 24 days: the offset was +0.12 ppm, steady to within 0.015 ppm.
 Replaying 44,000 GPS losses on that recording, the typical error after an hour of holdover fell from
-386 µs to 7 µs, and after six hours from 2.4 ms to 0.15 ms. Default on. Also settable from the menu
+386 µs to 7 µs, and after six hours from 2.4 ms to 0.15 ms. Default off. Also settable from the menu
 (DIAG > F HOLD).
 
 ## USB serial output
@@ -712,13 +774,13 @@ $PMTXTS,<seq>,<epoch>,<subms>,<systick>,<load>,<calerr>,<sincecal>,<temp>,<flags
 The modelled sub-second position at the edge — the phase error against GPS — is
 `subms + (load − systick)/(load + 1)` milliseconds.
 
-A locked clock reports `subms` 999 with `systick` a few hundred: a few microseconds short of the
-second, which is the time the PPS handler takes to restart the millisecond counter. `subms` and
-`systick` are read as one value, so a counter that has just wrapped is never paired with a count that
-has not yet moved on. Builds before this one mostly reported `subms` 0 with the same small `systick`:
-a leftover tick from the old second was counted as the first millisecond of the new one, so the
-count, the ms digit and the roll-over of the seconds ran one millisecond ahead of GPS in most locked
-seconds (98.8% of them on one clock over 30 hours). A host that folds the phase by whole
+With `ms_align = on`, a locked clock reports `subms` 999 with `systick` a few hundred: a few
+microseconds short of the second, which is the time the PPS handler takes to restart the millisecond
+counter. Without it (the stock handler) a locked clock mostly reports `subms` 0 with the same small
+`systick`: a leftover tick from the old second is counted as the first millisecond of the new one, so
+the count runs one millisecond ahead of GPS in most locked seconds (98.8% of them on one clock over
+30 hours). Either way `subms` and `systick` are read as one value, so a counter that has just wrapped
+is never paired with a count that has not yet moved on. A host that folds the phase by whole
 milliseconds reads both forms the same way.
 
 The last three fields are the SOF-correlation tail, present once USB has enumerated: `dwt_pps` is a
@@ -844,7 +906,7 @@ SYS > RESET erases every setting you've changed with the menu **and everything t
 learned** — the stored and live temperature-compensation model included — then immediately re-reads
 `config.txt`, returning the clock to exactly what the file says (a `tc_*` seed block in the file
 re-seeds compensation on the spot). Menu choices the clock has already written into `config.txt`
-(`config_write`) are part of the file by then, so a reset keeps them: delete those lines to undo
+(`config_write = on`) are part of the file by then, so a reset keeps them: delete those lines to undo
 them. It is the same thing as the `factory_reset` serial command. EDIT
 opens a `DELETE ALL` confirm screen: APPLY fires it (the row flashes `DONE`), CANCEL backs out.
 This is deliberately a different thing from the REBOOT chord, which restarts the clock but keeps

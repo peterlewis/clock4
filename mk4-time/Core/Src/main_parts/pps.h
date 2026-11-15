@@ -6,10 +6,11 @@
 // --- PPS host timestamping ----------------------------------------------------------------
 // Optional: emit one proprietary NMEA sentence ($PMTXTS) per PPS edge over the CDC port so a
 // host can measure the clock's timing stability (phase jitter, oscillator drift, holdover) —
-// things the plain NMEA stream cannot convey. On by default; "pps = off" stops it. Capture happens in
+// things the plain NMEA stream cannot convey. Enabled by config "pps = on". Capture happens in
 // the PPS ISR (cheap, just snapshots); the sentence is formatted + sent from the main loop.
-volatile uint8_t pps_ts_enabled = 1;
+volatile uint8_t pps_ts_enabled = 0;
 volatile _Bool   pps_record_pending = 0;
+volatile uint8_t ms_align = 0;         // config "ms_align = on": restartSecond() below drops the old second's pending tick
 volatile struct {
   uint32_t seq;        // increments every PPS edge (32-bit: no practical wrap; host detects gaps)
   uint32_t systick;    // SysTick->VAL at the edge, captured BEFORE the reload (down-counter)
@@ -67,8 +68,8 @@ static inline _Bool pps_emit_pending(void){ return pps_ts_enabled && pps_record_
     adev_push_dwt(pps_cap.dwt_pps, pps_cap.epoch); /* free-running Allan-deviation sample */ \
   } while(0)
 
-// The second starts at the edge: restart the millisecond counter, and drop a tick left over from the
-// second that has just ended.
+// The second starts at the edge: restart the millisecond counter and, with "ms_align = on", drop a
+// tick left over from the second that has just ended. Off (the default) is the stock restart.
 //
 // The counter was restarted a few microseconds after the previous edge, so its 1000th wrap falls a
 // few microseconds after this one: inside this handler, which runs at SysTick's own priority. The
@@ -88,8 +89,10 @@ static inline _Bool pps_emit_pending(void){ return pps_ts_enabled && pps_record_
 #endif
 #define restartSecond() do { \
     SysTick->VAL = SysTick->LOAD; \
-    systick_drop_pending(); \
-    if (decisec >= 5) HAL_IncTick(); \
+    if (ms_align) { \
+      systick_drop_pending(); \
+      if (decisec >= 5) HAL_IncTick(); \
+    } \
   } while(0)
 
 // PPS rising edge

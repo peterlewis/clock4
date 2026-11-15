@@ -14,17 +14,20 @@ mitxela's firmware for the [Precision Clock Mk IV](https://mitxela.com/projects/
 
 ## How this firmware differs from stock
 
-What improves the clock is on by default: holdover, brightness equalisation, the timing sentence, the watchdog, and menu choices written into `config.txt`. What changes what it shows is opt-in: the new display modes and the chimes. Set any key to `off` in `config.txt` to return that part to stock.
+Everything this firmware adds is off until you switch it on in `config.txt` or the menu. Flashed onto a clock with a stock `config.txt`, it behaves as stock does, apart from the fixes listed below. The settings its author runs with are marked "Recommended" in the sample `config.txt` and listed in the [manual](docs/firmware-additions.md#recommended-settings).
+
+The table shows what the additions do once switched on.
 
 | | Stock (0.0.4 / 0.0.1) | This firmware |
 |---|---|---|
 | Display modes | Calendar, timezone, countdown, text, satellite and diagnostic modes | The same, plus sun, moon, twilight, grid locator, position, sidereal time, solar time, a second timezone, star transits and oscillator stability |
-| Changing a setting | Edit `config.txt` on a computer | Also a two-button menu on the clock, saved across power-off and written into `config.txt` |
+| Changing a setting | Edit `config.txt` on a computer | Also a two-button menu on the clock, saved across power-off |
 | GPS lost | Sub-second digits are dashed after fixed times | Each digit fades as the measured uncertainty reaches it, and the clock holds the frequency it measured while locked |
 | Brightness | One drive level for every segment | Per-segment and colon equalisation, so a `1` is not brighter than an `8` |
 | USB serial | GPS sentences | The same, plus a timing sentence on each GPS pulse, and opt-in diagnostics |
-| A stalled clock | Frozen until power-cycled | Restarts itself |
-| Removing a line from `config.txt` | Takes effect at the next power-on | Takes effect when the file is saved |
+| A stalled clock | Frozen until power-cycled | Restarts itself (`watchdog`) |
+| Timezone lookup | From the position, every second | The same, or only when the clock has moved (`zone_gate`) |
+| Removing a line from `config.txt` | Takes effect at the next power-on | Takes effect when the file is saved (always) |
 
 <details>
 <summary><b>Display modes</b>: the 12 new keys</summary>
@@ -51,7 +54,7 @@ Enable each in `config.txt` like the stock modes, or from the menu.
 <details>
 <summary><b>When GPS is lost</b>: digits that fade honestly, and a held frequency</summary>
 
-All on by default.
+All off by default, and all recommended.
 
 - **`significance_fade`** replaces the fixed `Tolerance_time_*` times. The clock computes a bound on its own time error from what it measured while locked, and each sub-second digit fades out as the bound passes that digit's place value. A digit that is lit is still right.
 - **`freq_hold`** steers out the oscillator's small fixed offset, measured against GPS while locked. Replayed over 24 days of recordings from one clock, the typical error after an hour without GPS fell from 386 µs to 7 µs.
@@ -62,10 +65,12 @@ All on by default.
 <details>
 <summary><b>Display</b>: brightness equalisation, colons, chimes, paging</summary>
 
-- **`seg_balance`, `colon_balance`** (on by default) equalise brightness between digits that light different numbers of segments, and dim the colons with the rest of the display.
+- **`seg_balance`, `colon_balance`** equalise brightness between digits that light different numbers of segments, and dim the colons with the rest of the display. `seg_balance` is best paired with `zone_gate`, below.
 - **`colon_alt_mode`** gives the sidereal, solar and second-timezone modes their own colon animation, so they cannot be mistaken for civil time.
 - **`cuckoo`** adds a small flourish each quarter-hour and a longer one on the hour.
 - **`page_ms`** sets how long each page of a multi-page mode stays up.
+- **`zone_gate`** looks the timezone up again only when the clock has moved about 0.5 km. Stock looks it up every second, which is deliberate (a clock carried across a boundary changes at once) and remains the default; each lookup occupies the main loop for about 300 ms. Worth switching on for a clock that stays put, if you use `seg_balance`: its per-digit weighting is worked out in the main loop, and with the lookup running every second the fast digits may flicker faintly. That combination has not been checked on a clock.
+- **`ms_align`** starts each second's millisecond count at the GPS pulse. On one clock, `$PMTXTS` showed the count running one millisecond ahead of GPS in 98.8% of locked seconds, because a timer tick left pending across the pulse is counted as the first millisecond of the new second. Checked in the emulator; not yet filmed on a clock.
 
 </details>
 
@@ -84,14 +89,14 @@ When `config.txt` and the menu disagree, the rule works one setting at a time:
 
 So a brightness set at the clock survives an edit to the timezone line, and a line you change in the file always takes effect, whether the clock was running at the time or unplugged straight after.
 
-Menu choices end up in `config.txt`, so the file shows what the clock is doing. A clock on a charger writes them itself (`config_write`, on by default); with a computer attached, the clock sends them over USB (`$PMCFG`) and PCC's `pccd` writes them. Once they are in the file, a factory reset keeps them: delete the lines to undo them.
+The clock also sends its menu choices over USB as `config.txt` lines (`$PMCFG`). With PCC's `pccd` running, they are written into `config.txt`, so the file shows what the clock is doing. With `config_write = on`, a clock on a charger writes them into the file itself. Once they are in the file, a factory reset keeps them: delete the lines to undo them.
 
 </details>
 
 <details>
 <summary><b>USB serial output</b>: timing and diagnostic sentences</summary>
 
-`$PMTXTS` is on by default (`pps`); the rest are off until asked for.
+All off until asked for. `$PMTXTS` is switched on with `pps`.
 
 | Sentence | Carries |
 |---|---|
@@ -108,11 +113,6 @@ One-line reports are also available for the temperature model (`tc_dump`), the s
 <details>
 <summary><b>Fixes</b>: always on</summary>
 
-Seen on a real clock:
-
-- **The millisecond count ran one ahead of GPS.** A timer tick left pending across the GPS pulse was counted as the first millisecond of the new second: 98.8% of locked seconds in recordings from one clock. Found through `$PMTXTS`. The stock pulse handler restarts the counter the same way, so stock very likely does the same; it has no telemetry to show it.
-- **The timezone lookup re-ran on every GPS fix** although the clock had not moved, stalling the main loop for about 300 ms each second.
-
 Found in the code or the emulator, and fixed before they were seen on a clock:
 
 - A cut-short `TZRULES.BIN`, such as an interrupted copy, made the timezone loader run off the end of memory at every power-on. It is now refused, and the loaded zone is kept.
@@ -121,9 +121,13 @@ Found in the code or the emulator, and fixed before they were seen on a clock:
 - Out-of-range writes in the text mode, and in the date board's display and text handling.
 - Work inside the USB interrupt that could collide with the main loop: applying a serial setting, checking for an update on eject, and allocating memory.
 
-Changed for everyone: a line removed from `config.txt` returns that setting to its default when the file is saved, not at the next power-on.
+Changed for everyone:
 
-On by default: the watchdog (`watchdog`) restarts a clock whose main loop has stalled for 8 seconds. It is never armed during an update, and stands down after three restarts in a row.
+- A line removed from `config.txt` returns that setting to its default when the file is saved, not at the next power-on.
+- The buttons are read by the main loop, so that the menu can use them. A press can register about 0.3 s late while the timezone lookup runs; stock acts on it at once.
+- The USB start-of-frame interrupt is enabled (a 1 kHz latch that the `pps` timing sentence uses).
+
+Two things once listed here as fixes are now options, off by default, because the stock behaviour is either deliberate or not yet shown to be wrong on a clock: `zone_gate` and `ms_align` (under Display, above).
 
 </details>
 
@@ -149,10 +153,10 @@ Download the files from the **[latest release](https://github.com/peterlewis/clo
 4. Copy `fwt.bin` (time board) and `fwd.bin` (date board).
 5. Eject the drive. The clock updates itself and restarts.
 
-Your `config.txt` keeps working as it is, and the defaults above apply to any key it doesn't mention.
+Your `config.txt` keeps working as it is. Any key it doesn't mention stays off, so the clock behaves as it did until you add lines.
 
 > [!TIP]
-> The release's `config.txt` is a sample with a line for every key this firmware knows, each at its built-in value. Copy lines from it into yours; don't copy it over your own unless you mean to lose your settings.
+> The release's `config.txt` is a sample with a line for every key this firmware knows, each at its built-in value, with the recommended ones marked. Copy lines from it into yours; don't copy it over your own unless you mean to lose your settings.
 
 To return to stock, copy mitxela's `fwt.bin` and `fwd.bin` the same way. [qspi/qspi.md](qspi/qspi.md) covers the details, including formatting the drive from scratch.
 
@@ -165,7 +169,7 @@ To return to stock, copy mitxela's `fwt.bin` and `fwd.bin` the same way. [qspi/q
 <details>
 <summary><b>How it is tested</b></summary>
 
-- **Emulator suites** in the PCC repository ([`web/emu/phase1`](https://github.com/peterlewis/pcc/tree/main/web/emu/phase1)): 37 suites that drive the real firmware code, compiled to WebAssembly. A change here comes with a test there.
+- **Emulator suites** in the PCC repository ([`web/emu/phase1`](https://github.com/peterlewis/pcc/tree/main/web/emu/phase1)): 38 suites that drive the real firmware code, compiled to WebAssembly. A change here comes with a test there.
 - **Conformance:** 4,511 display checks against independently computed calendar and astronomy results, and 912 timezone checks against the host's timezone database.
 - **A native build** of the same source, compared byte for byte with the WebAssembly build's output.
 - **A replay** of a capture from a real clock.

@@ -150,6 +150,7 @@ SMALL_CODE void checkDelayedLoadRules(){
     config.zone_override = 1;
     if (loadRulesSingle(preloadRulesString) !=RULES_OK) {
       config.zone_override = 0;
+      zone_lat = 999.0;                    // look the zone up from the position again, whatever zone_gate says
       if (data_valid) new_position=1;
     }
   }

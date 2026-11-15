@@ -64,6 +64,22 @@ void cuckoo_abort(void){
 
 static uint8_t cuckoo_active(void){ return ck_anim != 0xFF; }
 
+// The main loop's timezone lookup takes about 300 ms and starts around .350 of the second, when the
+// GPS sentence arrives. The scheduler below arms at .500 of a :59 second and starts in the first
+// 50 ms of the next, and a piece is stepped every 10 ms, all from the same loop: a lookup across any
+// of those would lose the piece or freeze it. So the main loop asks here first, and waits while this
+// is true: through the :59 second before a quarter, while a piece is armed, and while one plays.
+// That is a few seconds an hour. With cuckoo = off nothing is ever armed, and only a menu preview
+// that is playing holds the lookup.
+static _Bool cuckoo_holds_lookup(void){
+  if (ck_anim != 0xFF || ck_armed) return 1;
+  if (cuckoo == CK_OFF || cuckoo >= CK_PIECES) return 0;
+  if (displayMode == MODE_STANDBY || countMode != COUNT_NORMAL) return 0;   // the scheduler will not arm
+  uint8_t ss = (uint8_t)(nextBcd.tenSeconds * 10 + nextBcd.seconds);
+  uint8_t mm = (uint8_t)(nextBcd.tenMinutes * 10 + nextBcd.minutes);
+  return ss == 59 && (mm % 15) == 14;
+}
+
 static void ck_start(uint8_t anim){
   if (ck_anim != 0xFF) return;               // never preempt a running piece
   if (segbal_depth() == 0) return;           // scan too slow for the dither canvas — honest skip
