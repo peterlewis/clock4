@@ -70,7 +70,7 @@ All off by default, and all recommended.
 - **`cuckoo`** adds a small flourish each quarter-hour and a longer one on the hour.
 - **`page_ms`** sets how long each page of a multi-page mode stays up.
 - **`zone_gate`** looks the timezone up again only when the clock has moved about 0.5 km. Stock looks it up every second, which is deliberate (a clock carried across a boundary changes at once) and remains the default; each lookup occupies the main loop for about 300 ms. Worth switching on for a clock that stays put, if you use `seg_balance`: its per-digit weighting is worked out in the main loop, and with the lookup running every second the fast digits may flicker faintly. That combination has not been checked on a clock.
-- **`ms_align`** starts each second's millisecond count at the GPS pulse. On one clock, `$PMTXTS` showed the count running one millisecond ahead of GPS in 98.8% of locked seconds, because a timer tick left pending across the pulse is counted as the first millisecond of the new second. Checked in the emulator; not yet filmed on a clock.
+- **`ms_align`** starts each second's millisecond count at the GPS pulse. On one clock, `$PMTXTS` showed the count running one millisecond ahead of GPS in 98.8% of locked seconds, because a timer tick left pending across the pulse is counted as the first millisecond of the new second. It does nothing on a clock whose oscillator does not leave that tick. Recommended; checked in the emulator, not yet filmed on a clock.
 
 </details>
 

@@ -19,6 +19,7 @@ tc_learn = on
 tc_apply = on
 tc_persist = on
 colon_balance = on
+ms_align = on
 watchdog = on
 config_write = on
 ```
@@ -30,8 +31,8 @@ Two more depend on how the clock is used:
   flicker on the fast digits (see `zone_gate`). That combination has not been checked on a clock.
 - `pps = on` if a computer running PCC is attached, which reads the timing sentence.
 
-`ms_align` is not on the list: it has been checked in the emulator and against a clock's own timing
-reports, but not yet filmed on a clock.
+`ms_align` is on the list with a caveat: it has been checked in the emulator and against one clock's
+own timing reports, but not yet filmed on a clock. On a clock that does not need it, it does nothing.
 
 ## New modes
 
@@ -469,8 +470,15 @@ count, the millisecond digit and the roll-over of the seconds then run one milli
 On one clock, 30 hours of `$PMTXTS` showed that in 98.8% of locked seconds. With `ms_align = on` the
 handler drops the leftover tick.
 
-This rests on the clock's own timing reports and on the emulator (`pps_edge_check` in PCC). It has
-not yet been confirmed by filming a clock, and it may differ between boards. Default off.
+Whether a clock has the leftover tick depends on its oscillator. One that runs a little slow restarts
+the timer before the tick arrives, and one that runs more than a few parts per million fast has the
+tick before the pulse; both count correctly as stock, and the key changes nothing on them. Only an
+oscillator within a few parts per million fast of nominal leaves the tick inside the handler. A tick
+still pending when the timer is restarted can only belong to the second that has ended, so dropping
+it cannot take a millisecond from the new one.
+
+This rests on one clock's own timing reports and on the emulator (`pps_edge_check` in PCC). It has
+not yet been confirmed by filming a clock. Default off; recommended on.
 
 ### watchdog
 
